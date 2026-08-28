@@ -1859,6 +1859,166 @@ async fn aggregate_proxy_fails_over_to_next_member_in_same_request() {
 }
 
 #[tokio::test]
+async fn aggregate_proxy_preserves_final_upstream_status_code() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let first = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let first_addr = first.local_addr().unwrap();
+    let second = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let second_addr = second.local_addr().unwrap();
+    let first_server = tokio::spawn(capture_request_and_respond_once(
+        first,
+        "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 13\r\ncontent-type: application/json\r\n\r\n{\"error\":429}",
+    ));
+    let second_server = tokio::spawn(capture_request_and_respond_once(
+        second,
+        "HTTP/1.1 418 I'm a teapot\r\ncontent-length: 13\r\ncontent-type: application/json\r\n\r\n{\"error\":418}",
+    ));
+    let mut settings = aggregate_proxy_settings(
+        "status-preservation",
+        format!("http://{first_addr}/v1"),
+        format!("http://{second_addr}/v1"),
+    );
+    for relay in settings.relay_profiles.iter_mut().take(2) {
+        relay.relay_mode = RelayMode::PureApi;
+        relay.no_auth = true;
+        relay.api_key.clear();
+    }
+
+    let result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-5-mini","input":"hi","stream":false}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.status_code, 418);
+    assert_eq!(result.response.status().as_u16(), 418);
+    first_server.await.unwrap();
+    second_server.await.unwrap();
+}
+
+#[tokio::test]
+async fn aggregate_code_mode_host_forwards_only_function_tools() {
+    let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let target_server = tokio::spawn(capture_json_request_once(target));
+    let request = json!({
+        "model": "gpt-5.6-luna",
+        "input": "run a terminal command",
+        "stream": false,
+        "parallel_tool_calls": true,
+        "tool_choice": "auto",
+        "tools": [
+            { "type": "function", "name": "exec_command", "parameters": { "type": "object" } },
+            { "type": "function", "name": "write_stdin", "parameters": { "type": "object" } },
+            { "type": "custom", "name": "apply_patch" },
+            { "type": "tool_search" },
+            { "type": "web_search" }
+        ]
+    });
+    let mut settings = aggregate_proxy_settings(
+        "code-mode-host-on",
+        format!("http://{target_addr}/v1"),
+        "http://127.0.0.1:9/v1".to_string(),
+    );
+    settings.aggregate_relay_profiles[0].code_mode_host = true;
+
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+    let (_, upstream_body) = target_server.await.unwrap();
+
+    assert_eq!(
+        upstream_body["tools"],
+        json!([
+            { "type": "function", "name": "exec_command", "parameters": { "type": "object" } },
+            { "type": "function", "name": "write_stdin", "parameters": { "type": "object" } }
+        ])
+    );
+    assert_eq!(upstream_body["tool_choice"], "auto");
+    assert_eq!(upstream_body["parallel_tool_calls"], true);
+}
+
+#[tokio::test]
+async fn aggregate_code_mode_host_is_opt_in() {
+    let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let target_server = tokio::spawn(capture_json_request_once(target));
+    let request = json!({
+        "model": "gpt-5.6-luna",
+        "input": "keep all tools",
+        "stream": false,
+        "parallel_tool_calls": true,
+        "tool_choice": "auto",
+        "tools": [
+            { "type": "function", "name": "exec_command", "parameters": { "type": "object" } },
+            { "type": "custom", "name": "apply_patch" },
+            { "type": "tool_search" },
+            { "type": "web_search" }
+        ]
+    });
+    let settings = aggregate_proxy_settings(
+        "code-mode-host-off",
+        format!("http://{target_addr}/v1"),
+        "http://127.0.0.1:9/v1".to_string(),
+    );
+
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+    let (_, upstream_body) = target_server.await.unwrap();
+
+    assert_eq!(upstream_body, request);
+}
+
+#[tokio::test]
+async fn aggregate_code_mode_host_removes_empty_tool_controls() {
+    let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let target_server = tokio::spawn(capture_json_request_once(target));
+    let request = json!({
+        "model": "gpt-5.6-luna",
+        "input": "no supported tools",
+        "stream": false,
+        "parallel_tool_calls": true,
+        "tool_choice": "auto",
+        "tools": [
+            { "type": "custom", "name": "apply_patch" },
+            { "type": "tool_search" },
+            { "type": "web_search" }
+        ]
+    });
+    let mut settings = aggregate_proxy_settings(
+        "code-mode-host-empty",
+        format!("http://{target_addr}/v1"),
+        "http://127.0.0.1:9/v1".to_string(),
+    );
+    settings.aggregate_relay_profiles[0].code_mode_host = true;
+
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+    let (_, upstream_body) = target_server.await.unwrap();
+
+    assert!(upstream_body.get("tools").is_none());
+    assert!(upstream_body.get("tool_choice").is_none());
+    assert!(upstream_body.get("parallel_tool_calls").is_none());
+}
+
+#[tokio::test]
 async fn model_route_uses_target_responses_provider_without_mutating_request() {
     let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -2268,6 +2428,7 @@ fn aggregate_proxy_settings(
             id: aggregate_id,
             name: "aggregate".to_string(),
             session_provider: RelaySessionProvider::Custom,
+            code_mode_host: false,
             strategy: AggregateRelayStrategy::RequestRoundRobin,
             members: vec![
                 AggregateRelayMember {

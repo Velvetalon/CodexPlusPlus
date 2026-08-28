@@ -771,6 +771,34 @@ fn apply_aggregate_relay_points_codex_to_local_responses_proxy_without_snapshot(
 }
 
 #[test]
+fn apply_aggregate_relay_projects_one_million_context_and_model_catalog() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile = RelayProfile {
+        id: "agg".to_string(),
+        name: "聚合供应商 1".to_string(),
+        model: "gpt-5.6-sol".to_string(),
+        relay_mode: RelayMode::Aggregate,
+        context_window: "1000000".to_string(),
+        auto_compact_limit: "900000".to_string(),
+        model_list: "gpt-5.6-sol[1M]".to_string(),
+        config_contents: String::new(),
+        auth_contents: String::new(),
+        ..RelayProfile::default()
+    };
+
+    apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
+    let updated = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+
+    assert!(updated.contains("model_context_window = 1000000"));
+    assert!(updated.contains("model_auto_compact_token_limit = 900000"));
+    assert!(updated.contains(r#"model_catalog_json = "model-catalogs/agg.json""#));
+    let catalog =
+        std::fs::read_to_string(temp.path().join("model-catalogs").join("agg.json")).unwrap();
+    assert!(catalog.contains(r#""slug": "gpt-5.6-sol""#));
+    assert!(catalog.contains(r#""context_window": 1000000"#));
+}
+
+#[test]
 fn chat_protocol_profile_keeps_upstream_base_url_separate_from_codex_proxy() {
     let temp = tempfile::tempdir().unwrap();
     let mut profile = RelayProfile {

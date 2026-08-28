@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::Context;
 use serde_json::{Value, json};
 
-use crate::relay_rotation::{RotationContext, RotationEvent};
+use crate::relay_rotation::{RelayRequestOutcome, RotationContext};
 use crate::settings::{RelayProtocol, SettingsStore};
 
 pub const DEFAULT_PROTOCOL_PROXY_PORT: u16 = 57321;
@@ -559,6 +559,12 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     request_path: &str,
 ) -> anyhow::Result<UpstreamProxyResponse> {
     let mut request_json: Value = serde_json::from_str(body)?;
+    if settings
+        .active_aggregate_relay_profile()
+        .is_some_and(|aggregate| aggregate.code_mode_host)
+    {
+        normalize_code_mode_host_tools(&mut request_json);
+    }
     let is_stream = request_json
         .get("stream")
         .and_then(Value::as_bool)
@@ -650,7 +656,11 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         "error": error.to_string()
                     }),
                 );
-                crate::relay_rotation::record_relay_request_failure(&settings);
+                crate::relay_rotation::record_relay_request_outcome(
+                    &settings,
+                    &relay.id,
+                    RelayRequestOutcome::TransportFailure,
+                );
                 if has_more_candidates {
                     continue;
                 }
@@ -678,13 +688,10 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 "willFailover": has_more_candidates && !(200..300).contains(&status_code)
             }),
         );
-        crate::relay_rotation::record_relay_request_event(
+        crate::relay_rotation::record_relay_request_outcome(
             &settings,
-            if (200..300).contains(&status_code) {
-                RotationEvent::Success
-            } else {
-                RotationEvent::Failure
-            },
+            &relay.id,
+            RelayRequestOutcome::HttpStatus(status_code),
         );
         let content_type = upstream
             .headers()
@@ -717,6 +724,20 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         );
     }
     anyhow::bail!("未找到可用的聚合供应商成员")
+}
+
+fn normalize_code_mode_host_tools(body: &mut Value) {
+    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    tools.retain(|tool| tool.get("type").and_then(Value::as_str) == Some("function"));
+    if tools.is_empty()
+        && let Some(object) = body.as_object_mut()
+    {
+        object.remove("tools");
+        object.remove("tool_choice");
+        object.remove("parallel_tool_calls");
+    }
 }
 
 fn select_model_route(

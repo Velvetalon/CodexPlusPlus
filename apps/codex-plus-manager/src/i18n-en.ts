@@ -463,6 +463,19 @@ export const EN_PLAIN: Record<string, string> = {
   "失败": "Failed",
   "失败切换": "Failover",
   "失败切换会保留成员顺序，优先使用第一个可用供应商。": "Failover preserves member order, preferring the first available provider.",
+  "优先降级": "Priority fallback",
+  "固定成员优先级；失败成员冷却，到期后自动回切。": "Keep fixed member priority; cool down failed members and automatically fail back after expiry.",
+  "优先降级会跳过仍在冷却的失败成员，并在冷却到期后的下一请求自动恢复其原始优先级。": "Priority fallback skips failed members while they cool down and restores their original priority on the first request after expiry.",
+  "code_mode_host 兼容": "code_mode_host compatibility",
+  "仅向聚合上游转发函数工具；保留终端工具，过滤自定义语法与托管工具。":
+    "Forward only function tools to aggregate upstreams; keep terminal tools while filtering custom-grammar and hosted tools.",
+  "留空继承成员：{0}": "Leave blank to inherit from member: {0}",
+  "留空不改写，例如 1000000": "Leave blank to keep the default, for example 1000000",
+  "留空不改写，例如 900000": "Leave blank to keep the default, for example 900000",
+  "显式设置会写入 model_context_window；留空时继承已选成员中最大的明确窗口。":
+    "An explicit value writes model_context_window; blank inherits the largest explicit window among selected members.",
+  "显式设置会写入 model_auto_compact_token_limit；继承窗口时会同时继承该成员的阈值。":
+    "An explicit value writes model_auto_compact_token_limit; inherited windows also inherit that member's threshold.",
   "如果使用官方模式或官方混入 API 模式，通常不需要开启插件市场解锁。":
     "If you use official mode or official mixed-API mode, you usually don't need plugin marketplace unlock.",
   "安装": "Install",

@@ -102,6 +102,7 @@ import {
   type ModelWindowRow,
 } from "./model-windows";
 import { relayAuthForLiveDraft, shouldBackfillRelayProfileBeforeSwitch } from "./relay-live-files";
+import { orderAggregateMembersByCandidates } from "./relay-aggregate-order";
 import { resolveProviderName } from "./provider-name";
 import { resolveProviderSyncCompletion } from "./provider-sync-flow";
 import { resolveLaunchStatus } from "./launch-status";
@@ -312,7 +313,12 @@ export type RelayProfile = {
   aggregate?: RelayAggregateConfig | null;
 };
 
-type RelayAggregateStrategy = "failover" | "conversationRoundRobin" | "requestRoundRobin" | "weightedRoundRobin";
+type RelayAggregateStrategy =
+  | "failover"
+  | "priorityFallback"
+  | "conversationRoundRobin"
+  | "requestRoundRobin"
+  | "weightedRoundRobin";
 type RelayAggregateMember = {
   profileId: string;
   weight: number;
@@ -320,6 +326,7 @@ type RelayAggregateMember = {
 type RelayAggregateConfig = {
   strategy: RelayAggregateStrategy;
   members: RelayAggregateMember[];
+  codeModeHost: boolean;
 };
 type AggregateRelayMember = {
   relayId: string;
@@ -329,6 +336,7 @@ type AggregateRelayProfile = {
   id: string;
   name: string;
   sessionProvider?: RelaySessionProvider;
+  codeModeHost?: boolean;
   strategy: RelayAggregateStrategy;
   members: AggregateRelayMember[];
 };
@@ -8807,6 +8815,14 @@ function AggregateRelayProfileEditor({
   const aggregate = normalizeAggregateConfig(profile.aggregate, candidates);
   const memberIds = new Set(aggregate.members.map((member) => member.profileId));
   const sessionProvider = normalizeRelaySessionProvider(profile.sessionProvider);
+  const inheritedContextProfile = candidates
+    .filter((candidate) => memberIds.has(candidate.id))
+    .reduce<RelayProfile | null>((selected, candidate) => {
+      const candidateWindow = Number.parseInt(candidate.contextWindow, 10);
+      if (!Number.isFinite(candidateWindow) || candidateWindow <= 0) return selected;
+      const selectedWindow = selected ? Number.parseInt(selected.contextWindow, 10) : 0;
+      return candidateWindow > selectedWindow ? candidate : selected;
+    }, null);
   const updateAggregate = (nextAggregate: RelayAggregateConfig) => {
     onProfileChange(normalizeAggregateRelayProfile({ ...profile, aggregate: nextAggregate }, form));
   };
@@ -8863,6 +8879,50 @@ function AggregateRelayProfileEditor({
             {t("聚合请求仍由本地 Responses 代理轮转成员；OpenAI 身份用于让 ChatGPT Remote 识别会话。")}
           </p>
         </Field>
+        <Field className="relay-field-context-window" label={t("上下文大小")}>
+          <Input
+            inputMode="numeric"
+            value={profile.contextWindow}
+            onChange={(event) => onProfileChange({
+              ...profile,
+              contextWindow: event.currentTarget.value.replace(/[^\d]/g, ""),
+            })}
+            placeholder={inheritedContextProfile
+              ? tf("留空继承成员：{0}", [inheritedContextProfile.contextWindow])
+              : t("留空不改写，例如 1000000")}
+          />
+          <p className="field-hint">
+            {t("显式设置会写入 model_context_window；留空时继承已选成员中最大的明确窗口。")}
+          </p>
+        </Field>
+        <Field className="relay-field-auto-compact" label={t("压缩上下文大小")}>
+          <Input
+            inputMode="numeric"
+            value={profile.autoCompactLimit}
+            onChange={(event) => onProfileChange({
+              ...profile,
+              autoCompactLimit: event.currentTarget.value.replace(/[^\d]/g, ""),
+            })}
+            placeholder={inheritedContextProfile?.autoCompactLimit
+              ? tf("留空继承成员：{0}", [inheritedContextProfile.autoCompactLimit])
+              : t("留空不改写，例如 900000")}
+          />
+          <p className="field-hint">
+            {t("显式设置会写入 model_auto_compact_token_limit；继承窗口时会同时继承该成员的阈值。")}
+          </p>
+        </Field>
+        <label className="switch-row compact relay-switch-row relay-field-code-mode-host">
+          <input
+            checked={aggregate.codeModeHost}
+            onChange={(event) => updateAggregate({ ...aggregate, codeModeHost: event.currentTarget.checked })}
+            type="checkbox"
+          />
+          <span>
+            <strong>{t("code_mode_host 兼容")}</strong>
+            <small>{t("仅向聚合上游转发函数工具；保留终端工具，过滤自定义语法与托管工具。")}</small>
+          </span>
+          <ToggleVisual />
+        </label>
       </div>
       <div className="aggregate-strategy-grid">
         {aggregateStrategyOptions.map((option) => (
@@ -11197,10 +11257,10 @@ function normalizeRelayProfile(profile: RelayProfile): RelayProfile {
         configContents: "",
         authContents: "",
         useCommonConfig: profile.useCommonConfig !== false,
-        contextWindow: "",
-        autoCompactLimit: "",
-        modelList: "",
-        modelWindows: "",
+        contextWindow: profile.contextWindow || "",
+        autoCompactLimit: profile.autoCompactLimit || "",
+        modelList: profile.modelList || "",
+        modelWindows: profile.modelWindows || "",
         modelRoutes: [],
         sub2apiEnabled: false,
         sub2apiMultiplier: "",
@@ -11249,6 +11309,7 @@ function hydrateAggregateRelayProfile(profile: RelayProfile, aggregate: Aggregat
     sessionProvider: normalizeRelaySessionProvider(aggregate.sessionProvider),
     aggregate: {
       strategy: aggregate.strategy,
+      codeModeHost: aggregate.codeModeHost === true,
       members: aggregate.members.map((member) => ({
         profileId: member.relayId,
         weight: clampAggregateWeight(member.weight),
@@ -12013,6 +12074,7 @@ function normalizeAggregateProfilesFromRelayProfiles(profiles: RelayProfile[]): 
       id: profile.id,
       name: profile.name || t("聚合供应商"),
       sessionProvider: normalizeRelaySessionProvider(profile.sessionProvider),
+      codeModeHost: aggregate.codeModeHost === true,
       strategy: aggregate.strategy,
       members: aggregate.members.map((member) => ({
         relayId: member.profileId,
@@ -12109,6 +12171,7 @@ function createAggregateRelayProfile(settings: BackendSettings): RelayProfile {
       modelRoutes: [],
       aggregate: {
         strategy: "failover",
+        codeModeHost: false,
         members: candidates.slice(0, 1).map((profile) => ({ profileId: profile.id, weight: 1 })),
       },
     },
@@ -12197,6 +12260,11 @@ const aggregateStrategyOptions: Array<{ value: RelayAggregateStrategy; label: st
     description: t("按成员顺序请求，失败后切到下一个供应商。"),
   },
   {
+    value: "priorityFallback",
+    label: t("优先降级"),
+    description: t("固定成员优先级；失败成员冷却，到期后自动回切。"),
+  },
+  {
     value: "conversationRoundRobin",
     label: t("按对话轮转"),
     description: t("同一对话保持一个成员，不同对话依次分配。"),
@@ -12256,7 +12324,11 @@ function normalizeAggregateConfig(
       seen.add(member.profileId);
       return { profileId: member.profileId, weight: clampAggregateWeight(member.weight) };
     });
-  return { strategy, members };
+  return {
+    strategy,
+    members: orderAggregateMembersByCandidates(members, candidates.map((profile) => profile.id)),
+    codeModeHost: aggregate?.codeModeHost === true,
+  };
 }
 
 function aggregateMemberCandidates(settings: BackendSettings, aggregateId: string): RelayProfile[] {
@@ -12281,6 +12353,7 @@ function aggregateStrategyLabel(strategy: RelayAggregateStrategy): string {
 
 function aggregateStrategyHelp(strategy: RelayAggregateStrategy): string {
   if (strategy === "failover") return t("失败切换会保留成员顺序，优先使用第一个可用供应商。");
+  if (strategy === "priorityFallback") return t("优先降级会跳过仍在冷却的失败成员，并在冷却到期后的下一请求自动恢复其原始优先级。");
   if (strategy === "conversationRoundRobin") return t("按对话轮转会让同一对话尽量保持固定成员，降低上下文漂移。");
   if (strategy === "requestRoundRobin") return t("按请求轮转会逐请求切换成员，适合供应商能力接近的场景。");
   return t("权重轮转会读取每个成员的权重值，权重越高的成员获得更多请求。");

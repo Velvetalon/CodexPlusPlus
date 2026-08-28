@@ -6,6 +6,7 @@
  */
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::settings::{
     AggregateRelayProfile, AggregateRelayStrategy, BackendSettings, RelayProfile,
@@ -73,6 +74,32 @@ pub enum RotationEvent {
     Failure,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayRequestOutcome {
+    HttpStatus(u16),
+    TransportFailure,
+}
+
+impl RelayRequestOutcome {
+    pub fn cooldown_duration(self) -> Option<Duration> {
+        match self {
+            Self::HttpStatus(status) if (200..300).contains(&status) => None,
+            Self::HttpStatus(429) => Some(Duration::from_secs(30 * 60)),
+            Self::HttpStatus(402) => Some(Duration::from_secs(60 * 60)),
+            Self::HttpStatus(502) | Self::HttpStatus(503) => Some(Duration::from_secs(3 * 60)),
+            Self::HttpStatus(_) | Self::TransportFailure => Some(Duration::from_secs(10 * 60)),
+        }
+    }
+
+    fn rotation_event(self) -> RotationEvent {
+        if self.cooldown_duration().is_some() {
+            RotationEvent::Failure
+        } else {
+            RotationEvent::Success
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RelayRotationSelector {
     aggregate: AggregateRelayProfile,
@@ -80,6 +107,7 @@ pub struct RelayRotationSelector {
     request_index: usize,
     weighted_index: usize,
     conversation_assignments: HashMap<String, String>,
+    cooldowns: HashMap<String, Instant>,
 }
 
 static GLOBAL_SELECTOR: OnceLock<Mutex<Option<RelayRotationSelector>>> = OnceLock::new();
@@ -94,6 +122,7 @@ impl RelayRotationSelector {
             request_index: 0,
             weighted_index: 0,
             conversation_assignments: HashMap::new(),
+            cooldowns: HashMap::new(),
         })
     }
 
@@ -102,9 +131,21 @@ impl RelayRotationSelector {
         settings: &BackendSettings,
         context: RotationContext,
     ) -> Result<RelayProfile, SelectionError> {
+        self.select_at(settings, context, Instant::now())
+    }
+
+    pub fn select_at(
+        &mut self,
+        settings: &BackendSettings,
+        context: RotationContext,
+        now: Instant,
+    ) -> Result<RelayProfile, SelectionError> {
         validate_aggregate_members(settings, &self.aggregate)?;
+        self.cooldowns
+            .retain(|_, cooldown_until| *cooldown_until > now);
         let relay_id = match self.aggregate.strategy {
             AggregateRelayStrategy::Failover => self.member_id_at(self.failover_index),
+            AggregateRelayStrategy::PriorityFallback => self.select_priority_fallback(now),
             AggregateRelayStrategy::ConversationRoundRobin => {
                 self.select_for_conversation(context.conversation_id)
             }
@@ -118,9 +159,18 @@ impl RelayRotationSelector {
     }
 
     pub fn peek(&self, settings: &BackendSettings) -> Result<RelayProfile, SelectionError> {
+        self.peek_at(settings, Instant::now())
+    }
+
+    pub fn peek_at(
+        &self,
+        settings: &BackendSettings,
+        now: Instant,
+    ) -> Result<RelayProfile, SelectionError> {
         validate_aggregate_members(settings, &self.aggregate)?;
         let relay_id = match self.aggregate.strategy {
             AggregateRelayStrategy::Failover => self.member_id_at(self.failover_index),
+            AggregateRelayStrategy::PriorityFallback => self.select_priority_fallback(now),
             AggregateRelayStrategy::ConversationRoundRobin
             | AggregateRelayStrategy::RequestRoundRobin => self.member_id_at(self.request_index),
             AggregateRelayStrategy::WeightedRoundRobin => {
@@ -141,6 +191,88 @@ impl RelayRotationSelector {
         {
             self.failover_index = (self.failover_index + 1) % self.aggregate.members.len();
         }
+    }
+
+    pub fn record_outcome_at(
+        &mut self,
+        relay_id: &str,
+        outcome: RelayRequestOutcome,
+        now: Instant,
+    ) {
+        if self.aggregate.strategy != AggregateRelayStrategy::PriorityFallback {
+            self.record_event(outcome.rotation_event());
+            return;
+        }
+        if !self
+            .aggregate
+            .members
+            .iter()
+            .any(|member| member.relay_id == relay_id)
+        {
+            return;
+        }
+        if let Some(duration) = outcome.cooldown_duration() {
+            self.cooldowns.insert(relay_id.to_string(), now + duration);
+        } else {
+            self.cooldowns.remove(relay_id);
+        }
+    }
+
+    pub fn cooldown_until(&self, relay_id: &str) -> Option<Instant> {
+        self.cooldowns.get(relay_id).copied()
+    }
+
+    pub fn priority_fallbacks_after(&self, relay_id: &str, now: Instant) -> Vec<String> {
+        let Some(start_index) = self
+            .aggregate
+            .members
+            .iter()
+            .position(|member| member.relay_id == relay_id)
+        else {
+            return Vec::new();
+        };
+        if self
+            .aggregate
+            .members
+            .iter()
+            .all(|member| !self.is_available(&member.relay_id, now))
+        {
+            // 所有成员都在冷却时，不再返回其它冷却中的成员作为后备，
+            // 否则协议代理会逐个尝试它们并把冷却时间无限顺延，造成无限重试。
+            // 此时只保留 select 选出的“最早到期”成员作为唯一候选，失败即报错。
+            return Vec::new();
+        }
+        self.aggregate
+            .members
+            .iter()
+            .skip(start_index + 1)
+            .filter(|member| self.is_available(&member.relay_id, now))
+            .map(|member| member.relay_id.clone())
+            .collect()
+    }
+
+    fn select_priority_fallback(&self, now: Instant) -> String {
+        if let Some(member) = self
+            .aggregate
+            .members
+            .iter()
+            .find(|member| self.is_available(&member.relay_id, now))
+        {
+            return member.relay_id.clone();
+        }
+        self.aggregate
+            .members
+            .iter()
+            .min_by_key(|member| self.cooldowns.get(&member.relay_id).copied())
+            .expect("aggregate members validated as non-empty")
+            .relay_id
+            .clone()
+    }
+
+    fn is_available(&self, relay_id: &str, now: Instant) -> bool {
+        self.cooldowns
+            .get(relay_id)
+            .is_none_or(|cooldown_until| *cooldown_until <= now)
     }
 
     fn select_for_conversation(&mut self, conversation_id: Option<String>) -> String {
@@ -233,30 +365,92 @@ pub fn fallback_relays_after(
     settings: &BackendSettings,
     relay_id: &str,
 ) -> Result<Vec<RelayProfile>, SelectionError> {
+    fallback_relays_after_at(settings, relay_id, Instant::now())
+}
+
+pub fn fallback_relays_after_at(
+    settings: &BackendSettings,
+    relay_id: &str,
+    now: Instant,
+) -> Result<Vec<RelayProfile>, SelectionError> {
     let Some(active_aggregate) = settings.active_aggregate_relay_profile() else {
         return Ok(Vec::new());
     };
     validate_aggregate_members(settings, &active_aggregate)?;
-    let start_index = active_aggregate
-        .members
-        .iter()
-        .position(|member| member.relay_id == relay_id)
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    (0..active_aggregate.members.len().saturating_sub(1))
-        .map(|offset| {
-            let index = (start_index + offset) % active_aggregate.members.len();
-            &active_aggregate.members[index]
-        })
-        .map(|member| {
-            relay_profile_by_id(settings, &member.relay_id).ok_or_else(|| {
+    let relay_ids = if active_aggregate.strategy == AggregateRelayStrategy::PriorityFallback {
+        let lock = GLOBAL_SELECTOR.get_or_init(|| Mutex::new(None));
+        let mut guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let needs_new_selector = guard
+            .as_ref()
+            .map(|selector| selector.aggregate != active_aggregate)
+            .unwrap_or(true);
+        if needs_new_selector {
+            *guard = Some(RelayRotationSelector::from_settings(settings)?);
+        }
+        guard
+            .as_ref()
+            .expect("selector initialized")
+            .priority_fallbacks_after(relay_id, now)
+    } else {
+        let start_index = active_aggregate
+            .members
+            .iter()
+            .position(|member| member.relay_id == relay_id)
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        (0..active_aggregate.members.len().saturating_sub(1))
+            .map(|offset| {
+                let index = (start_index + offset) % active_aggregate.members.len();
+                active_aggregate.members[index].relay_id.clone()
+            })
+            .collect()
+    };
+    relay_ids
+        .into_iter()
+        .map(|candidate_id| {
+            relay_profile_by_id(settings, &candidate_id).ok_or_else(|| {
                 SelectionError::UnknownMemberRelay {
                     aggregate_id: active_aggregate.id.clone(),
-                    relay_id: member.relay_id.clone(),
+                    relay_id: candidate_id,
                 }
             })
         })
         .collect()
+}
+
+pub fn record_relay_request_outcome(
+    settings: &BackendSettings,
+    relay_id: &str,
+    outcome: RelayRequestOutcome,
+) {
+    record_relay_request_outcome_at(settings, relay_id, outcome, Instant::now());
+}
+
+pub fn record_relay_request_outcome_at(
+    settings: &BackendSettings,
+    relay_id: &str,
+    outcome: RelayRequestOutcome,
+    now: Instant,
+) {
+    let Some(active_aggregate) = settings.active_aggregate_relay_profile() else {
+        clear_global_selector();
+        return;
+    };
+    let lock = GLOBAL_SELECTOR.get_or_init(|| Mutex::new(None));
+    let mut guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let needs_new_selector = guard
+        .as_ref()
+        .map(|selector| selector.aggregate != active_aggregate)
+        .unwrap_or(true);
+    if needs_new_selector {
+        let Ok(selector) = RelayRotationSelector::from_settings(settings) else {
+            return;
+        };
+        *guard = Some(selector);
+    }
+    if let Some(selector) = guard.as_mut() {
+        selector.record_outcome_at(relay_id, outcome, now);
+    }
 }
 
 pub fn record_relay_request_event(settings: &BackendSettings, event: RotationEvent) {

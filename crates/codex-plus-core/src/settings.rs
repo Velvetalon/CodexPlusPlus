@@ -115,6 +115,7 @@ pub struct RelayModelRoute {
 pub enum AggregateRelayStrategy {
     #[default]
     Failover,
+    PriorityFallback,
     ConversationRoundRobin,
     RequestRoundRobin,
     WeightedRoundRobin,
@@ -153,6 +154,8 @@ pub struct AggregateRelayProfile {
     pub name: String,
     #[serde(default)]
     pub session_provider: RelaySessionProvider,
+    #[serde(default)]
+    pub code_mode_host: bool,
     #[serde(default)]
     pub strategy: AggregateRelayStrategy,
     #[serde(default)]
@@ -665,7 +668,9 @@ impl BackendSettings {
             .iter()
             .find(|profile| profile.id == self.active_relay_id)
         {
-            return profile.clone();
+            let mut profile = profile.clone();
+            self.apply_aggregate_context_fallback(&mut profile);
+            return profile;
         }
 
         RelayProfile {
@@ -735,6 +740,56 @@ impl BackendSettings {
             .iter()
             .find(|profile| profile.id == active_aggregate_id)
             .cloned()
+    }
+
+    fn apply_aggregate_context_fallback(&self, profile: &mut RelayProfile) {
+        if profile.relay_mode != RelayMode::Aggregate {
+            return;
+        }
+        let Some(aggregate) = self.active_aggregate_relay_profile() else {
+            return;
+        };
+        let mut source: Option<(&RelayProfile, u64)> = None;
+        for member in &aggregate.members {
+            let Some(member_profile) = self
+                .relay_profiles
+                .iter()
+                .find(|candidate| candidate.id == member.relay_id)
+            else {
+                continue;
+            };
+            let Some(context_window) = member_profile
+                .context_window
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0)
+            else {
+                continue;
+            };
+            if source.is_none_or(|(_, selected_window)| context_window > selected_window) {
+                source = Some((member_profile, context_window));
+            }
+        }
+        let Some((source, source_window)) = source else {
+            return;
+        };
+
+        let inherited_context = profile.context_window.trim().is_empty();
+        let explicit_context_matches_source = profile
+            .context_window
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .is_some_and(|value| value == source_window);
+        if inherited_context {
+            profile.context_window = source.context_window.clone();
+        }
+        if profile.auto_compact_limit.trim().is_empty()
+            && (inherited_context || explicit_context_matches_source)
+        {
+            profile.auto_compact_limit = source.auto_compact_limit.clone();
+        }
     }
 
     pub fn active_relay_session_provider(&self) -> RelaySessionProvider {
@@ -1568,6 +1623,7 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
     for profile in &mut settings.relay_profiles {
         let _ = crate::relay_config::normalize_relay_profile_for_storage(profile);
     }
+    normalize_aggregate_member_order(&mut settings);
     settings.codex_app_image_overlay_opacity =
         clamp_image_overlay_opacity(settings.codex_app_image_overlay_opacity);
     settings.codex_app_image_overlay_fit_mode =
@@ -1626,6 +1682,25 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
     settings.codex_app_stepwise_timeout_ms =
         clamp_stepwise_timeout_ms(settings.codex_app_stepwise_timeout_ms);
     settings
+}
+
+fn normalize_aggregate_member_order(settings: &mut BackendSettings) {
+    for aggregate in &mut settings.aggregate_relay_profiles {
+        let mut stored_members = std::mem::take(&mut aggregate.members);
+        let mut ordered_members = Vec::with_capacity(stored_members.len());
+        for relay in &settings.relay_profiles {
+            if let Some(index) = stored_members
+                .iter()
+                .position(|member| member.relay_id == relay.id)
+            {
+                ordered_members.push(stored_members.remove(index));
+            }
+        }
+        // Keep unknown members so the existing validation path can report them
+        // instead of silently discarding a malformed settings entry.
+        ordered_members.extend(stored_members);
+        aggregate.members = ordered_members;
+    }
 }
 
 fn split_context_config_sections(config: &str) -> (String, String) {
@@ -2433,6 +2508,7 @@ experimental_bearer_token = "sk-existing""#
                 id: "agg".to_string(),
                 name: "聚合".to_string(),
                 session_provider: RelaySessionProvider::Openai,
+                code_mode_host: true,
                 strategy: AggregateRelayStrategy::WeightedRoundRobin,
                 members: vec![
                     AggregateRelayMember {
@@ -2465,11 +2541,123 @@ experimental_bearer_token = "sk-existing""#
             active_aggregate.session_provider,
             RelaySessionProvider::Openai
         );
+        assert!(active_aggregate.code_mode_host);
         assert_eq!(
             loaded.active_relay_session_provider(),
             RelaySessionProvider::Openai
         );
         assert!(loaded.active_relay_uses_protocol_proxy());
+    }
+
+    #[test]
+    fn active_aggregate_inherits_largest_member_context_and_paired_compaction_limit() {
+        let settings = BackendSettings {
+            relay_profiles: vec![
+                RelayProfile {
+                    id: "openai-account-relay".to_string(),
+                    context_window: String::new(),
+                    auto_compact_limit: String::new(),
+                    ..RelayProfile::default()
+                },
+                RelayProfile {
+                    id: "krill".to_string(),
+                    context_window: "1000000".to_string(),
+                    auto_compact_limit: "900000".to_string(),
+                    ..RelayProfile::default()
+                },
+                RelayProfile {
+                    id: "shuai-api".to_string(),
+                    context_window: "272000".to_string(),
+                    auto_compact_limit: "250000".to_string(),
+                    ..RelayProfile::default()
+                },
+                RelayProfile {
+                    id: "agg".to_string(),
+                    relay_mode: RelayMode::Aggregate,
+                    context_window: String::new(),
+                    auto_compact_limit: String::new(),
+                    ..RelayProfile::default()
+                },
+            ],
+            active_relay_id: "agg".to_string(),
+            active_aggregate_relay_id: "agg".to_string(),
+            aggregate_relay_profiles: vec![AggregateRelayProfile {
+                id: "agg".to_string(),
+                name: "聚合".to_string(),
+                session_provider: RelaySessionProvider::Custom,
+                code_mode_host: false,
+                strategy: AggregateRelayStrategy::PriorityFallback,
+                members: vec![
+                    AggregateRelayMember {
+                        relay_id: "openai-account-relay".to_string(),
+                        weight: 1,
+                    },
+                    AggregateRelayMember {
+                        relay_id: "krill".to_string(),
+                        weight: 1,
+                    },
+                    AggregateRelayMember {
+                        relay_id: "shuai-api".to_string(),
+                        weight: 1,
+                    },
+                ],
+            }],
+            ..BackendSettings::default()
+        };
+
+        let active = settings.active_relay_profile();
+        assert_eq!(active.context_window, "1000000");
+        assert_eq!(active.auto_compact_limit, "900000");
+        assert!(settings.relay_profiles[3].context_window.is_empty());
+    }
+
+    #[test]
+    fn active_aggregate_explicit_context_and_compaction_limit_override_members() {
+        let settings = BackendSettings {
+            relay_profiles: vec![
+                RelayProfile {
+                    id: "member".to_string(),
+                    context_window: "1000000".to_string(),
+                    auto_compact_limit: "900000".to_string(),
+                    ..RelayProfile::default()
+                },
+                RelayProfile {
+                    id: "agg".to_string(),
+                    relay_mode: RelayMode::Aggregate,
+                    context_window: "500000".to_string(),
+                    auto_compact_limit: "450000".to_string(),
+                    ..RelayProfile::default()
+                },
+            ],
+            active_relay_id: "agg".to_string(),
+            active_aggregate_relay_id: "agg".to_string(),
+            aggregate_relay_profiles: vec![AggregateRelayProfile {
+                id: "agg".to_string(),
+                name: "聚合".to_string(),
+                session_provider: RelaySessionProvider::Custom,
+                code_mode_host: false,
+                strategy: AggregateRelayStrategy::PriorityFallback,
+                members: vec![AggregateRelayMember {
+                    relay_id: "member".to_string(),
+                    weight: 1,
+                }],
+            }],
+            ..BackendSettings::default()
+        };
+
+        let active = settings.active_relay_profile();
+        assert_eq!(active.context_window, "500000");
+        assert_eq!(active.auto_compact_limit, "450000");
+    }
+
+    #[test]
+    fn priority_fallback_strategy_uses_camel_case_json_and_roundtrips() {
+        let serialized = serde_json::to_value(AggregateRelayStrategy::PriorityFallback).unwrap();
+        assert_eq!(serialized, json!("priorityFallback"));
+        assert_eq!(
+            serde_json::from_value::<AggregateRelayStrategy>(serialized).unwrap(),
+            AggregateRelayStrategy::PriorityFallback
+        );
     }
 
     #[test]
@@ -2866,6 +3054,7 @@ experimental_bearer_token = "sk-existing""#
                     {
                         "id": "agg",
                         "name": "聚合",
+                        "codeModeHost": true,
                         "strategy": "weightedRoundRobin",
                         "members": [
                             { "relayId": "relay-a", "weight": 1 },
@@ -2887,7 +3076,51 @@ experimental_bearer_token = "sk-existing""#
         assert_eq!(active_aggregate.members.len(), 2);
         assert_eq!(active_aggregate.members[1].relay_id, "relay-b");
         assert_eq!(active_aggregate.members[1].weight, 4);
+        assert!(active_aggregate.code_mode_host);
         assert!(updated.active_relay_uses_protocol_proxy());
+    }
+
+    #[test]
+    fn settings_load_reorders_selected_aggregate_members_to_match_relay_profiles() {
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "relayProfiles": [
+                    { "id": "openai-account-relay", "name": "OpenAI账号中转" },
+                    { "id": "krill", "name": "krill" },
+                    { "id": "shuai-api", "name": "帅api" },
+                    { "id": "agg", "name": "聚合", "relayMode": "aggregate" }
+                ],
+                "activeRelayId": "agg",
+                "aggregateRelayProfiles": [{
+                    "id": "agg",
+                    "name": "聚合",
+                    "strategy": "priorityFallback",
+                    "members": [
+                        { "relayId": "krill", "weight": 2 },
+                        { "relayId": "shuai-api", "weight": 3 },
+                        { "relayId": "openai-account-relay", "weight": 1 }
+                    ]
+                }],
+                "activeAggregateRelayId": "agg"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let loaded = SettingsStore::new(path).load().unwrap();
+        let member_ids = loaded.aggregate_relay_profiles[0]
+            .members
+            .iter()
+            .map(|member| member.relay_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            member_ids,
+            vec!["openai-account-relay", "krill", "shuai-api"]
+        );
+        assert_eq!(loaded.aggregate_relay_profiles[0].members[0].weight, 1);
     }
 
     #[test]
