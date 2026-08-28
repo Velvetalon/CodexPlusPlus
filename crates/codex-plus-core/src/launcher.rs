@@ -606,6 +606,31 @@ fn helper_bind_host() -> String {
         .unwrap_or_else(|| "127.0.0.1".to_string())
 }
 
+pub async fn helper_backend_available(helper_port: u16) -> bool {
+    let Ok(client) = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    else {
+        return false;
+    };
+    let Ok(response) = client
+        .get(format!("http://127.0.0.1:{helper_port}/backend/status"))
+        .send()
+        .await
+    else {
+        return false;
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    let Ok(payload) = response.json::<serde_json::Value>().await else {
+        return false;
+    };
+    payload.get("status").and_then(serde_json::Value::as_str) == Some("ok")
+        && payload.get("transport").and_then(serde_json::Value::as_str) == Some("http-helper")
+}
+
 #[async_trait(?Send)]
 impl LaunchHooks for DefaultLaunchHooks {
     fn resolve_app_dir(
@@ -1218,6 +1243,35 @@ async fn handle_helper_connection(
             }))?,
             "application/json; charset=utf-8".to_string(),
             "helper.backend_status_ok",
+        )
+    } else if path == "/relay-rotation/status" && matches!(method, "GET" | "POST") {
+        let settings = crate::settings::SettingsStore::default()
+            .load()
+            .unwrap_or_default();
+        let cooldown = crate::relay_rotation::priority_fallback_cooldown_status(&settings);
+        (
+            "200 OK".to_string(),
+            serde_json::to_vec(&serde_json::json!({
+                "status": "ok",
+                "message": "优先降级冷却状态已读取。",
+                "aggregateId": cooldown.aggregate_id,
+                "members": cooldown.members
+            }))?,
+            "application/json; charset=utf-8".to_string(),
+            "helper.relay_rotation_status_ok",
+        )
+    } else if path == "/relay-rotation/reset" && method == "POST" {
+        let cooldown = crate::relay_rotation::reset_all_priority_fallback_cooldowns();
+        (
+            "200 OK".to_string(),
+            serde_json::to_vec(&serde_json::json!({
+                "status": "ok",
+                "message": "所有供应商的冷却时间和连续失败计数已重置。",
+                "aggregateId": cooldown.aggregate_id,
+                "members": cooldown.members
+            }))?,
+            "application/json; charset=utf-8".to_string(),
+            "helper.relay_rotation_reset_ok",
         )
     } else if path == "/diagnostics/log" && matches!(method, "POST" | "OPTIONS") {
         if method == "POST" {
@@ -3359,6 +3413,184 @@ mod tests {
             serde_json::from_slice(&upstream_request[header_end + 4..]).unwrap();
         assert_eq!(upstream_body["model"], "gpt-5.6-sol");
         crate::paths::set_settings_path_for_tests(previous_settings_path);
+    }
+
+    #[tokio::test]
+    async fn helper_cooldown_routes_apply_three_failure_threshold_and_reset() {
+        let _settings_guard = crate::paths::settings_path_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let settings_path = temp.path().join("settings.json");
+        let previous_settings_path =
+            crate::paths::set_settings_path_for_tests(Some(settings_path.clone()));
+        let failing_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let failing_addr = failing_listener.local_addr().unwrap();
+        let working_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let working_addr = working_listener.local_addr().unwrap();
+        let failing_calls = Arc::new(AtomicUsize::new(0));
+        let working_calls = Arc::new(AtomicUsize::new(0));
+        let failing_server = tokio::spawn(mock_responses_server(
+            failing_listener,
+            429,
+            failing_calls.clone(),
+        ));
+        let working_server = tokio::spawn(mock_responses_server(
+            working_listener,
+            200,
+            working_calls.clone(),
+        ));
+        let settings = serde_json::json!({
+            "relayProfiles": [
+                {
+                    "id": "relay-threshold-a",
+                    "name": "A",
+                    "baseUrl": format!("http://{failing_addr}/v1"),
+                    "apiKey": "sk-a",
+                    "protocol": "responses",
+                    "relayMode": "pureApi"
+                },
+                {
+                    "id": "relay-threshold-b",
+                    "name": "B",
+                    "baseUrl": format!("http://{working_addr}/v1"),
+                    "apiKey": "sk-b",
+                    "protocol": "responses",
+                    "relayMode": "pureApi"
+                },
+                {
+                    "id": "aggregate-threshold",
+                    "name": "Aggregate",
+                    "relayMode": "aggregate",
+                    "protocol": "responses"
+                }
+            ],
+            "aggregateRelayProfiles": [{
+                "id": "aggregate-threshold",
+                "name": "Aggregate",
+                "sessionProvider": "custom",
+                "strategy": "priorityFallback",
+                "members": [
+                    { "relayId": "relay-threshold-a", "weight": 1 },
+                    { "relayId": "relay-threshold-b", "weight": 1 }
+                ]
+            }],
+            "activeRelayId": "aggregate-threshold",
+            "activeAggregateRelayId": "aggregate-threshold"
+        });
+        std::fs::write(settings_path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+
+        let request_body = r#"{"model":"gpt-test","input":"probe","stream":false}"#;
+        let request = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{request_body}",
+            request_body.len()
+        );
+        for expected_failures in [1, 2] {
+            let response = send_raw_helper_request(request.as_bytes()).await;
+            assert!(
+                String::from_utf8_lossy(&response).starts_with("HTTP/1.1 429 Too Many Requests")
+            );
+            let status = helper_json_response(
+                &send_raw_helper_request(
+                    b"GET /relay-rotation/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+                )
+                .await,
+            );
+            assert_eq!(
+                status["members"][0]["consecutiveFailures"],
+                expected_failures
+            );
+            assert_eq!(status["members"][0]["cooldownRemainingSeconds"], 0);
+            assert_eq!(working_calls.load(Ordering::SeqCst), 0);
+        }
+
+        let response = send_raw_helper_request(request.as_bytes()).await;
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK"));
+        let cooling = helper_json_response(
+            &send_raw_helper_request(
+                b"GET /relay-rotation/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            )
+            .await,
+        );
+        assert_eq!(cooling["members"][0]["consecutiveFailures"], 0);
+        assert!(
+            cooling["members"][0]["cooldownRemainingSeconds"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(
+            cooling["members"][0]["lastCooldownReason"]["type"],
+            "httpStatus"
+        );
+        assert_eq!(
+            cooling["members"][0]["lastCooldownReason"]["statusCode"],
+            429
+        );
+
+        let response = send_raw_helper_request(request.as_bytes()).await;
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(failing_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(working_calls.load(Ordering::SeqCst), 2);
+
+        let reset = helper_json_response(
+            &send_raw_helper_request(
+                b"POST /relay-rotation/reset HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await,
+        );
+        assert_eq!(reset["members"][0]["consecutiveFailures"], 0);
+        assert_eq!(reset["members"][0]["cooldownRemainingSeconds"], 0);
+
+        let response = send_raw_helper_request(request.as_bytes()).await;
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 429 Too Many Requests"));
+        assert_eq!(failing_calls.load(Ordering::SeqCst), 4);
+        assert_eq!(working_calls.load(Ordering::SeqCst), 2);
+
+        failing_server.abort();
+        working_server.abort();
+        crate::paths::set_settings_path_for_tests(previous_settings_path);
+    }
+
+    async fn mock_responses_server(
+        listener: tokio::net::TcpListener,
+        status_code: u16,
+        calls: Arc<AtomicUsize>,
+    ) {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            calls.fetch_add(1, Ordering::SeqCst);
+            let mut buffer = [0_u8; 8192];
+            let _ = stream.read(&mut buffer).await;
+            let (status, body) = if status_code == 200 {
+                (
+                    "200 OK",
+                    br#"{"id":"resp_mock","object":"response","status":"completed","output":[]}"#
+                        .as_slice(),
+                )
+            } else {
+                (
+                    "429 Too Many Requests",
+                    br#"{"error":{"message":"mock rate limit","type":"rate_limit_error"}}"#
+                        .as_slice(),
+                )
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.write_all(body).await;
+        }
+    }
+
+    fn helper_json_response(response: &[u8]) -> serde_json::Value {
+        let header_end = find_header_end(response).expect("helper response has headers");
+        serde_json::from_slice(&response[header_end + 4..]).unwrap()
     }
 
     async fn send_raw_helper_request(request: &[u8]) -> Vec<u8> {

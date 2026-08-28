@@ -154,6 +154,7 @@ pub fn run() {
             commands::reset_settings,
             commands::reset_image_overlay_settings,
             commands::relay_status,
+            commands::relay_cooldown_status,
             commands::read_relay_files,
             commands::check_env_conflicts,
             commands::check_relay_environment,

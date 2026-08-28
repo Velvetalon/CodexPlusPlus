@@ -103,6 +103,12 @@ import {
 } from "./model-windows";
 import { relayAuthForLiveDraft, shouldBackfillRelayProfileBeforeSwitch } from "./relay-live-files";
 import { orderAggregateMembersByCandidates } from "./relay-aggregate-order";
+import {
+  formatCooldownDuration,
+  relayCooldownReasonLabel,
+  relayPriorityHighlights,
+  type RelayCooldownMemberStatus,
+} from "./relay-cooldown";
 import { resolveProviderName } from "./provider-name";
 import { resolveProviderSyncCompletion } from "./provider-sync-flow";
 import { resolveLaunchStatus } from "./launch-status";
@@ -510,6 +516,11 @@ type RelayResult = CommandResult<{
 }>;
 
 type RelayPayload = Omit<RelayResult, "status" | "message">;
+
+type RelayCooldownStatusResult = CommandResult<{
+  aggregateId: string | null;
+  members: RelayCooldownMemberStatus[];
+}>;
 
 type RelayFilesResult = CommandResult<{
   configPath: string;
@@ -1410,6 +1421,23 @@ export function App() {
       if (!silent) showResultNotice(t("登录状态"), result, { silentSuccess: true });
     }
   };
+  const requestRelayCooldownStatus = async (
+    reset: boolean,
+    silent: boolean,
+  ): Promise<RelayCooldownStatusResult | null> => {
+    const helperPort = overview?.latest_launch?.helper_port ?? parsePort(launchForm.helperPort, 57321);
+    const result = await run(() => call<RelayCooldownStatusResult>("relay_cooldown_status", {
+      helperPort,
+      reset,
+    }));
+    if (!result) return null;
+    if (!silent) {
+      showResultNotice(reset ? t("重置冷却") : t("冷却状态"), result, { silentSuccess: true });
+    }
+    return result;
+  };
+  const refreshRelayCooldownStatus = (silent = true) => requestRelayCooldownStatus(false, silent);
+  const resetRelayCooldowns = () => requestRelayCooldownStatus(true, false);
   const refreshRelayFiles = async (silent = false) => {
     const result = await run(() => call<RelayFilesResult>("read_relay_files"));
     if (result) {
@@ -3376,6 +3404,8 @@ export function App() {
         await saveLaunchMode(launchMode);
       },
       refreshRelay,
+      refreshRelayCooldownStatus,
+      resetRelayCooldowns,
       refreshRelayFiles,
       refreshEnvConflicts,
       refreshRelayEnvironment,
@@ -3795,6 +3825,8 @@ type Actions = {
   setProviderSyncTarget: (provider: string) => void;
   setLaunchMode: (launchMode: LaunchMode) => Promise<void>;
   refreshRelay: () => Promise<void>;
+  refreshRelayCooldownStatus: (silent?: boolean) => Promise<RelayCooldownStatusResult | null>;
+  resetRelayCooldowns: () => Promise<RelayCooldownStatusResult | null>;
   refreshRelayFiles: () => Promise<RelayFilesResult | null>;
   refreshEnvConflicts: (silent?: boolean) => Promise<EnvConflictsResult | null>;
   refreshRelayEnvironment: (silent?: boolean) => Promise<RelayEnvironmentResult | null>;
@@ -8245,6 +8277,7 @@ function RelayProfileEditor({
         profile={profile}
         form={form}
         onProfileChange={onProfileChange}
+        actions={actions}
       />
     );
   }
@@ -8806,13 +8839,18 @@ function AggregateRelayProfileEditor({
   profile,
   form,
   onProfileChange,
+  actions,
 }: {
   profile: RelayProfile;
   form: BackendSettings;
   onProfileChange: (value: RelayProfile) => void;
+  actions: Actions;
 }) {
+  const [cooldownStatus, setCooldownStatus] = useState<RelayCooldownStatusResult | null>(null);
+  const [resettingCooldowns, setResettingCooldowns] = useState(false);
   const candidates = aggregateMemberCandidates(form, profile.id);
   const aggregate = normalizeAggregateConfig(profile.aggregate, candidates);
+  const priorityFallback = aggregate.strategy === "priorityFallback";
   const memberIds = new Set(aggregate.members.map((member) => member.profileId));
   const sessionProvider = normalizeRelaySessionProvider(profile.sessionProvider);
   const inheritedContextProfile = candidates
@@ -8841,6 +8879,39 @@ function AggregateRelayProfileEditor({
     });
   };
   const totalWeight = aggregate.members.reduce((total, member) => total + clampAggregateWeight(member.weight), 0);
+  useEffect(() => {
+    if (!priorityFallback) {
+      setCooldownStatus(null);
+      return undefined;
+    }
+    let active = true;
+    const refresh = async () => {
+      const result = await actions.refreshRelayCooldownStatus(true);
+      if (active && result) setCooldownStatus(result);
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 1_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [actions, priorityFallback, profile.id]);
+  const resetCooldowns = async () => {
+    setResettingCooldowns(true);
+    try {
+      const result = await actions.resetRelayCooldowns();
+      if (result) setCooldownStatus(result);
+    } finally {
+      setResettingCooldowns(false);
+    }
+  };
+  const cooldownStatusActive = priorityFallback && cooldownStatus?.aggregateId === profile.id;
+  const priorityHighlights = cooldownStatusActive
+    ? relayPriorityHighlights(
+        aggregate.members.map((member) => member.profileId),
+        cooldownStatus.members,
+      )
+    : { currentRelayId: null, nextRelayId: null };
 
   return (
     <div className="relay-profile-editor aggregate-editor">
@@ -8943,15 +9014,37 @@ function AggregateRelayProfileEditor({
             <strong>{t("成员供应商")}</strong>
             <span>{t("只能勾选已填写 Base URL / Key 的 API 供应商，聚合供应商不会作为成员。")}</span>
           </div>
-          <UiBadge variant="outline">{aggregate.members.length} / {candidates.length}</UiBadge>
+          <div className="aggregate-members-head-actions">
+            <UiBadge variant="outline">{aggregate.members.length} / {candidates.length}</UiBadge>
+            {priorityFallback ? (
+              <Button
+                disabled={resettingCooldowns}
+                onClick={() => void resetCooldowns()}
+                size="sm"
+                type="button"
+                variant="outline"
+              >
+                <RotateCcw className="h-4 w-4" />
+                {resettingCooldowns ? t("重置中") : t("重置")}
+              </Button>
+            ) : null}
+          </div>
         </div>
         {candidates.length ? (
           <div className="aggregate-member-list">
             {candidates.map((candidate) => {
               const member = aggregate.members.find((item) => item.profileId === candidate.id);
               const checked = memberIds.has(candidate.id);
+              const priorityRole = candidate.id === priorityHighlights.currentRelayId
+                ? "current"
+                : candidate.id === priorityHighlights.nextRelayId
+                  ? "next"
+                  : null;
               return (
-                <label className={`aggregate-member-row ${checked ? "selected" : ""}`} key={candidate.id}>
+                <label
+                  className={`aggregate-member-row ${checked ? "selected" : ""}${priorityFallback ? " priority-fallback" : ""}${priorityRole ? ` priority-${priorityRole}` : ""}`}
+                  key={candidate.id}
+                >
                   <input
                     checked={checked}
                     onChange={(event) => toggleMember(candidate.id, event.currentTarget.checked)}
@@ -8961,16 +9054,24 @@ function AggregateRelayProfileEditor({
                     <strong>{candidate.name || t("未命名供应商")}</strong>
                     <small>{relayModeLabel(candidate.relayMode)} · {relayProtocolLabel(candidate.protocol)} · {relayProfileConfigBrief(candidate)}</small>
                   </span>
-                  <span className="aggregate-weight-box">
-                    <span>{t("权重")}</span>
-                    <Input
-                      disabled={!checked}
-                      min={1}
-                      onChange={(event) => updateWeight(candidate.id, Number.parseInt(event.currentTarget.value, 10))}
-                      type="number"
-                      value={String(member?.weight ?? 1)}
+                  {priorityFallback ? (
+                    <RelayCooldownSummary
+                      active={cooldownStatusActive}
+                      priorityRole={priorityRole}
+                      status={cooldownStatus?.members.find((item) => item.relayId === candidate.id) ?? null}
                     />
-                  </span>
+                  ) : (
+                    <span className="aggregate-weight-box">
+                      <span>{t("权重")}</span>
+                      <Input
+                        disabled={!checked}
+                        min={1}
+                        onChange={(event) => updateWeight(candidate.id, Number.parseInt(event.currentTarget.value, 10))}
+                        type="number"
+                        value={String(member?.weight ?? 1)}
+                      />
+                    </span>
+                  )}
                 </label>
               );
             })}
@@ -8982,7 +9083,10 @@ function AggregateRelayProfileEditor({
       <div className="relay-grid compact aggregate-preview">
         <Metric label={t("策略")} value={aggregateStrategyLabel(aggregate.strategy)} />
         <Metric label={t("成员数量")} value={tf("{0} 个", [aggregate.members.length])} />
-        <Metric label={t("总权重")} value={`${totalWeight}`} />
+        <Metric
+          label={priorityFallback ? t("失败阈值") : t("总权重")}
+          value={priorityFallback ? tf("{0} 次", [3]) : `${totalWeight}`}
+        />
         <Metric label={t("序列化字段")} value="aggregate.strategy / aggregate.members" />
       </div>
       <div className="hint-line relay-protocol-hint">
@@ -8990,6 +9094,33 @@ function AggregateRelayProfileEditor({
         <span>{aggregateStrategyHelp(aggregate.strategy)}</span>
       </div>
     </div>
+  );
+}
+
+function RelayCooldownSummary({
+  active,
+  priorityRole,
+  status,
+}: {
+  active: boolean;
+  priorityRole: "current" | "next" | null;
+  status: RelayCooldownMemberStatus | null;
+}) {
+  const remaining = status?.cooldownRemainingSeconds ?? 0;
+  const failureCount = status?.consecutiveFailures ?? 0;
+  const threshold = status?.failureThreshold ?? 3;
+  const reason = relayCooldownReasonLabel(status?.lastCooldownReason ?? null, t("传输失败"));
+  return (
+    <span className={`aggregate-cooldown-box${remaining > 0 ? " cooling" : ""}`}>
+      {priorityRole ? (
+        <small className={`aggregate-priority-role ${priorityRole}`}>
+          {priorityRole === "current" ? t("当前使用") : t("冷却后下一顺位")}
+        </small>
+      ) : null}
+      <strong>{remaining > 0 ? tf("冷却 {0}", [formatCooldownDuration(remaining)]) : t("未冷却")}</strong>
+      <small>{active ? tf("连续失败 {0}/{1}", [failureCount, threshold]) : t("当前聚合未启用")}</small>
+      <small>{reason ? tf("上次原因：{0}", [reason]) : t("暂无冷却记录")}</small>
+    </span>
   );
 }
 

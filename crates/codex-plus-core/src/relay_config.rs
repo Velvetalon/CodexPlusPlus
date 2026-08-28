@@ -352,7 +352,7 @@ pub fn apply_relay_config_to_home_with_session_provider(
         "",
         &codex_base_url,
         bearer_token,
-        true,
+        session_provider == RelaySessionProvider::Openai,
         session_provider,
     )?;
     let auth_contents = serde_json::to_string_pretty(&json!({
@@ -366,6 +366,57 @@ pub fn apply_relay_config_to_home_with_session_provider(
         backup_path,
         configured: status.configured,
     })
+}
+
+pub fn apply_aggregate_relay_profile_to_home_with_session_provider(
+    home: &Path,
+    profile: &RelayProfile,
+    common_config_contents: &str,
+    bearer_token: &str,
+    proxy_port: u16,
+    session_provider: RelaySessionProvider,
+) -> anyhow::Result<RelayApplyResult> {
+    if profile.relay_mode != crate::settings::RelayMode::Aggregate {
+        anyhow::bail!("仅聚合供应商可写入聚合代理配置");
+    }
+    let bearer_token = bearer_token.trim();
+    if bearer_token.is_empty() {
+        anyhow::bail!("聚合代理 Key 不能为空");
+    }
+    let codex_base_url = codex_base_url_for_protocol(
+        &relay_profile_base_url(profile),
+        RelayProtocol::Responses,
+        proxy_port,
+    );
+    let base_config = upsert_model_provider_config_with_session_provider(
+        "",
+        &codex_base_url,
+        bearer_token,
+        session_provider == RelaySessionProvider::Openai,
+        session_provider,
+    )?;
+    let mut effective_profile = profile.clone();
+    effective_profile.config_contents = base_config;
+    let selected_common = if effective_profile.use_common_config {
+        prepare_common_config_for_apply(common_config_contents)?
+    } else {
+        String::new()
+    };
+    let profile_config = complete_relay_profile_config(&effective_profile)?;
+    let config_with_common = merge_common_config_into_config(&profile_config, &selected_common)?;
+    let config_with_common =
+        preserve_unmanaged_live_context_entries(home, &config_with_common, common_config_contents)?;
+    let config_with_limits = apply_context_limits_to_config(
+        &config_with_common,
+        &effective_profile.context_window,
+        &effective_profile.auto_compact_limit,
+    )?;
+    let config_with_catalog =
+        apply_model_catalog_to_config(home, &effective_profile, &config_with_limits)?;
+    let auth_contents = serde_json::to_string_pretty(&json!({
+        "OPENAI_API_KEY": bearer_token
+    }))?;
+    apply_relay_files_to_home(home, &config_with_catalog, &auth_contents)
 }
 
 pub fn apply_pure_api_config_to_home(
@@ -579,7 +630,7 @@ pub fn apply_pure_api_config_to_home_with_session_provider(
         "",
         &codex_base_url,
         bearer_token,
-        false,
+        session_provider == RelaySessionProvider::Openai,
         session_provider,
     )?;
     let auth_contents = serde_json::to_string_pretty(&json!({
@@ -2575,7 +2626,7 @@ fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<Strin
     }
     if profile.uses_no_auth() {
         provider["requires_openai_auth"] = toml_edit::value(true);
-    } else if profile.relay_mode != crate::settings::RelayMode::PureApi
+    } else if (uses_openai_provider || profile.relay_mode == crate::settings::RelayMode::Official)
         && provider
             .get("requires_openai_auth")
             .and_then(Item::as_bool)
@@ -3237,6 +3288,8 @@ fn upsert_model_provider_config_with_session_provider(
     provider["wire_api"] = toml_edit::value("responses");
     if requires_openai_auth {
         provider["requires_openai_auth"] = toml_edit::value(true);
+    } else {
+        provider.remove("requires_openai_auth");
     }
     provider["base_url"] = toml_edit::value(base_url);
     provider["experimental_bearer_token"] = toml_edit::value(bearer_token);

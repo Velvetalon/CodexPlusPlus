@@ -1,7 +1,7 @@
 use codex_plus_core::relay_rotation::{
     RelayRequestOutcome, RelayRotationSelector, RotationContext, RotationEvent, SelectionError,
     fallback_relays_after, record_relay_request_failure, record_relay_request_outcome,
-    select_relay_for_probe, select_relay_for_request,
+    reset_priority_fallback_cooldowns, select_relay_for_probe, select_relay_for_request,
 };
 use codex_plus_core::settings::{
     AggregateRelayMember, AggregateRelayProfile, AggregateRelayStrategy, BackendSettings,
@@ -91,6 +91,17 @@ fn settings(strategy: AggregateRelayStrategy) -> BackendSettings {
     }
 }
 
+fn trigger_cooldown(
+    selector: &mut RelayRotationSelector,
+    relay_id: &str,
+    outcome: RelayRequestOutcome,
+    now: Instant,
+) {
+    for _ in 0..3 {
+        selector.record_outcome_at(relay_id, outcome, now);
+    }
+}
+
 #[test]
 fn failover_keeps_current_provider_until_failure_then_moves_to_next_member() {
     let settings = settings(AggregateRelayStrategy::Failover);
@@ -138,6 +149,13 @@ fn priority_fallback_429_cools_a_for_30_minutes_then_fails_back() {
     let now = Instant::now();
 
     selector.record_outcome_at("relay-a", RelayRequestOutcome::HttpStatus(429), now);
+    assert_eq!(selector.cooldown_until("relay-a"), None);
+    assert_eq!(selector.consecutive_failures("relay-a"), 1);
+    selector.record_outcome_at("relay-a", RelayRequestOutcome::HttpStatus(429), now);
+    assert_eq!(selector.cooldown_until("relay-a"), None);
+    assert_eq!(selector.consecutive_failures("relay-a"), 2);
+    selector.record_outcome_at("relay-a", RelayRequestOutcome::HttpStatus(429), now);
+    assert_eq!(selector.consecutive_failures("relay-a"), 0);
 
     assert_eq!(
         selector
@@ -180,7 +198,12 @@ fn priority_fallback_502_and_503_cool_a_for_3_minutes() {
 
     for status in [502, 503] {
         let mut selector = RelayRotationSelector::from_settings(&settings).unwrap();
-        selector.record_outcome_at("relay-a", RelayRequestOutcome::HttpStatus(status), now);
+        trigger_cooldown(
+            &mut selector,
+            "relay-a",
+            RelayRequestOutcome::HttpStatus(status),
+            now,
+        );
 
         assert_eq!(
             selector.cooldown_until("relay-a"),
@@ -230,9 +253,57 @@ fn priority_fallback_uses_status_specific_and_transport_cooldowns() {
         ),
     ] {
         let mut selector = RelayRotationSelector::from_settings(&settings).unwrap();
-        selector.record_outcome_at("relay-a", outcome, now);
+        trigger_cooldown(&mut selector, "relay-a", outcome, now);
         assert_eq!(selector.cooldown_until("relay-a"), Some(now + expected));
     }
+}
+
+#[test]
+fn priority_fallback_success_resets_consecutive_failure_count() {
+    let settings = settings(AggregateRelayStrategy::PriorityFallback);
+    let mut selector = RelayRotationSelector::from_settings(&settings).unwrap();
+    let now = Instant::now();
+
+    assert!(!selector.record_outcome_at("relay-a", RelayRequestOutcome::HttpStatus(500), now));
+    assert!(!selector.record_outcome_at("relay-a", RelayRequestOutcome::HttpStatus(500), now));
+    assert_eq!(selector.consecutive_failures("relay-a"), 2);
+
+    assert!(!selector.record_outcome_at("relay-a", RelayRequestOutcome::HttpStatus(200), now));
+    assert_eq!(selector.consecutive_failures("relay-a"), 0);
+    assert_eq!(selector.cooldown_until("relay-a"), None);
+}
+
+#[test]
+fn priority_fallback_status_reports_remaining_time_count_and_last_reason() {
+    let settings = settings(AggregateRelayStrategy::PriorityFallback);
+    let mut selector = RelayRotationSelector::from_settings(&settings).unwrap();
+    let now = Instant::now();
+
+    assert!(!selector.record_outcome_at("relay-a", RelayRequestOutcome::HttpStatus(429), now));
+    let pending = selector.cooldown_status_at(now);
+    assert_eq!(pending.members[0].consecutive_failures, 1);
+    assert_eq!(pending.members[0].cooldown_remaining_seconds, 0);
+    assert_eq!(pending.members[0].last_cooldown_reason, None);
+
+    assert!(!selector.record_outcome_at("relay-a", RelayRequestOutcome::HttpStatus(429), now));
+    assert!(selector.record_outcome_at("relay-a", RelayRequestOutcome::HttpStatus(429), now));
+    let cooling = selector.cooldown_status_at(now + Duration::from_secs(1));
+    assert_eq!(cooling.members[0].consecutive_failures, 0);
+    assert_eq!(cooling.members[0].failure_threshold, 3);
+    assert_eq!(cooling.members[0].cooldown_remaining_seconds, 30 * 60 - 1);
+    assert_eq!(
+        cooling.members[0].last_cooldown_reason,
+        Some(RelayRequestOutcome::HttpStatus(429))
+    );
+
+    selector.reset_priority_fallback_cooldowns();
+    let reset = selector.cooldown_status_at(now + Duration::from_secs(1));
+    assert_eq!(reset.members[0].cooldown_remaining_seconds, 0);
+    assert_eq!(reset.members[0].consecutive_failures, 0);
+    assert_eq!(
+        reset.members[0].last_cooldown_reason,
+        Some(RelayRequestOutcome::HttpStatus(429))
+    );
 }
 
 #[test]
@@ -241,8 +312,18 @@ fn priority_fallback_tracks_member_cooldowns_independently_and_recovers_a_from_c
     let mut selector = RelayRotationSelector::from_settings(&settings).unwrap();
     let now = Instant::now();
 
-    selector.record_outcome_at("relay-a", RelayRequestOutcome::HttpStatus(429), now);
-    selector.record_outcome_at("relay-b", RelayRequestOutcome::HttpStatus(402), now);
+    trigger_cooldown(
+        &mut selector,
+        "relay-a",
+        RelayRequestOutcome::HttpStatus(429),
+        now,
+    );
+    trigger_cooldown(
+        &mut selector,
+        "relay-b",
+        RelayRequestOutcome::HttpStatus(402),
+        now,
+    );
 
     assert_eq!(
         selector
@@ -271,9 +352,24 @@ fn priority_fallback_forces_earliest_expiring_member_when_all_are_cooling_down()
     let mut selector = RelayRotationSelector::from_settings(&settings).unwrap();
     let now = Instant::now();
 
-    selector.record_outcome_at("relay-a", RelayRequestOutcome::HttpStatus(429), now);
-    selector.record_outcome_at("relay-b", RelayRequestOutcome::HttpStatus(402), now);
-    selector.record_outcome_at("relay-c", RelayRequestOutcome::HttpStatus(503), now);
+    trigger_cooldown(
+        &mut selector,
+        "relay-a",
+        RelayRequestOutcome::HttpStatus(429),
+        now,
+    );
+    trigger_cooldown(
+        &mut selector,
+        "relay-b",
+        RelayRequestOutcome::HttpStatus(402),
+        now,
+    );
+    trigger_cooldown(
+        &mut selector,
+        "relay-c",
+        RelayRequestOutcome::HttpStatus(503),
+        now,
+    );
 
     assert_eq!(
         selector
@@ -285,6 +381,17 @@ fn priority_fallback_forces_earliest_expiring_member_when_all_are_cooling_down()
     // 所有成员都在冷却时，不再返回其它冷却中的成员作为后备，
     // 避免协议代理顺延冷却时间造成无限重试。
     assert!(selector.priority_fallbacks_after("relay-c", now).is_empty());
+    // relay-c 仍在原冷却中，失败不会继续延长冷却时间。
+    trigger_cooldown(
+        &mut selector,
+        "relay-c",
+        RelayRequestOutcome::HttpStatus(429),
+        now,
+    );
+    assert_eq!(
+        selector.cooldown_until("relay-c"),
+        Some(now + Duration::from_secs(3 * 60))
+    );
 }
 
 #[test]
@@ -294,7 +401,12 @@ fn priority_fallback_skips_cooled_members_in_fallback_chain() {
     let now = Instant::now();
 
     // 冷却 relay-a，此时 relay-b、relay-c 可用。
-    selector.record_outcome_at("relay-a", RelayRequestOutcome::HttpStatus(429), now);
+    trigger_cooldown(
+        &mut selector,
+        "relay-a",
+        RelayRequestOutcome::HttpStatus(429),
+        now,
+    );
 
     // select 应落到第一个可用成员 relay-b。
     assert_eq!(
@@ -560,11 +672,23 @@ fn global_priority_fallback_selector_skips_a_after_429() {
     };
 
     let first = select_relay_for_request(&settings, RotationContext::default()).unwrap();
-    record_relay_request_outcome(&settings, &first.id, RelayRequestOutcome::HttpStatus(429));
+    for _ in 0..3 {
+        record_relay_request_outcome(&settings, &first.id, RelayRequestOutcome::HttpStatus(429));
+    }
     let second = select_relay_for_request(&settings, RotationContext::default()).unwrap();
 
     assert_eq!(first.id, "relay-a");
     assert_eq!(second.id, "relay-b");
+
+    let reset = reset_priority_fallback_cooldowns(&settings);
+    assert!(
+        reset
+            .members
+            .iter()
+            .all(|member| member.cooldown_remaining_seconds == 0)
+    );
+    let after_reset = select_relay_for_request(&settings, RotationContext::default()).unwrap();
+    assert_eq!(after_reset.id, "relay-a");
 }
 
 #[test]

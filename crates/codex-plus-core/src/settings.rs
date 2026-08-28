@@ -790,6 +790,17 @@ impl BackendSettings {
         {
             profile.auto_compact_limit = source.auto_compact_limit.clone();
         }
+        if inherited_context {
+            if profile.model.trim().is_empty() {
+                profile.model = source.model.clone();
+            }
+            if profile.model_list.trim().is_empty() {
+                profile.model_list = source.model_list.clone();
+            }
+            if profile.model_windows.trim().is_empty() {
+                profile.model_windows = source.model_windows.clone();
+            }
+        }
     }
 
     pub fn active_relay_session_provider(&self) -> RelaySessionProvider {
@@ -2561,8 +2572,11 @@ experimental_bearer_token = "sk-existing""#
                 },
                 RelayProfile {
                     id: "krill".to_string(),
+                    model: "gpt-5.6-sol".to_string(),
                     context_window: "1000000".to_string(),
                     auto_compact_limit: "900000".to_string(),
+                    model_list: "gpt-5.6-sol\ngpt-5.6-terra".to_string(),
+                    model_windows: r#"{"gpt-5.6-sol":"1000000"}"#.to_string(),
                     ..RelayProfile::default()
                 },
                 RelayProfile {
@@ -2608,6 +2622,9 @@ experimental_bearer_token = "sk-existing""#
         let active = settings.active_relay_profile();
         assert_eq!(active.context_window, "1000000");
         assert_eq!(active.auto_compact_limit, "900000");
+        assert_eq!(active.model, "gpt-5.6-sol");
+        assert_eq!(active.model_list, "gpt-5.6-sol\ngpt-5.6-terra");
+        assert_eq!(active.model_windows, r#"{"gpt-5.6-sol":"1000000"}"#);
         assert!(settings.relay_profiles[3].context_window.is_empty());
     }
 

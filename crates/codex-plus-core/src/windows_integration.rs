@@ -14,6 +14,10 @@ use anyhow::Context;
 #[cfg(windows)]
 use windows::Win32::Foundation::{BOOL, CloseHandle, HANDLE, HWND, LPARAM, MAX_PATH, WPARAM};
 #[cfg(windows)]
+use windows::Win32::NetworkManagement::IpHelper::{
+    GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
+};
+#[cfg(windows)]
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
     CoTaskMemFree, CoUninitialize, IPersistFile,
@@ -346,6 +350,58 @@ pub fn terminate_process(process_id: u32) -> bool {
 }
 
 #[cfg(windows)]
+pub fn tcp_listener_process_ids(port: u16) -> Vec<u32> {
+    const AF_INET: u32 = 2;
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+
+    let mut size = 0u32;
+    let initial = unsafe {
+        GetExtendedTcpTable(
+            None,
+            &mut size,
+            false,
+            AF_INET,
+            TCP_TABLE_OWNER_PID_LISTENER,
+            0,
+        )
+    };
+    if initial != ERROR_INSUFFICIENT_BUFFER || size == 0 {
+        return Vec::new();
+    }
+
+    let mut buffer = vec![0u8; size as usize];
+    let result = unsafe {
+        GetExtendedTcpTable(
+            Some(buffer.as_mut_ptr().cast()),
+            &mut size,
+            false,
+            AF_INET,
+            TCP_TABLE_OWNER_PID_LISTENER,
+            0,
+        )
+    };
+    if result != 0 {
+        return Vec::new();
+    }
+
+    let table = buffer.as_ptr().cast::<MIB_TCPTABLE_OWNER_PID>();
+    let count = unsafe { (*table).dwNumEntries as usize };
+    let rows = unsafe {
+        let first = std::ptr::addr_of!((*table).table).cast::<MIB_TCPROW_OWNER_PID>();
+        std::slice::from_raw_parts(first, count)
+    };
+    let mut process_ids = rows
+        .iter()
+        .filter(|row| u16::from_be(row.dwLocalPort as u16) == port)
+        .map(|row| row.dwOwningPid)
+        .filter(|process_id| *process_id != 0)
+        .collect::<Vec<_>>();
+    process_ids.sort_unstable();
+    process_ids.dedup();
+    process_ids
+}
+
+#[cfg(windows)]
 pub fn activate_process_window(process_id: u32) -> bool {
     let Some(hwnd) = process_window(process_id, false) else {
         return false;
@@ -666,6 +722,58 @@ impl Drop for RegistryKeyGuard {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    const LISTENER_TEST_PORT_ENV: &str = "CODEX_PLUS_TEST_LISTENER_PORT";
+
+    #[test]
+    fn tcp_listener_helper_process() {
+        let Ok(port) = std::env::var(LISTENER_TEST_PORT_ENV) else {
+            return;
+        };
+        let port = port.parse::<u16>().unwrap();
+        let _listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn tcp_listener_process_ids_finds_the_current_process() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        assert_eq!(tcp_listener_process_ids(port), vec![std::process::id()]);
+    }
+
+    #[test]
+    fn terminate_process_releases_the_exact_owned_listener() {
+        let reservation = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "windows_integration::tests::tcp_listener_helper_process",
+                "--nocapture",
+            ])
+            .env(LISTENER_TEST_PORT_ENV, port.to_string())
+            .spawn()
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if tcp_listener_process_ids(port) == vec![child.id()] {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                panic!("child process did not listen on {port}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        assert!(terminate_process(child.id()));
+        child.wait().unwrap();
+        assert!(tcp_listener_process_ids(port).is_empty());
+    }
 
     #[test]
     fn application_window_outranks_titled_ime_and_tool_windows() {

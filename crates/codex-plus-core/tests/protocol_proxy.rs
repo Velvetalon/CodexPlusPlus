@@ -12,6 +12,7 @@ use codex_plus_core::protocol_proxy::{
     upstream_stream_header_timeout,
 };
 use codex_plus_core::relay_config::test_relay_profile;
+use codex_plus_core::relay_rotation::priority_fallback_cooldown_status;
 use codex_plus_core::settings::{
     AggregateRelayMember, AggregateRelayProfile, AggregateRelayStrategy, BackendSettings,
     RelayMode, RelayModelRoute, RelayProfile, RelayProtocol, RelaySessionProvider,
@@ -1856,6 +1857,115 @@ async fn aggregate_proxy_fails_over_to_next_member_in_same_request() {
             .to_ascii_lowercase()
             .contains("authorization:")
     );
+}
+
+#[tokio::test]
+async fn priority_fallback_waits_for_third_failure_before_failing_over() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let first = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let first_addr = first.local_addr().unwrap();
+    let second = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let second_addr = second.local_addr().unwrap();
+    let first_server = tokio::spawn(async move {
+        for _ in 0..3 {
+            let (mut stream, _) = first.accept().await.unwrap();
+            let mut buffer = [0; 4096];
+            let _ = stream.read(&mut buffer).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 11\r\ncontent-type: application/json\r\n\r\n{\"error\":1}",
+                )
+                .await
+                .unwrap();
+        }
+    });
+    let second_server = tokio::spawn(capture_request_and_respond_once(
+        second,
+        "HTTP/1.1 200 OK\r\ncontent-length: 35\r\ncontent-type: application/json\r\n\r\n{\"id\":\"resp_1\",\"object\":\"response\"}",
+    ));
+    let mut settings = aggregate_proxy_settings(
+        "priority-threshold",
+        format!("http://{first_addr}/v1"),
+        format!("http://{second_addr}/v1"),
+    );
+    settings.aggregate_relay_profiles[0].strategy = AggregateRelayStrategy::PriorityFallback;
+
+    let unattended_turn_request =
+        r#"{"model":"gpt-5-mini","input":"hi","stream":false,"conversation":"unattended-turn-1"}"#;
+    for expected_failures in 1..=2 {
+        let result =
+            open_responses_proxy_request_with_settings(unattended_turn_request, settings.clone())
+                .await
+                .unwrap();
+        assert_eq!(result.status_code, 500);
+        let _ = result.response.bytes().await.unwrap();
+        let status = priority_fallback_cooldown_status(&settings);
+        assert_eq!(status.members[0].consecutive_failures, expected_failures);
+        assert_eq!(status.members[0].cooldown_remaining_seconds, 0);
+    }
+
+    let result =
+        open_responses_proxy_request_with_settings(unattended_turn_request, settings.clone())
+            .await
+            .unwrap();
+    assert_eq!(result.status_code, 200);
+    let _ = result.response.bytes().await.unwrap();
+    let status = priority_fallback_cooldown_status(&settings);
+    assert_eq!(status.members[0].consecutive_failures, 0);
+    assert!(status.members[0].cooldown_remaining_seconds > 0);
+    assert_eq!(status.members[1].consecutive_failures, 0);
+
+    first_server.await.unwrap();
+    second_server.await.unwrap();
+}
+
+#[tokio::test]
+async fn priority_fallback_hides_429_by_failing_over_in_the_same_request() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let first = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let first_addr = first.local_addr().unwrap();
+    let second = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let second_addr = second.local_addr().unwrap();
+    let first_server = tokio::spawn(capture_request_and_respond_once(
+        first,
+        "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 13\r\ncontent-type: application/json\r\n\r\n{\"error\":429}",
+    ));
+    let second_server = tokio::spawn(capture_request_and_respond_once(
+        second,
+        "HTTP/1.1 200 OK\r\ncontent-length: 35\r\ncontent-type: application/json\r\n\r\n{\"id\":\"resp_1\",\"object\":\"response\"}",
+    ));
+    let mut settings = aggregate_proxy_settings(
+        "priority-429-silent-failover",
+        format!("http://{first_addr}/v1"),
+        format!("http://{second_addr}/v1"),
+    );
+    settings.aggregate_relay_profiles[0].strategy = AggregateRelayStrategy::PriorityFallback;
+
+    let result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-5-mini","input":"hi","stream":false}"#,
+        settings.clone(),
+    )
+    .await
+    .unwrap();
+    let body = result.response.bytes().await.unwrap();
+
+    assert_eq!(result.status_code, 200);
+    assert_eq!(body.as_ref(), br#"{"id":"resp_1","object":"response"}"#);
+    let status = priority_fallback_cooldown_status(&settings);
+    assert_eq!(status.members[0].consecutive_failures, 1);
+    assert_eq!(status.members[0].cooldown_remaining_seconds, 0);
+    assert_eq!(status.members[1].consecutive_failures, 0);
+
+    first_server.await.unwrap();
+    second_server.await.unwrap();
 }
 
 #[tokio::test]

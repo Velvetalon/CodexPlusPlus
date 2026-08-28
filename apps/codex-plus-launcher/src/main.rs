@@ -73,11 +73,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn launcher_main(
-    args: Vec<String>,
-    helper_only: bool,
-    options: LaunchOptions,
-) -> Result<()> {
+async fn launcher_main(args: Vec<String>, helper_only: bool, options: LaunchOptions) -> Result<()> {
     if helper_only {
         let hooks = LauncherHooks::default();
         hooks.start_helper(options.helper_port).await?;
@@ -85,19 +81,24 @@ async fn launcher_main(
         hooks.shutdown_helper(options.helper_port).await;
         return Ok(());
     }
-    let Some(_guard) = acquire_single_instance_guard(options.debug_port)? else {
-        activate_existing_codex_app(&options).await?;
-        options.status_store.save_latest(&LaunchStatus {
-            status: "running".to_string(),
-            message: "Existing Codex instance activated".to_string(),
-            started_at_ms: current_timestamp_ms(),
-            debug_port: Some(options.debug_port),
-            helper_port: Some(options.helper_port),
-            codex_app: options
-                .app_dir
-                .map(|path| path.to_string_lossy().to_string()),
-        })?;
-        return Ok(());
+    let _guard = match acquire_single_instance_guard(options.debug_port)? {
+        Some(guard) => guard,
+        None => match activate_existing_codex_app(&options).await? {
+            ExistingLauncherOutcome::Activated(activation) => {
+                options.status_store.save_latest(&LaunchStatus {
+                    status: "running".to_string(),
+                    message: "Existing Codex instance activated".to_string(),
+                    started_at_ms: current_timestamp_ms(),
+                    debug_port: Some(activation.debug_port),
+                    helper_port: Some(activation.helper_port),
+                    codex_app: Some(activation.app_dir.to_string_lossy().to_string()),
+                })?;
+                return Ok(());
+            }
+            ExistingLauncherOutcome::TakeOver => {
+                acquire_single_instance_guard_after_takeover(options.debug_port)?
+            }
+        },
     };
     tokio::spawn(async {
         let _ = notify_manager_when_update_available().await;
@@ -163,6 +164,30 @@ fn try_acquire_single_instance_guard() -> std::io::Result<codex_plus_core::ports
     )
 }
 
+fn acquire_single_instance_guard_after_takeover(
+    debug_port: u16,
+) -> anyhow::Result<codex_plus_core::ports::LoopbackPortGuard> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match try_acquire_single_instance_guard() {
+            Ok(guard) => return Ok(guard),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::AddrInUse
+                ) && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(error) => {
+                anyhow::bail!(
+                    "已结束故障 Helper，但无法接管 Codex++ launcher guard（debug port {debug_port}）：{error}"
+                );
+            }
+        }
+    }
+}
+
 fn log_launcher_guard_fallback(fallback_lock_path: &Path) {
     let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
         "launcher.guard_fallback",
@@ -190,10 +215,50 @@ fn should_recover_stale_launcher(debug_port: u16) -> bool {
     recover
 }
 
-async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<()> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExistingActivation {
+    debug_port: u16,
+    helper_port: u16,
+    app_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExistingLauncherOutcome {
+    Activated(ExistingActivation),
+    TakeOver,
+}
+
+fn existing_runtime_ports(
+    options: &LaunchOptions,
+    latest_status: Option<&LaunchStatus>,
+    settings: &codex_plus_core::settings::BackendSettings,
+) -> (u16, u16) {
+    let debug_port = latest_status
+        .and_then(|status| status.debug_port)
+        .unwrap_or(options.debug_port);
+    let selected_helper_port = latest_status
+        .and_then(|status| status.helper_port)
+        .unwrap_or(options.helper_port);
+    let profile = settings.active_relay_profile();
+    let protocol_proxy_enabled = settings.active_relay_uses_protocol_proxy()
+        || (profile.relay_mode == codex_plus_core::settings::RelayMode::Official
+            && profile.official_mix_api_key);
+    let helper_port = if protocol_proxy_enabled {
+        codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT
+    } else {
+        selected_helper_port
+    };
+    (debug_port, helper_port)
+}
+
+async fn activate_existing_codex_app(
+    options: &LaunchOptions,
+) -> anyhow::Result<ExistingLauncherOutcome> {
     let hooks = LauncherHooks::default();
-    let helper_port = hooks.select_helper_port(options.helper_port);
     let settings = hooks.load_settings().await?;
+    let latest_status = options.status_store.load_latest()?;
+    let (debug_port, helper_port) =
+        existing_runtime_ports(options, latest_status.as_ref(), &settings);
     let app_dir = hooks.resolve_app_dir(options.app_dir.as_deref(), &settings)?;
     let has_pending_recovery = hooks.has_pending_remote_control_session_recoveries();
     let blocking_process_ids = if has_pending_recovery {
@@ -210,17 +275,26 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
             json!({"blocking_process_ids": blocking_process_ids}),
         );
     }
-    let launch_result = hooks
-        .launch_codex(
-            &app_dir,
-            options.debug_port,
-            &settings,
-            &settings.codex_extra_args,
-        )
-        .await;
-    if settings.enhancements_enabled {
-        hooks.start_helper(helper_port).await?;
+    let profile = settings.active_relay_profile();
+    let protocol_proxy_enabled = settings.active_relay_uses_protocol_proxy()
+        || (profile.relay_mode == codex_plus_core::settings::RelayMode::Official
+            && profile.official_mix_api_key);
+    if (settings.enhancements_enabled || protocol_proxy_enabled)
+        && !codex_plus_core::launcher::helper_backend_available(helper_port).await
+    {
+        prepare_unhealthy_helper_takeover(helper_port)?;
+        return Ok(ExistingLauncherOutcome::TakeOver);
     }
+
+    let launch_result = if cfg!(windows) {
+        None
+    } else {
+        Some(
+            hooks
+                .launch_codex(&app_dir, debug_port, &settings, &settings.codex_extra_args)
+                .await,
+        )
+    };
     let process_ids = codex_plus_core::watcher::find_codex_processes();
     #[cfg(windows)]
     let activated = process_ids
@@ -231,15 +305,13 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
     let activated = false;
     let injection_ready = if settings.enhancements_enabled {
         hooks
-            .ensure_injection(options.debug_port, helper_port, &app_dir)
+            .ensure_injection(debug_port, helper_port, &app_dir)
             .await
     } else {
         false
     };
     if injection_ready {
-        hooks
-            .start_bridge_watchdog(options.debug_port, helper_port)
-            .await?;
+        hooks.start_bridge_watchdog(debug_port, helper_port).await?;
         hooks.write_status("running").await;
     } else if settings.enhancements_enabled {
         hooks.write_status("running_degraded").await;
@@ -248,17 +320,84 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
         "launcher.activate_existing_codex",
         json!({
             "app_dir": app_dir.to_string_lossy(),
-            "debug_port": options.debug_port,
+            "debug_port": debug_port,
             "helper_port": helper_port,
+            "status_debug_port": latest_status.as_ref().and_then(|status| status.debug_port),
+            "status_helper_port": latest_status.as_ref().and_then(|status| status.helper_port),
             "requested_helper_port": options.helper_port,
             "process_ids": process_ids,
             "activated": activated,
             "injection_ready": injection_ready,
-            "launch_ok": launch_result.is_ok(),
-            "launch_error": launch_result.as_ref().err().map(|error| error.to_string())
+            "launch_skipped_for_existing_windows_instance": cfg!(windows),
+            "launch_ok": launch_result.as_ref().is_none_or(|result| result.is_ok()),
+            "launch_error": launch_result
+                .as_ref()
+                .and_then(|result| result.as_ref().err())
+                .map(|error| error.to_string())
         }),
     );
-    launch_result.map(|_| ())
+    if let Some(result) = launch_result {
+        result?;
+    }
+    Ok(ExistingLauncherOutcome::Activated(ExistingActivation {
+        debug_port,
+        helper_port,
+        app_dir,
+    }))
+}
+
+#[cfg(windows)]
+fn prepare_unhealthy_helper_takeover(helper_port: u16) -> anyhow::Result<()> {
+    let process_ids = codex_plus_core::windows_tcp_listener_process_ids(helper_port);
+    if process_ids.len() > 1 {
+        anyhow::bail!(
+            "固定 Helper 端口 {helper_port} 同时由多个进程监听，无法安全接管：{process_ids:?}"
+        );
+    }
+    if let Some(process_id) = process_ids.first().copied() {
+        if process_id == std::process::id() {
+            anyhow::bail!("当前 launcher 自己占用了固定 Helper 端口 {helper_port}，无法接管");
+        }
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "helper.takeover_terminate_port_owner",
+            json!({
+                "helper_port": helper_port,
+                "process_id": process_id,
+            }),
+        );
+        if !codex_plus_core::windows_terminate_process(process_id) {
+            anyhow::bail!(
+                "固定 Helper 端口 {helper_port} 由进程 {process_id} 占用，结束该进程失败，无法接管"
+            );
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let owners = codex_plus_core::windows_tcp_listener_process_ids(helper_port);
+            if !owners.contains(&process_id) {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "已请求结束进程 {process_id}，但固定 Helper 端口 {helper_port} 在 5 秒内仍未释放"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    codex_plus_core::watcher::stop_launcher_processes_and_wait();
+    let remaining = codex_plus_core::windows_tcp_listener_process_ids(helper_port);
+    if !remaining.is_empty() {
+        anyhow::bail!(
+            "清理故障 launcher 后，固定 Helper 端口 {helper_port} 仍被占用：{remaining:?}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn prepare_unhealthy_helper_takeover(helper_port: u16) -> anyhow::Result<()> {
+    anyhow::bail!("Helper 未在固定端口 {helper_port} 响应，当前平台不支持自动结束端口占用进程")
 }
 
 fn should_finalize_pending_remote_control_recovery(
@@ -1137,16 +1276,82 @@ mod tests {
                 "let has_pending_recovery = hooks.has_pending_remote_control_session_recoveries()",
             )
             .expect("pending recovery guard");
-        let launch = body
-            .find("let launch_result = hooks")
-            .expect("Codex activation");
+        let activation = body
+            .find("let process_ids = codex_plus_core::watcher::find_codex_processes()")
+            .expect("existing process activation");
 
-        assert!(recovery < launch);
-        assert!(body[recovery..launch].contains("find_session_index_cleanup_blocking_processes"));
-        assert!(body[recovery..launch].contains("should_finalize_pending_remote_control_recovery"));
+        assert!(recovery < activation);
         assert!(
-            body[recovery..launch].contains("hooks.run_remote_control_session_recovery().await?")
+            body[recovery..activation].contains("find_session_index_cleanup_blocking_processes")
         );
+        assert!(
+            body[recovery..activation].contains("should_finalize_pending_remote_control_recovery")
+        );
+        assert!(
+            body[recovery..activation]
+                .contains("hooks.run_remote_control_session_recovery().await?")
+        );
+    }
+
+    #[test]
+    fn existing_launcher_reuses_recorded_ports_and_pins_protocol_proxy() {
+        let options = LaunchOptions {
+            debug_port: 9229,
+            helper_port: 57321,
+            ..LaunchOptions::default()
+        };
+        let status = LaunchStatus {
+            status: "running".to_string(),
+            message: "ready".to_string(),
+            started_at_ms: 1,
+            debug_port: Some(58212),
+            helper_port: Some(64599),
+            codex_app: None,
+        };
+        let settings = codex_plus_core::settings::BackendSettings {
+            active_relay_id: "aggregate".to_string(),
+            active_aggregate_relay_id: "aggregate".to_string(),
+            relay_profiles: vec![codex_plus_core::settings::RelayProfile {
+                id: "aggregate".to_string(),
+                relay_mode: codex_plus_core::settings::RelayMode::Aggregate,
+                ..codex_plus_core::settings::RelayProfile::default()
+            }],
+            aggregate_relay_profiles: vec![codex_plus_core::settings::AggregateRelayProfile {
+                id: "aggregate".to_string(),
+                name: "Aggregate".to_string(),
+                session_provider: codex_plus_core::settings::RelaySessionProvider::Custom,
+                code_mode_host: false,
+                strategy: codex_plus_core::settings::AggregateRelayStrategy::PriorityFallback,
+                members: Vec::new(),
+            }],
+            ..codex_plus_core::settings::BackendSettings::default()
+        };
+
+        assert_eq!(
+            existing_runtime_ports(&options, Some(&status), &settings),
+            (
+                58212,
+                codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT
+            )
+        );
+    }
+
+    #[test]
+    fn existing_windows_launcher_never_starts_a_temporary_helper() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("async fn activate_existing_codex_app")
+            .expect("existing launcher activation function");
+        let end = source[start..]
+            .find("fn should_finalize_pending_remote_control_recovery")
+            .map(|offset| start + offset)
+            .expect("next function after activation");
+        let body = &source[start..end];
+
+        assert!(body.contains("helper_backend_available(helper_port).await"));
+        assert!(body.contains("let launch_result = if cfg!(windows)"));
+        assert!(!body.contains("hooks.start_helper(helper_port)"));
+        assert!(!body.contains("select_helper_port(options.helper_port)"));
     }
 
     #[test]

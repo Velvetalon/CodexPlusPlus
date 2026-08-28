@@ -39,9 +39,9 @@ pub mod relay_switch;
 pub mod remote_control_recovery;
 pub mod routes;
 pub mod script_market;
-pub mod share;
 pub mod session_share;
 pub mod settings;
+pub mod share;
 pub mod skills;
 pub mod status;
 pub mod stepwise;
@@ -82,4 +82,14 @@ pub fn windows_apply_codexplusplus_icon_to_process_window(
 #[cfg(windows)]
 pub fn windows_enumerate_processes() -> Vec<windows_integration::WindowsProcessInfo> {
     windows_integration::enumerate_processes()
+}
+
+#[cfg(windows)]
+pub fn windows_tcp_listener_process_ids(port: u16) -> Vec<u32> {
+    windows_integration::tcp_listener_process_ids(port)
+}
+
+#[cfg(windows)]
+pub fn windows_terminate_process(process_id: u32) -> bool {
+    windows_integration::terminate_process(process_id)
 }

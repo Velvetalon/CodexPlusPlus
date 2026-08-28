@@ -805,13 +805,11 @@ fn sync_active_relay_to_home(
         let aggregate = settings
             .active_aggregate_relay_profile()
             .ok_or_else(|| anyhow::anyhow!("当前聚合供应商配置不完整"))?;
-        return codex_plus_core::relay_config::apply_relay_config_to_home_with_session_provider(
+        return codex_plus_core::relay_config::apply_aggregate_relay_profile_to_home_with_session_provider(
             home,
-            &codex_plus_core::protocol_proxy::local_responses_proxy_base_url(
-                codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
-            ),
+            &relay,
+            &relay_combined_common_config(settings),
             "codex-plus-aggregate",
-            codex_plus_core::settings::RelayProtocol::Responses,
             codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
             aggregate.session_provider,
         );
@@ -4054,6 +4052,61 @@ pub fn relay_status() -> CommandResult<RelayPayload> {
 }
 
 #[tauri::command]
+pub async fn relay_cooldown_status(helper_port: u16, reset: bool) -> Value {
+    let action = if reset { "reset" } else { "status" };
+    let url = format!("http://127.0.0.1:{helper_port}/relay-rotation/{action}");
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return json!({
+                "status": "failed",
+                "message": format!("初始化冷却状态请求失败：{error}"),
+                "aggregateId": null,
+                "members": []
+            });
+        }
+    };
+    let request = if reset {
+        client.post(&url)
+    } else {
+        client.get(&url)
+    };
+    match request.send().await {
+        Ok(response) => {
+            let status = response.status();
+            match response.json::<Value>().await {
+                Ok(value) if status.is_success() => value,
+                Ok(value) => json!({
+                    "status": "failed",
+                    "message": value
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("冷却状态接口返回 HTTP {}", status.as_u16())),
+                    "aggregateId": value.get("aggregateId").cloned().unwrap_or(Value::Null),
+                    "members": value.get("members").cloned().unwrap_or_else(|| json!([]))
+                }),
+                Err(error) => json!({
+                    "status": "failed",
+                    "message": format!("读取冷却状态响应失败：{error}"),
+                    "aggregateId": null,
+                    "members": []
+                }),
+            }
+        }
+        Err(error) => json!({
+            "status": "failed",
+            "message": format!("连接 Codex++ Helper {helper_port} 失败：{error}"),
+            "aggregateId": null,
+            "members": []
+        }),
+    }
+}
+
+#[tauri::command]
 pub fn read_relay_files() -> CommandResult<RelayFilesPayload> {
     let home = codex_plus_core::relay_config::default_codex_home_dir();
     match relay_files_payload_from_home(&home) {
@@ -5069,7 +5122,8 @@ pub fn apply_relay_injection() -> CommandResult<RelayPayload> {
     let relay = settings.active_relay_profile();
     log_relay_apply_request("manager.apply_relay_injection", &settings, &relay);
     if let Some(aggregate) = settings.active_aggregate_relay_profile() {
-        let response = apply_aggregate_relay_injection_to_home(&home, aggregate.session_provider);
+        let response =
+            apply_aggregate_relay_injection_to_home(&home, &settings, aggregate.session_provider);
         if response.status == "ok" {
             finish_codex_app_state_after_provider_switch(
                 &home,
@@ -5180,15 +5234,15 @@ pub fn apply_relay_injection() -> CommandResult<RelayPayload> {
 
 fn apply_aggregate_relay_injection_to_home(
     home: &Path,
+    settings: &codex_plus_core::settings::BackendSettings,
     session_provider: RelaySessionProvider,
 ) -> CommandResult<RelayPayload> {
-    match codex_plus_core::relay_config::apply_relay_config_to_home_with_session_provider(
+    let relay = settings.active_relay_profile();
+    match codex_plus_core::relay_config::apply_aggregate_relay_profile_to_home_with_session_provider(
         home,
-        &codex_plus_core::protocol_proxy::local_responses_proxy_base_url(
-            codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
-        ),
+        &relay,
+        &relay_combined_common_config(settings),
         "codex-plus-aggregate",
-        codex_plus_core::settings::RelayProtocol::Responses,
         codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
         session_provider,
     ) {
@@ -6527,9 +6581,41 @@ mod tests {
     #[test]
     fn aggregate_relay_injection_writes_local_proxy_without_chatgpt_auth() {
         let temp = tempfile::tempdir().unwrap();
+        let settings = codex_plus_core::settings::BackendSettings {
+            relay_profiles: vec![
+                codex_plus_core::settings::RelayProfile {
+                    id: "member".to_string(),
+                    model: "gpt-5.6-sol".to_string(),
+                    context_window: "1000000".to_string(),
+                    auto_compact_limit: "900000".to_string(),
+                    model_list: "gpt-5.6-sol".to_string(),
+                    ..codex_plus_core::settings::RelayProfile::default()
+                },
+                codex_plus_core::settings::RelayProfile {
+                    id: "aggregate".to_string(),
+                    relay_mode: codex_plus_core::settings::RelayMode::Aggregate,
+                    ..codex_plus_core::settings::RelayProfile::default()
+                },
+            ],
+            active_relay_id: "aggregate".to_string(),
+            active_aggregate_relay_id: "aggregate".to_string(),
+            aggregate_relay_profiles: vec![codex_plus_core::settings::AggregateRelayProfile {
+                id: "aggregate".to_string(),
+                name: "聚合供应商".to_string(),
+                session_provider: codex_plus_core::settings::RelaySessionProvider::Custom,
+                code_mode_host: false,
+                strategy: codex_plus_core::settings::AggregateRelayStrategy::PriorityFallback,
+                members: vec![codex_plus_core::settings::AggregateRelayMember {
+                    relay_id: "member".to_string(),
+                    weight: 1,
+                }],
+            }],
+            ..codex_plus_core::settings::BackendSettings::default()
+        };
 
         let result = apply_aggregate_relay_injection_to_home(
             temp.path(),
+            &settings,
             codex_plus_core::settings::RelaySessionProvider::Custom,
         );
         let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
@@ -6538,7 +6624,17 @@ mod tests {
         assert!(result.payload.configured);
         assert!(!result.payload.authenticated);
         assert!(config.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
+        assert!(!config.contains("requires_openai_auth"));
         assert!(config.contains(r#"experimental_bearer_token = "codex-plus-aggregate""#));
+        assert!(config.contains("model_context_window = 1000000"));
+        assert!(config.contains("model_auto_compact_token_limit = 900000"));
+        assert!(config.contains(r#"model_catalog_json = "model-catalogs/aggregate.json""#));
+        let catalog =
+            std::fs::read_to_string(temp.path().join("model-catalogs").join("aggregate.json"))
+                .unwrap();
+        let catalog: serde_json::Value = serde_json::from_str(&catalog).unwrap();
+        assert_eq!(catalog["models"][0]["slug"], "gpt-5.6-sol");
+        assert_eq!(catalog["models"][0]["context_window"], 1_000_000);
     }
 
     fn launch_request(sync_active_relay: bool) -> LaunchRequest {
@@ -6640,17 +6736,31 @@ mod tests {
         let settings = BackendSettings {
             active_relay_id: "aggregate".to_string(),
             active_aggregate_relay_id: "aggregate".to_string(),
-            relay_profiles: vec![RelayProfile {
-                id: "aggregate".to_string(),
-                relay_mode: codex_plus_core::settings::RelayMode::Aggregate,
-                ..RelayProfile::default()
-            }],
+            relay_profiles: vec![
+                RelayProfile {
+                    id: "member".to_string(),
+                    model: "gpt-5.6-sol".to_string(),
+                    context_window: "1000000".to_string(),
+                    auto_compact_limit: "900000".to_string(),
+                    model_list: "gpt-5.6-sol".to_string(),
+                    ..RelayProfile::default()
+                },
+                RelayProfile {
+                    id: "aggregate".to_string(),
+                    relay_mode: codex_plus_core::settings::RelayMode::Aggregate,
+                    ..RelayProfile::default()
+                },
+            ],
             aggregate_relay_profiles: vec![codex_plus_core::settings::AggregateRelayProfile {
                 id: "aggregate".to_string(),
                 name: "Aggregate".to_string(),
                 session_provider: codex_plus_core::settings::RelaySessionProvider::Custom,
+                code_mode_host: false,
                 strategy: codex_plus_core::settings::AggregateRelayStrategy::Failover,
-                members: Vec::new(),
+                members: vec![codex_plus_core::settings::AggregateRelayMember {
+                    relay_id: "member".to_string(),
+                    weight: 1,
+                }],
             }],
             ..BackendSettings::default()
         };
@@ -6659,7 +6769,17 @@ mod tests {
 
         let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
         assert!(config.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
+        assert!(!config.contains("requires_openai_auth"));
         assert!(config.contains(r#"experimental_bearer_token = "codex-plus-aggregate""#));
+        assert!(config.contains("model_context_window = 1000000"));
+        assert!(config.contains("model_auto_compact_token_limit = 900000"));
+        assert!(config.contains(r#"model_catalog_json = "model-catalogs/aggregate.json""#));
+        let catalog =
+            std::fs::read_to_string(temp.path().join("model-catalogs").join("aggregate.json"))
+                .unwrap();
+        let catalog: serde_json::Value = serde_json::from_str(&catalog).unwrap();
+        assert_eq!(catalog["models"][0]["slug"], "gpt-5.6-sol");
+        assert_eq!(catalog["models"][0]["context_window"], 1_000_000);
     }
 
     #[test]

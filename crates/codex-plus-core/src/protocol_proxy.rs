@@ -641,6 +641,13 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         {
             Ok(upstream) => upstream,
             Err(error) => {
+                let entered_cooldown_or_regular_failure =
+                    crate::relay_rotation::record_relay_request_outcome(
+                        &settings,
+                        &relay.id,
+                        RelayRequestOutcome::TransportFailure,
+                    );
+                let should_failover = has_more_candidates && entered_cooldown_or_regular_failure;
                 let _ = crate::diagnostic_log::append_diagnostic_log(
                     "protocol_proxy.upstream_request_failed",
                     json!({
@@ -652,16 +659,11 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         "attempt": attempt + 1,
                         "candidateCount": relay_count,
                         "headerTimeoutSeconds": header_timeout.as_secs(),
-                        "willFailover": has_more_candidates,
+                        "willFailover": should_failover,
                         "error": error.to_string()
                     }),
                 );
-                crate::relay_rotation::record_relay_request_outcome(
-                    &settings,
-                    &relay.id,
-                    RelayRequestOutcome::TransportFailure,
-                );
-                if has_more_candidates {
+                if should_failover {
                     continue;
                 }
                 return Err(error).with_context(|| {
@@ -673,6 +675,15 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             }
         };
         let status_code = upstream.status().as_u16();
+        let entered_cooldown_or_regular_failure =
+            crate::relay_rotation::record_relay_request_outcome(
+                &settings,
+                &relay.id,
+                RelayRequestOutcome::HttpStatus(status_code),
+            );
+        let should_failover = has_more_candidates
+            && !(200..300).contains(&status_code)
+            && (status_code == 429 || entered_cooldown_or_regular_failure);
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "protocol_proxy.upstream_response",
             json!({
@@ -685,13 +696,8 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 "attempt": attempt + 1,
                 "candidateCount": relay_count,
                 "headerTimeoutSeconds": header_timeout.as_secs(),
-                "willFailover": has_more_candidates && !(200..300).contains(&status_code)
+                "willFailover": should_failover
             }),
-        );
-        crate::relay_rotation::record_relay_request_outcome(
-            &settings,
-            &relay.id,
-            RelayRequestOutcome::HttpStatus(status_code),
         );
         let content_type = upstream
             .headers()
@@ -699,7 +705,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             .and_then(|value| value.to_str().ok())
             .unwrap_or("")
             .to_string();
-        if (200..300).contains(&status_code) || !has_more_candidates {
+        if (200..300).contains(&status_code) || !should_failover {
             return Ok(UpstreamProxyResponse {
                 status_code,
                 is_stream: is_stream || content_type.contains("text/event-stream"),
