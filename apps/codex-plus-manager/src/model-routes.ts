@@ -2,6 +2,8 @@ export type RelayModelRoute = {
   model: string;
   targetRelayId: string;
   targetModel: string;
+  enabled?: boolean;
+  restoreAt?: number | null;
 };
 
 export type RelayModelRouteProfile = {
@@ -38,6 +40,8 @@ export function normalizeRelayModelRoutes(routes: RelayModelRoute[] | undefined)
     model: typeof route?.model === "string" ? route.model : "",
     targetRelayId: typeof route?.targetRelayId === "string" ? route.targetRelayId : "",
     targetModel: typeof route?.targetModel === "string" ? route.targetModel : "",
+    enabled: route?.enabled !== false,
+    restoreAt: typeof route?.restoreAt === "number" ? route.restoreAt : null,
   }));
 }
 

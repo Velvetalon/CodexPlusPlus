@@ -7,12 +7,12 @@ description: 通过原生 manager CLI 或 stdio MCP 管理 Codex++，无需 GUI 
 
 直接调用新版 `codex-plus-plus-manager.exe --cli <命令>`，stdout 为一个 UTF-8 JSON，退出码 0 成功、1 失败。不需要先开 manager。使用和新版 manager 同目录的配套 launcher；旧稳定版不识别 --cli，不要拿旧 exe 试命令。
 
-本机安装包若存在 `references/local-install.json`，先读取其中的已验证 manager 路径。用户指定其他安装目录时以用户路径为准，先确认是新版 CLI。
+默认使用 Skill 内 `bin/codex-plus-plus-manager.exe`。用户指定其他安装目录时可传 `--manager` 覆盖，先确认是新版 CLI。
 
 先读 `--cli help` 和 `--cli providers-list`。所有选取使用保存的 id，不用名称或猜测索引。配置输入用 `--input @file.json`，或者 `--input -` 从 stdin 读取 JSON；密钥不要放到命令行。
 
 ```powershell
-$manager = 'C:\实际交付目录\codex-plus-plus-manager.exe'
+$manager = Join-Path $PSScriptRoot 'bin\codex-plus-plus-manager.exe'
 & $manager --cli providers-list
 & $manager --cli provider-switch --input '{"id":"已保存供应商ID"}'
 & $manager --cli aggregate-update --input '{"id":"聚合ID","patch":{"strategy":"priorityFallback"}}'
@@ -22,9 +22,9 @@ $manager = 'C:\实际交付目录\codex-plus-plus-manager.exe'
 需要稳定捕获 Windows GUI exe 的 JSON 时，用本目录 Python 封装：
 
 ```text
-python scripts/control.py --manager <新版manager.exe> providers-list
-python scripts/control.py --manager <新版manager.exe> --input @change.json provider-update
-python scripts/control.py --manager <新版manager.exe> --dry-run codex-restart
+python scripts/control.py providers-list
+python scripts/control.py --input @change.json provider-update
+python scripts/control.py --dry-run codex-restart
 ```
 
 读取默认隐藏凭据和完整配置文本；确需读取 TOML/auth 用显式 CLI `--include-secrets`，不要把其输出带入公开日志。读取的脱敏对象不能原样提交；更新只传真正改变的字段。
@@ -33,6 +33,7 @@ python scripts/control.py --manager <新版manager.exe> --dry-run codex-restart
 
 - `settings-get/settings-set`：获取设置或以 `{patch:{...}}` 更新普通设置。供应商相关数组和当前选择走专用命令。启用供应商配置时写操作同步 live 配置。
 - `provider-get/provider-update`：读/改已有供应商。更新活动供应商或活动聚合的成员会同步配置；不重启。聚合的上下文模式等字段同样通过 provider-update 设置。
+- `model-routes-list/model-route-set`：读取单模型转发的有效状态、恢复时间和剩余时长，或立即启用/禁用某一项。禁用默认 5 小时，也可指定恢复时间、持续秒数或永久禁用；新请求立即生效，不重启 Codex，不中断正在执行的请求。
 - `provider-switch/aggregate-switch`：真正执行 manager 使用的配置切换与回滚服务，不是只改 activeRelayId。
 - `providers-reorder`：给出的 IDs 按顺序移到前面，其余保留相对顺序。聚合成员优先级继承全局供应商顺序。
 - `aggregate-get/aggregate-update`：读/改聚合成员、策略、会话身份、codeModeHost。members 更新的是成员选择和权重，不另创独立顺序规则。

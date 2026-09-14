@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "codexpp-control": {
+      "command": "F:/python3105/python.exe",
+      "args": [
+        "C:/Users/v_whcnwwang/OneDrive/codex/skills/codexpp-control/scripts/control.py",
+        "--mcp"
+      ]
+    }
+  }
+}

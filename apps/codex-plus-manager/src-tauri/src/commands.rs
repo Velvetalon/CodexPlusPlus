@@ -1343,6 +1343,24 @@ pub fn load_settings() -> CommandResult<SettingsPayload> {
 }
 
 #[tauri::command]
+pub fn model_routes_list(
+    id: String,
+) -> Result<codex_plus_core::settings::RelayModelRoutesResult, String> {
+    SettingsStore::default()
+        .model_routes_list(&id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn model_route_set(
+    request: codex_plus_core::settings::SetRelayModelRouteRequest,
+) -> Result<codex_plus_core::settings::SetRelayModelRouteResult, String> {
+    SettingsStore::default()
+        .model_route_set(&request, false)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub fn save_settings(settings: BackendSettings) -> CommandResult<SettingsPayload> {
     let settings = normalize_settings_before_save(settings);
     let Ok(_guard) = relay_switch_mutex().lock() else {
@@ -6679,6 +6697,8 @@ mod tests {
                     model: "gpt-5.6-luna".to_string(),
                     target_relay_id: "target".to_string(),
                     target_model: String::new(),
+                    enabled: true,
+                    restore_at: None,
                 }],
                 ..RelayProfile::default()
             }],

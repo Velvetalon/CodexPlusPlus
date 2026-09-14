@@ -1635,6 +1635,8 @@ async fn launch_starts_helper_when_model_routing_is_enabled() {
                     model: "gpt-5.6-luna".to_string(),
                     target_relay_id: "target".to_string(),
                     target_model: String::new(),
+                    enabled: true,
+                    restore_at: None,
                 }],
                 ..RelayProfile::default()
             },

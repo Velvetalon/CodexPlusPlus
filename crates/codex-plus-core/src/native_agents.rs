@@ -251,6 +251,8 @@ mod tests {
                 model: "gpt-5.6-luna".to_string(),
                 target_relay_id: "glm".to_string(),
                 target_model: "glm-5.3-flash".to_string(),
+                enabled: true,
+                restore_at: None,
         });
         assert!(enabled(&settings));
         settings.relay_profiles[0].protocol = crate::settings::RelayProtocol::ChatCompletions;

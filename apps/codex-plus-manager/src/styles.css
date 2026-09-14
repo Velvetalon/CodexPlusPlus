@@ -5030,7 +5030,7 @@ input[type="range"]:disabled {
 
 .relay-model-route-row {
   display: grid;
-  grid-template-columns: minmax(180px, 1fr) minmax(180px, 1fr) minmax(170px, 1fr) 36px;
+  grid-template-columns: minmax(150px, .8fr) minmax(150px, .8fr) minmax(150px, .8fr) minmax(300px, 1.6fr) 36px;
   align-items: center;
   gap: 8px;
 }
@@ -5044,6 +5044,36 @@ input[type="range"]:disabled {
 .relay-model-route-row input {
   min-width: 0;
   font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.relay-model-route-state {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.relay-model-route-state > span {
+  min-width: 96px;
+  font-size: 12px;
+}
+
+.route-state-enabled { color: hsl(var(--status-success)); }
+.route-state-disabled { color: hsl(var(--status-warning)); }
+.route-state-unsaved { color: hsl(var(--muted-foreground)); }
+
+.relay-model-route-restore {
+  display: flex;
+  min-width: 260px;
+  flex: 1 1 260px;
+  align-items: center;
+  gap: 6px;
+}
+
+.relay-model-route-restore input[type="datetime-local"] {
+  min-width: 180px;
+  flex: 1;
 }
 
 /* ══════════════════════════════════════════════════════════════

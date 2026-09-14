@@ -2330,6 +2330,47 @@ async fn model_route_uses_exact_match_and_keeps_other_models_on_source_provider(
 }
 
 #[tokio::test]
+async fn disabled_model_route_uses_source_and_expired_route_uses_target() {
+    let source = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let source_addr = source.local_addr().unwrap();
+    let source_server = tokio::spawn(capture_json_request_once(source));
+    let request = json!({ "model": "gpt-5.6-terra", "input": "source", "stream": false });
+    let mut settings = model_route_settings(
+        "gpt-5.6-terra",
+        "glm-5.3",
+        "http://127.0.0.1:9/v1".to_string(),
+    );
+    settings.relay_profiles[0].base_url = format!("http://{source_addr}/v1");
+    settings.relay_profiles[0].model_routes[0].enabled = false;
+    settings.relay_profiles[0].model_routes[0].restore_at = None;
+
+    open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    let (headers, body) = source_server.await.unwrap();
+    assert!(headers.to_ascii_lowercase().contains("bearer sk-source"));
+    assert_eq!(body["model"], "gpt-5.6-terra");
+
+    let target = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let target_server = tokio::spawn(capture_json_request_once(target));
+    let mut expired = model_route_settings(
+        "gpt-5.6-terra",
+        "glm-5.3",
+        format!("http://{target_addr}/v1"),
+    );
+    expired.relay_profiles[0].model_routes[0].enabled = false;
+    expired.relay_profiles[0].model_routes[0].restore_at = Some(1);
+
+    open_responses_proxy_request_with_settings(&request.to_string(), expired)
+        .await
+        .unwrap();
+    let (headers, body) = target_server.await.unwrap();
+    assert!(headers.to_ascii_lowercase().contains("bearer sk-target"));
+    assert_eq!(body["model"], "glm-5.3");
+}
+
+#[tokio::test]
 async fn model_route_rejects_missing_or_non_responses_targets() {
     let mut missing = model_route_settings("gpt-5.6-luna", "", "http://127.0.0.1:9/v1".to_string());
     missing.relay_profiles.pop();
@@ -2485,6 +2526,8 @@ fn model_route_settings(
                     model: source_model.to_string(),
                     target_relay_id: "target".to_string(),
                     target_model: target_model.to_string(),
+                    enabled: true,
+                    restore_at: None,
                 }],
                 ..RelayProfile::default()
             },

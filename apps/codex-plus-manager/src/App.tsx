@@ -326,6 +326,34 @@ type RelayAggregateStrategy =
   | "conversationRoundRobin"
   | "requestRoundRobin"
   | "weightedRoundRobin";
+
+type RelayModelRouteStatus = {
+  model: string;
+  targetRelayId: string;
+  targetRelayName: string;
+  targetModel: string;
+  enabled: boolean;
+  restoreAt: number | null;
+  permanent: boolean;
+  remainingSeconds: number;
+};
+
+type RelayModelRoutesResult = {
+  status: string;
+  providerId: string;
+  providerName: string;
+  observedAt: number;
+  routes: RelayModelRouteStatus[];
+};
+
+type SetRelayModelRouteRequest = {
+  id: string;
+  model: string;
+  enabled: boolean;
+  restoreAt?: number;
+  durationSeconds?: number;
+  permanent?: boolean;
+};
 type RelayAggregateMember = {
   profileId: string;
   weight: number;
@@ -2947,6 +2975,26 @@ export function App() {
     return result && isSuccessStatus(result.status) ? result : null;
   };
 
+  const modelRoutesList = async (id: string) => {
+    try {
+      return await call<RelayModelRoutesResult>("model_routes_list", { id });
+    } catch {
+      return null;
+    }
+  };
+
+  const modelRouteSet = async (request: SetRelayModelRouteRequest) => {
+    const result = await run(() => call<{ status: string; route: RelayModelRouteStatus }>("model_route_set", { request }));
+    if (result) {
+      showNotice(
+        t("单模型路由"),
+        request.enabled ? t("已启用该模型转发。") : t("已禁用该模型转发。"),
+        result.status,
+      );
+    }
+    return result?.route ?? null;
+  };
+
   const switchOfficialMode = async () => {
     const switched = await clearRelayInjection(true);
     if (!switched) return;
@@ -3461,6 +3509,8 @@ export function App() {
       testStepwiseSettings,
       fetchRelayProfileModels,
       fetchSub2ApiBilling,
+      modelRoutesList,
+      modelRouteSet,
       switchRelayProfile,
       relaySwitching,
       switchOfficialMode,
@@ -3888,6 +3938,8 @@ type Actions = {
   testStepwiseSettings: (settings: BackendSettings) => Promise<void>;
   fetchRelayProfileModels: (profile: RelayProfile) => Promise<string[] | null>;
   fetchSub2ApiBilling: (profile: RelayProfile) => Promise<Sub2ApiBillingResult | null>;
+  modelRoutesList: (id: string) => Promise<RelayModelRoutesResult | null>;
+  modelRouteSet: (request: SetRelayModelRouteRequest) => Promise<RelayModelRouteStatus | null>;
   switchRelayProfile: (settings: BackendSettings, previousActiveRelayId?: string) => Promise<void>;
   relaySwitching: boolean;
   switchOfficialMode: () => Promise<void>;
@@ -8269,20 +8321,11 @@ function RelayProfileEditor({
   setModelWindowRows: (value: ModelWindowRow[]) => void;
 }) {
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [modelRouteStatuses, setModelRouteStatuses] = useState<Record<string, RelayModelRouteStatus>>({});
+  const [modelRouteRestoreDrafts, setModelRouteRestoreDrafts] = useState<Record<string, string>>({});
   const useCommonConfig = profile.useCommonConfig !== false;
   // VLM/Strip 对 Chat Completions 与 Responses 协议均可用(注入块类型已按协议适配)。
   const vlmUnsupportedProtocol = false;
-  if (isAggregateRelayProfile(profile)) {
-    return (
-      <AggregateRelayProfileEditor
-        profile={profile}
-        form={form}
-        onProfileChange={onProfileChange}
-        actions={actions}
-      />
-    );
-  }
-
   const showApiFields = profile.relayMode !== "official" || profile.officialMixApiKey;
   const sessionProvider = relaySessionProvider(profile);
   const canUseOpenAiSessionProvider = profile.relayMode !== "official" || profile.officialMixApiKey;
@@ -8305,6 +8348,27 @@ function RelayProfileEditor({
       modelRoutes: modelRoutes.map((route, routeIndex) => (routeIndex === index ? { ...route, ...patch } : route)),
     });
   };
+  const refreshModelRouteStatuses = async () => {
+    if (isNew || !profile.id) return;
+    const result = await actions.modelRoutesList(profile.id);
+    if (!result || !isSuccessStatus(result.status)) return;
+    setModelRouteStatuses(Object.fromEntries(result.routes.map((route) => [route.model, route])));
+  };
+  useEffect(() => {
+    if (isNew || !profile.id || isAggregateRelayProfile(profile)) return undefined;
+    void refreshModelRouteStatuses();
+    const timer = window.setInterval(() => void refreshModelRouteStatuses(), 1000);
+    return () => window.clearInterval(timer);
+  }, [isNew, profile.id]);
+  const setModelRouteEnabled = async (route: RelayModelRoute, request: Omit<SetRelayModelRouteRequest, "id" | "model">) => {
+    const model = route.model.trim();
+    if (!model || !modelRouteStatuses[model]) {
+      await actions.showMessage(t("单模型路由"), t("请先保存该模型路由，再修改启用状态。"), "failed");
+      return;
+    }
+    const status = await actions.modelRouteSet({ id: profile.id, model, ...request });
+    if (status) setModelRouteStatuses((current) => ({ ...current, [model]: status }));
+  };
   const updateModelWindowRow = (index: number, patch: Partial<ModelWindowRow>) => {
     setModelWindowRows(
       modelWindowRows.map((row, rowIndex) => (rowIndex === index ? { ...row, ...patch } : row)),
@@ -8325,6 +8389,16 @@ function RelayProfileEditor({
       sub2apiMultiplier: formatMultiplierValue(result.effectiveRateMultiplier),
     });
   };
+  if (isAggregateRelayProfile(profile)) {
+    return (
+      <AggregateRelayProfileEditor
+        profile={profile}
+        form={form}
+        onProfileChange={onProfileChange}
+        actions={actions}
+      />
+    );
+  }
   return (
     <div className="relay-profile-editor">
       {isNew ? (
@@ -8664,6 +8738,7 @@ function RelayProfileEditor({
                   <span>{t("匹配模型")}</span>
                   <span>{t("目标供应商")}</span>
                   <span>{t("目标模型（可选）")}</span>
+                  <span>{t("转发状态")}</span>
                 </div>
               ) : null}
               {modelRoutes.map((route, index) => (
@@ -8686,6 +8761,75 @@ function RelayProfileEditor({
                     onChange={(event) => updateModelRoute(index, { targetModel: event.currentTarget.value })}
                     placeholder={t("留空保持原模型名")}
                   />
+                  <div className="relay-model-route-state">
+                    {modelRouteStatuses[route.model.trim()] ? (
+                      <>
+                        <label className="relay-bare-switch" title={t("启用单模型转发")}>
+                          <input
+                            checked={modelRouteStatuses[route.model.trim()].enabled}
+                            onChange={(event) => void setModelRouteEnabled(route, { enabled: event.currentTarget.checked })}
+                            type="checkbox"
+                          />
+                          <ToggleVisual />
+                        </label>
+                        <span className={modelRouteStatuses[route.model.trim()].enabled ? "route-state-enabled" : "route-state-disabled"}>
+                          {formatModelRouteStatus(modelRouteStatuses[route.model.trim()])}
+                        </span>
+                        {!modelRouteStatuses[route.model.trim()].enabled ? (
+                          <Button
+                            onClick={() => void setModelRouteEnabled(route, { enabled: true })}
+                            size="sm"
+                            type="button"
+                            variant="outline"
+                          >
+                            {t("立即启用")}
+                          </Button>
+                        ) : (
+                          <>
+                            <Button
+                              onClick={() => void setModelRouteEnabled(route, { enabled: false })}
+                              size="sm"
+                              type="button"
+                              variant="outline"
+                            >
+                              {t("禁用 5 小时")}
+                            </Button>
+                            <Button
+                              onClick={() => void setModelRouteEnabled(route, { enabled: false, permanent: true })}
+                              size="sm"
+                              type="button"
+                              variant="outline"
+                            >
+                              {t("永久禁用")}
+                            </Button>
+                          </>
+                        )}
+                        <div className="relay-model-route-restore">
+                          <input
+                            aria-label={t("恢复时间")}
+                            min={modelRouteMinDateTime()}
+                            onChange={(event) => setModelRouteRestoreDrafts((current) => ({ ...current, [route.model]: event.currentTarget.value }))}
+                            type="datetime-local"
+                            value={modelRouteRestoreDrafts[route.model] ?? ""}
+                          />
+                          <Button
+                            disabled={!modelRouteRestoreDrafts[route.model]}
+                            onClick={() => {
+                              const restoreAt = Date.parse(modelRouteRestoreDrafts[route.model]);
+                              if (Number.isFinite(restoreAt)) void setModelRouteEnabled(route, { enabled: false, restoreAt });
+                            }}
+                            size="sm"
+                            type="button"
+                            variant="secondary"
+                          >
+                            {t("禁用至此时间")}
+                          </Button>
+                        </div>
+                      </>
+                    ) : (
+                      <span className="route-state-unsaved">{t("保存后可控制")}</span>
+                    )}
+                  </div>
                   <Button
                     aria-label={t("删除模型路由")}
                     onClick={() => updateDraft({ modelRoutes: modelRoutes.filter((_, routeIndex) => routeIndex !== index) })}
@@ -12543,6 +12687,27 @@ function zedRemoteSourceLabel(source: string) {
 function formatTime(value: number) {
   if (!value) return "-";
   return new Date(value).toLocaleString("zh-CN");
+}
+
+function modelRouteMinDateTime() {
+  const date = new Date(Date.now() + 60_000);
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 16);
+}
+
+function formatModelRouteStatus(status: RelayModelRouteStatus) {
+  if (status.enabled) return t("已启用");
+  if (status.permanent || !status.restoreAt) return t("永久禁用");
+  const remaining = Math.max(0, status.remainingSeconds);
+  const hours = Math.floor(remaining / 3600);
+  const minutes = Math.floor((remaining % 3600) / 60);
+  const seconds = remaining % 60;
+  return tf("禁用至 {0}（剩余 {1}:{2}:{3}）", [
+    new Date(status.restoreAt).toLocaleString(),
+    String(hours).padStart(2, "0"),
+    String(minutes).padStart(2, "0"),
+    String(seconds).padStart(2, "0"),
+  ]);
 }
 
 function formatDuration(startedAtMs: number): string {

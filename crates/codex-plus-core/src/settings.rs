@@ -110,6 +110,65 @@ pub struct RelayModelRoute {
         skip_serializing_if = "String::is_empty"
     )]
     pub target_model: String,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
+    #[serde(rename = "restoreAt", default, skip_serializing_if = "Option::is_none")]
+    pub restore_at: Option<u64>,
+}
+
+impl RelayModelRoute {
+    pub fn is_effectively_enabled_at(&self, now_ms: u64) -> bool {
+        self.enabled || self.restore_at.is_some_and(|restore_at| restore_at <= now_ms)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayModelRouteStatus {
+    pub model: String,
+    pub target_relay_id: String,
+    pub target_relay_name: String,
+    pub target_model: String,
+    pub enabled: bool,
+    pub restore_at: Option<u64>,
+    pub permanent: bool,
+    pub remaining_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayModelRoutesResult {
+    pub status: &'static str,
+    pub provider_id: String,
+    pub provider_name: String,
+    pub observed_at: u64,
+    pub routes: Vec<RelayModelRouteStatus>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetRelayModelRouteRequest {
+    pub id: String,
+    pub model: String,
+    pub enabled: bool,
+    #[serde(default)]
+    pub restore_at: Option<u64>,
+    #[serde(default)]
+    pub duration_seconds: Option<u64>,
+    #[serde(default)]
+    pub permanent: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetRelayModelRouteResult {
+    pub status: &'static str,
+    pub provider_id: String,
+    pub observed_at: u64,
+    pub route: RelayModelRouteStatus,
+    pub dry_run: bool,
+    pub restart_requested: bool,
+    pub applied_live_config: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -1054,6 +1113,10 @@ pub fn default_true() -> bool {
     true
 }
 
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
 pub fn default_relay_base_url() -> String {
     String::new()
 }
@@ -1225,8 +1288,128 @@ impl SettingsStore {
     pub fn save(&self, settings: &BackendSettings) -> anyhow::Result<()> {
         let mut settings = normalize_settings_config_sections(settings.clone());
         settings.codex_extra_args = normalize_codex_extra_args(&settings.codex_extra_args);
+        if let Ok(current) = self.load() {
+            preserve_model_route_states(&mut settings.relay_profiles, &current.relay_profiles);
+        }
         let bytes = serde_json::to_vec_pretty(&settings)?;
         atomic_write(&self.path, &bytes)
+    }
+
+    pub fn model_routes_list(&self, provider_id: &str) -> anyhow::Result<RelayModelRoutesResult> {
+        let settings = self.load()?;
+        let provider = settings
+            .relay_profiles
+            .iter()
+            .find(|profile| profile.id == provider_id)
+            .context("Provider not found")?;
+        let observed_at = unix_time_ms();
+        Ok(RelayModelRoutesResult {
+            status: "ok",
+            provider_id: provider.id.clone(),
+            provider_name: provider.name.clone(),
+            observed_at,
+            routes: provider
+                .model_routes
+                .iter()
+                .map(|route| model_route_status(&settings, route, observed_at))
+                .collect(),
+        })
+    }
+
+    pub fn model_route_set(
+        &self,
+        request: &SetRelayModelRouteRequest,
+        dry_run: bool,
+    ) -> anyhow::Result<SetRelayModelRouteResult> {
+        let recovery_choices = usize::from(request.restore_at.is_some())
+            + usize::from(request.duration_seconds.is_some())
+            + usize::from(request.permanent);
+        if request.enabled && recovery_choices != 0 {
+            anyhow::bail!("Recovery options are only valid when disabling a route");
+        }
+        if recovery_choices > 1 {
+            anyhow::bail!("restoreAt, durationSeconds and permanent are mutually exclusive");
+        }
+        if request.id.trim().is_empty() || request.model.trim().is_empty() {
+            anyhow::bail!("Provider id and model are required");
+        }
+        let observed_at = unix_time_ms();
+        let restore_at = if request.enabled || request.permanent {
+            None
+        } else if let Some(restore_at) = request.restore_at {
+            if restore_at <= observed_at {
+                anyhow::bail!("restoreAt must be a future UTC Unix millisecond timestamp");
+            }
+            Some(restore_at)
+        } else if let Some(duration_seconds) = request.duration_seconds {
+            if duration_seconds == 0 {
+                anyhow::bail!("durationSeconds must be positive");
+            }
+            Some(observed_at.saturating_add(duration_seconds.saturating_mul(1000)))
+        } else {
+            Some(observed_at.saturating_add(5 * 60 * 60 * 1000))
+        };
+
+        let _lock = self.control_lock()?;
+        let mut raw = self.load_raw_object()?;
+        let profiles = raw
+            .get_mut("relayProfiles")
+            .and_then(Value::as_array_mut)
+            .context("Provider list is missing")?;
+        let provider = profiles
+            .iter_mut()
+            .find(|value| {
+                value.get("id").and_then(Value::as_str).map(str::trim)
+                    == Some(request.id.trim())
+            })
+            .context("Provider not found")?;
+        let routes = provider
+            .get_mut("modelRoutes")
+            .and_then(Value::as_array_mut)
+            .context("Model route not found")?;
+        let route = routes
+            .iter_mut()
+            .find(|value| {
+                value.get("model").and_then(Value::as_str).map(str::trim)
+                    == Some(request.model.trim())
+            })
+            .context("Model route not found")?;
+        let route_object = route.as_object_mut().context("Invalid model route")?;
+        route_object.insert("enabled".to_string(), Value::Bool(request.enabled));
+        match restore_at {
+            Some(value) => {
+                route_object.insert("restoreAt".to_string(), Value::Number(value.into()));
+            }
+            None => {
+                route_object.remove("restoreAt");
+            }
+        }
+        let candidate = normalize_settings_config_sections(
+            serde_json::from_value::<BackendSettings>(Value::Object(raw.clone()))?,
+        );
+        let provider = candidate
+            .relay_profiles
+            .iter()
+            .find(|profile| profile.id.trim() == request.id.trim())
+            .context("Provider not found")?;
+        let route = provider
+            .model_routes
+            .iter()
+            .find(|route| route.model.trim() == request.model.trim())
+            .context("Model route not found")?;
+        let status = model_route_status(&candidate, route, observed_at);
+        if !dry_run {
+            atomic_write(&self.path, &serde_json::to_vec_pretty(&Value::Object(raw))?)?;
+        }
+        Ok(SetRelayModelRouteResult {
+            status: "ok",
+            provider_id: request.id.trim().to_string(),
+            observed_at,
+            route: status,
+            dry_run,
+            restart_requested: false,
+            applied_live_config: false,
+        })
     }
 
     pub fn update(&self, payload: Value) -> anyhow::Result<BackendSettings> {
@@ -1267,6 +1450,59 @@ impl SettingsStore {
         match serde_json::from_str::<Value>(&contents) {
             Ok(Value::Object(map)) => Ok(map),
             Ok(_) | Err(_) => Ok(settings_to_object(&BackendSettings::default())),
+        }
+    }
+}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn model_route_status(
+    settings: &BackendSettings,
+    route: &RelayModelRoute,
+    observed_at: u64,
+) -> RelayModelRouteStatus {
+    let enabled = route.is_effectively_enabled_at(observed_at);
+    let restore_at = (!enabled).then_some(route.restore_at).flatten();
+    RelayModelRouteStatus {
+        model: route.model.clone(),
+        target_relay_id: route.target_relay_id.clone(),
+        target_relay_name: settings
+            .relay_profiles
+            .iter()
+            .find(|profile| profile.id == route.target_relay_id)
+            .map(|profile| profile.name.clone())
+            .unwrap_or_default(),
+        target_model: route.target_model.clone(),
+        enabled,
+        restore_at,
+        permanent: !enabled && route.restore_at.is_none(),
+        remaining_seconds: restore_at
+            .map(|value| value.saturating_sub(observed_at).saturating_add(999) / 1000)
+            .unwrap_or(0),
+    }
+}
+
+fn preserve_model_route_states(next: &mut [RelayProfile], current: &[RelayProfile]) {
+    for profile in next {
+        let Some(current_profile) = current.iter().find(|item| item.id == profile.id) else {
+            continue;
+        };
+        for route in &mut profile.model_routes {
+            if let Some(current_route) = current_profile
+                .model_routes
+                .iter()
+                .find(|item| item.model == route.model)
+            {
+                route.enabled = current_route.enabled;
+                route.restore_at = current_route.restore_at;
+            }
         }
     }
 }
@@ -2490,6 +2726,8 @@ experimental_bearer_token = "sk-existing""#
             model: "gpt-5.6-luna".to_string(),
             target_relay_id: "target".to_string(),
             target_model: String::new(),
+            enabled: true,
+            restore_at: None,
         }];
         let settings = BackendSettings {
             active_relay_id: "source".to_string(),
@@ -3362,5 +3600,150 @@ experimental_bearer_token = "sk-existing""#
 
         assert!(!updated.provider_sync_enabled);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn old_model_route_json_defaults_to_enabled() {
+        let route: RelayModelRoute = serde_json::from_value(json!({
+            "model": "gpt-5.6-terra",
+            "targetRelayId": "glm",
+            "targetModel": "glm-5.3"
+        }))
+        .unwrap();
+
+        assert!(route.enabled);
+        assert!(route.restore_at.is_none());
+        assert!(route.is_effectively_enabled_at(1));
+    }
+
+    #[test]
+    fn model_route_set_supports_default_permanent_and_manual_enable() {
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        let store = SettingsStore::new(path.clone());
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "activeRelayId": "source",
+                "relayProfiles": [
+                    {
+                        "id": "source",
+                        "name": "Source",
+                        "modelRoutes": [{
+                            "model": "gpt-5.6-terra",
+                            "targetRelayId": "target",
+                            "targetModel": "glm-5.3",
+                            "futureField": "keep"
+                        }]
+                    },
+                    { "id": "target", "name": "Target" }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let disabled = store
+            .model_route_set(
+                &SetRelayModelRouteRequest {
+                    id: "source".to_string(),
+                    model: "gpt-5.6-terra".to_string(),
+                    enabled: false,
+                    restore_at: None,
+                    duration_seconds: None,
+                    permanent: false,
+                },
+                false,
+            )
+            .unwrap();
+        assert!(!disabled.route.enabled);
+        assert!(!disabled.route.permanent);
+        assert!((17_999..=18_000).contains(&disabled.route.remaining_seconds));
+
+        let permanent = store
+            .model_route_set(
+                &SetRelayModelRouteRequest {
+                    id: "source".to_string(),
+                    model: "gpt-5.6-terra".to_string(),
+                    enabled: false,
+                    restore_at: None,
+                    duration_seconds: None,
+                    permanent: true,
+                },
+                false,
+            )
+            .unwrap();
+        assert!(permanent.route.permanent);
+        assert!(permanent.route.restore_at.is_none());
+
+        let enabled = store
+            .model_route_set(
+                &SetRelayModelRouteRequest {
+                    id: "source".to_string(),
+                    model: "gpt-5.6-terra".to_string(),
+                    enabled: true,
+                    restore_at: None,
+                    duration_seconds: None,
+                    permanent: false,
+                },
+                false,
+            )
+            .unwrap();
+        assert!(enabled.route.enabled);
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["relayProfiles"][0]["modelRoutes"][0]["futureField"], "keep");
+        assert_eq!(saved["relayProfiles"][0]["modelRoutes"][0]["enabled"], true);
+        assert!(saved["relayProfiles"][0]["modelRoutes"][0]
+            .get("restoreAt")
+            .is_none());
+    }
+
+    #[test]
+    fn settings_save_preserves_authoritative_model_route_state() {
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        let store = SettingsStore::new(path);
+        let mut settings = BackendSettings {
+            active_relay_id: "source".to_string(),
+            relay_profiles: vec![
+                RelayProfile {
+                    id: "source".to_string(),
+                    name: "Source".to_string(),
+                    relay_mode: RelayMode::PureApi,
+                    upstream_base_url: "https://source.example/v1".to_string(),
+                    config_contents: "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"custom\"\nwire_api = \"responses\"\nbase_url = \"https://source.example/v1\"\n".to_string(),
+                    auth_contents: "{\"OPENAI_API_KEY\":\"sk-source\"}".to_string(),
+                    model_routes: vec![RelayModelRoute {
+                        model: "gpt-5.6-sol".to_string(),
+                        target_relay_id: "target".to_string(),
+                        target_model: String::new(),
+                        enabled: false,
+                        restore_at: Some(u64::MAX - 1),
+                    }],
+                    ..RelayProfile::default()
+                },
+                RelayProfile {
+                    id: "target".to_string(),
+                    name: "Target".to_string(),
+                    relay_mode: RelayMode::PureApi,
+                    upstream_base_url: "https://target.example/v1".to_string(),
+                    config_contents: "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"custom\"\nwire_api = \"responses\"\nbase_url = \"https://target.example/v1\"\n".to_string(),
+                    auth_contents: "{\"OPENAI_API_KEY\":\"sk-target\"}".to_string(),
+                    ..RelayProfile::default()
+                },
+            ],
+            ..BackendSettings::default()
+        };
+        store.save(&settings).unwrap();
+        settings.relay_profiles[0].name = "Stale draft rename".to_string();
+        settings.relay_profiles[0].model_routes[0].enabled = true;
+        settings.relay_profiles[0].model_routes[0].restore_at = None;
+
+        store.save(&settings).unwrap();
+        let loaded = store.load().unwrap();
+        let route = &loaded.relay_profiles[0].model_routes[0];
+        assert_eq!(loaded.relay_profiles[0].name, "Stale draft rename");
+        assert!(!route.enabled);
+        assert_eq!(route.restore_at, Some(u64::MAX - 1));
     }
 }

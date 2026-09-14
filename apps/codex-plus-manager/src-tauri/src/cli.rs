@@ -16,6 +16,8 @@ pub const COMMANDS: &[&str] = &[
     "providers-list",
     "provider-get",
     "provider-update",
+    "model-routes-list",
+    "model-route-set",
     "provider-switch",
     "providers-reorder",
     "aggregate-get",
@@ -146,6 +148,8 @@ fn execute(options: &Options) -> anyhow::Result<Value> {
                 "settings-set":{"patch":{"relayTestModel":"gpt-6-astra"}},
                 "provider-switch":{"id":"saved-provider-id"},
                 "provider-update":{"id":"saved-provider-id","patch":{"name":"Updated"}},
+                "model-routes-list":{"id":"saved-provider-id"},
+                "model-route-set":{"id":"saved-provider-id","model":"gpt-5.6-terra","enabled":false,"durationSeconds":18000},
                 "providers-reorder":{"ids":["provider-b","provider-a"]},
                 "aggregate-update":{"id":"aggregate-id","patch":{"strategy":"priorityFallback","members":[{"relayId":"provider-a","weight":1}]}},
                 "codex-start":{"debugPort":9229,"helperPort":57321},
@@ -159,6 +163,20 @@ fn execute(options: &Options) -> anyhow::Result<Value> {
     ) {
         return lifecycle(options);
     }
+    let store = SettingsStore::new(options.state_dir.join("settings.json"));
+    if options.command == "model-routes-list" {
+        return Ok(serde_json::to_value(
+            store.model_routes_list(string(&options.input, "id")?)?,
+        )?);
+    }
+    if options.command == "model-route-set" {
+        let request = serde_json::from_value::<codex_plus_core::settings::SetRelayModelRouteRequest>(
+            options.input.clone(),
+        )?;
+        return Ok(serde_json::to_value(
+            store.model_route_set(&request, options.dry_run)?,
+        )?);
+    }
     let writes = matches!(
         options.command.as_str(),
         "settings-set"
@@ -168,7 +186,6 @@ fn execute(options: &Options) -> anyhow::Result<Value> {
             | "aggregate-update"
             | "aggregate-switch"
     );
-    let store = SettingsStore::new(options.state_dir.join("settings.json"));
     let _lock = if writes && !options.dry_run {
         Some(store.control_lock()?)
     } else {

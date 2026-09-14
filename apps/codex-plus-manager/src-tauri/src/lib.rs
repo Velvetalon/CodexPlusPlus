@@ -70,6 +70,8 @@ pub fn run() {
             commands::launch_codex_plus,
             commands::restart_codex_plus,
             commands::load_settings,
+            commands::model_routes_list,
+            commands::model_route_set,
             commands::save_settings,
             commands::load_grok_config,
             commands::save_grok_config,

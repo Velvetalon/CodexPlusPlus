@@ -5,7 +5,7 @@ import pathlib
 import subprocess
 import sys
 
-READ = {"status", "settings-get", "providers-list", "provider-get", "aggregate-get"}
+READ = {"status", "settings-get", "providers-list", "provider-get", "model-routes-list", "aggregate-get"}
 PATCH = {"type": "object", "description": "Only fields to change; omitted fields remain unchanged."}
 ID = {"type": "string", "minLength": 1, "description": "Exact saved provider ID, from providers-list."}
 DESCRIPTIONS = {
@@ -15,6 +15,8 @@ DESCRIPTIONS = {
     "providers-list": "List saved providers, aggregate members, strategy and current selection, in priority order.",
     "provider-get": "Read one saved provider and whether it is active.",
     "provider-update": "Patch an existing provider. Active provider or active aggregate member changes are applied to live config without restart. Supports configContents/authContents, modelList/contextWindow/newContextManagement, baseUrl/apiKey/model.",
+    "model-routes-list": "List one provider's per-model forwarding entries, effective enabled state, recovery time and remaining duration.",
+    "model-route-set": "Enable or disable one existing per-model forwarding entry immediately without restarting Codex. Disable defaults to five hours; supports an explicit restore time, duration, or permanent disable.",
     "provider-switch": "Select saved ordinary or aggregate provider; perform real config/auth/catalog apply using the same switch service as the GUI. Does not restart Codex.",
     "providers-reorder": "Move listed IDs to the front in order; unlisted providers keep relative order. Selected aggregate members follow this global order; does not restart Codex.",
     "aggregate-get": "Read one aggregate's strategy/members and corresponding provider settings.",
@@ -29,8 +31,17 @@ STRATEGIES = ["failover", "priorityFallback", "conversationRoundRobin", "request
 
 def schema(command):
     fields, required = {}, []
-    if command in {"provider-get", "provider-update", "provider-switch", "aggregate-get", "aggregate-update", "aggregate-switch"}:
+    if command in {"provider-get", "provider-update", "provider-switch", "model-routes-list", "model-route-set", "aggregate-get", "aggregate-update", "aggregate-switch"}:
         fields["id"], required = ID, ["id"]
+    if command == "model-route-set":
+        fields.update({
+            "model": {"type": "string", "minLength": 1},
+            "enabled": {"type": "boolean"},
+            "restoreAt": {"type": "integer", "minimum": 1, "description": "Future UTC Unix timestamp in milliseconds."},
+            "durationSeconds": {"type": "integer", "minimum": 1},
+            "permanent": {"type": "boolean", "default": False},
+        })
+        required.extend(["model", "enabled"])
     if command.endswith("-update") or command == "settings-set":
         fields["patch"] = PATCH
         required.append("patch")
@@ -150,7 +161,8 @@ def serve(options):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--manager", required=True, type=pathlib.Path)
+    bundled_manager = pathlib.Path(__file__).resolve().parent.parent / "bin" / "codex-plus-plus-manager.exe"
+    parser.add_argument("--manager", type=pathlib.Path, default=bundled_manager)
     parser.add_argument("--mcp", action="store_true")
     parser.add_argument("--state-dir")
     parser.add_argument("--codex-home")

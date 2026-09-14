@@ -721,6 +721,8 @@ base_url = "https://responses.example.test/v1"
             model: "gpt-5.6-luna".to_string(),
             target_relay_id: "target".to_string(),
             target_model: String::new(),
+            enabled: true,
+            restore_at: None,
         }],
         ..RelayProfile::default()
     };

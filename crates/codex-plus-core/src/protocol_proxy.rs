@@ -760,10 +760,16 @@ fn select_model_route(
     }
 
     let source = settings.active_relay_profile();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
     let Some(route) = source
         .model_routes
         .iter()
-        .find(|route| route.model.trim() == model)
+        .find(|route| route.model.trim() == model && route.is_effectively_enabled_at(now_ms))
     else {
         return Ok(None);
     };
