@@ -293,6 +293,7 @@ pub struct UpstreamProxyResponse {
     pub content_type: String,
     pub is_stream: bool,
     pub wire_api: UpstreamWireApi,
+    pub native_agent_plaintext: bool,
     pub response: reqwest::Response,
 }
 
@@ -559,6 +560,8 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     request_path: &str,
 ) -> anyhow::Result<UpstreamProxyResponse> {
     let mut request_json: Value = serde_json::from_str(body)?;
+    let native_agent_plaintext = crate::native_agents::enabled(&settings)
+        && crate::native_agents::prepare_request(&mut request_json);
     if settings
         .active_aggregate_relay_profile()
         .is_some_and(|aggregate| aggregate.code_mode_host)
@@ -612,6 +615,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 "relayName": relay.name,
                 "endpoint": endpoint,
                 "wireApi": wire_api,
+                "nativeAgentPlaintext": native_agent_plaintext,
                 "stream": is_stream,
                 "attempt": attempt + 1,
                 "candidateCount": relay_count,
@@ -711,6 +715,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 is_stream: is_stream || content_type.contains("text/event-stream"),
                 content_type,
                 wire_api,
+                native_agent_plaintext,
                 response: upstream,
             });
         }
@@ -828,6 +833,7 @@ pub async fn open_models_proxy_request(
         is_stream: false,
         content_type,
         wire_api: UpstreamWireApi::Responses,
+        native_agent_plaintext: false,
         response: upstream,
     })
 }
@@ -877,6 +883,7 @@ pub async fn open_audio_transcriptions_proxy_request(
         is_stream: false,
         content_type,
         wire_api: UpstreamWireApi::AudioTranscriptions,
+        native_agent_plaintext: false,
         response: upstream,
     })
 }
@@ -931,6 +938,7 @@ pub async fn open_chat_completions_proxy_request(
         is_stream: is_stream || content_type.contains("text/event-stream"),
         content_type,
         wire_api: UpstreamWireApi::ChatCompletions,
+        native_agent_plaintext: false,
         response: upstream,
     })
 }
@@ -949,6 +957,10 @@ async fn upstream_request_parts(
         RelayProtocol::ChatCompletions => responses_to_chat_completions(request_json)?,
     };
     if relay.protocol == RelayProtocol::Responses {
+        if crate::native_agents::is_glm_url(&relay.base_url) {
+            crate::native_agents::prepare_glm_messages(&mut body);
+        }
+        normalize_glm_additional_tools(&relay.base_url, &mut body);
         normalize_responses_custom_tool_call_ids(&mut body);
     }
 
@@ -1019,6 +1031,39 @@ async fn upstream_request_parts(
         body,
         wire_api,
     ))
+}
+
+fn normalize_glm_additional_tools(base_url: &str, body: &mut Value) {
+    if !reqwest::Url::parse(base_url)
+        .ok()
+        .is_some_and(|url| url.host_str() == Some("open.bigmodel.cn"))
+        || body.get("tools").is_some_and(|tools| !tools.is_array())
+    {
+        return;
+    }
+    let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    // GLM accepts these tool definitions in `tools`, but ignores their input-item form.
+    let mut additional_tools = Vec::new();
+    input.retain(|item| {
+        if item.get("type").and_then(Value::as_str) != Some("additional_tools") {
+            return true;
+        }
+        let Some(tools) = item.get("tools").and_then(Value::as_array) else {
+            return true;
+        };
+        additional_tools.extend(tools.iter().cloned());
+        false
+    });
+    if additional_tools.is_empty() {
+        return;
+    }
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+        tools.extend(additional_tools);
+    } else {
+        body["tools"] = Value::Array(additional_tools);
+    }
 }
 
 fn upstream_request_builder(
@@ -1092,6 +1137,7 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
     let upstream_content_type = upstream.content_type.clone();
     let is_stream = upstream.is_stream;
     let wire_api = upstream.wire_api;
+    let native_agent_plaintext = upstream.native_agent_plaintext;
     let upstream_body = upstream.response.bytes().await?;
 
     if !(200..300).contains(&status_code) {
@@ -1105,6 +1151,16 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
     }
 
     if wire_api == UpstreamWireApi::Responses {
+        let body = if native_agent_plaintext && is_stream {
+            let mut rewriter = crate::native_agents::NativeAgentSseRewriter::default();
+            let mut body = rewriter.push_bytes(&upstream_body);
+            body.extend(rewriter.finish());
+            body
+        } else if native_agent_plaintext {
+            crate::native_agents::restore_json(&upstream_body)
+        } else {
+            upstream_body.to_vec()
+        };
         return Ok(ProxyHttpResponse {
             status: "200 OK".to_string(),
             content_type: if upstream_content_type.is_empty() {
@@ -1112,7 +1168,7 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
             } else {
                 upstream_content_type
             },
-            body: upstream_body.to_vec(),
+            body,
         });
     }
 
@@ -4711,4 +4767,89 @@ fn is_openai_o_series(model: &str) -> bool {
             .as_bytes()
             .get(1)
             .is_some_and(|byte| byte.is_ascii_digit())
+}
+
+#[cfg(test)]
+mod glm_additional_tools_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn glm_responses_moves_complete_tool_definitions_without_filtering() {
+        let tools = json!([{
+            "type": "namespace", "name": "functions",
+            "tools": [
+                {"type": "custom", "name": "exec", "format": {"type": "text"}},
+                {"type": "function", "name": "wait", "parameters": {"type": "object"}}
+            ]
+        }, {"type": "future_tool", "opaque": {"keep": true}}]);
+        let message = json!({"role": "user", "content": "execute the task"});
+        let agent = json!({"type": "agent_message", "content": [
+            {"type": "encrypted_content", "encrypted_content": "opaque"}
+        ]});
+        let request = json!({
+            "model": "glm-5.3-flash", "stream": true,
+            "tool_choice": "auto", "parallel_tool_calls": true,
+            "input": [
+                {"type": "additional_tools", "role": "developer", "tools": tools},
+                message, agent
+            ]
+        });
+        let relay = crate::settings::RelayProfile {
+            base_url: "https://open.bigmodel.cn/api/v1".to_string(),
+            ..Default::default()
+        };
+        let (endpoint, actual, _) = upstream_request_parts(&relay, request.clone(), "/responses")
+            .await
+            .unwrap();
+        let mut expected = request;
+        expected["input"] = json!([message, agent]);
+        expected["tools"] = tools;
+        assert_eq!(endpoint, "https://open.bigmodel.cn/api/v1/responses");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn glm_preserves_existing_tools_and_multiple_additions() {
+        let mut body = json!({
+            "tools": [{"type": "function", "name": "existing"}],
+            "input": [
+                {"type": "additional_tools", "tools": [{"type": "custom", "name": "first"}]},
+                {"role": "user", "content": "hello"},
+                {"type": "additional_tools", "tools": [{"type": "function", "name": "second"}]}
+            ]
+        });
+        normalize_glm_additional_tools("https://open.bigmodel.cn/api/v1/", &mut body);
+        assert_eq!(body["tools"], json!([
+            {"type": "function", "name": "existing"},
+            {"type": "custom", "name": "first"},
+            {"type": "function", "name": "second"}
+        ]));
+        assert_eq!(body["input"], json!([{"role": "user", "content": "hello"}]));
+        let once = body.clone();
+        normalize_glm_additional_tools("https://open.bigmodel.cn/api/v1", &mut body);
+        assert_eq!(body, once);
+    }
+
+    #[test]
+    fn other_responses_providers_and_ordinary_glm_requests_are_unchanged() {
+        let request = json!({
+            "input": [{"type": "additional_tools", "tools": [{"type": "custom", "name": "exec"}]}]
+        });
+        for base in [
+            "http://127.0.0.1:8787/v1",
+            "https://api.cdn-krill-ai.com/codex/v1",
+            "https://open.bigmodel.cn.example.com/api/v1",
+        ] {
+            let mut actual = request.clone();
+            normalize_glm_additional_tools(base, &mut actual);
+            assert_eq!(actual, request);
+        }
+        let mut ordinary = json!({
+            "tools": [{"type": "function", "name": "sum"}],
+            "input": [{"role": "user", "content": "hello"}]
+        });
+        let expected = ordinary.clone();
+        normalize_glm_additional_tools("https://open.bigmodel.cn/api/v1", &mut ordinary);
+        assert_eq!(ordinary, expected);
+    }
 }

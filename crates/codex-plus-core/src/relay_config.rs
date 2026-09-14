@@ -379,6 +379,19 @@ pub fn apply_aggregate_relay_profile_to_home_with_session_provider(
     if profile.relay_mode != crate::settings::RelayMode::Aggregate {
         anyhow::bail!("仅聚合供应商可写入聚合代理配置");
     }
+    let auth_contents = if session_provider == RelaySessionProvider::Openai {
+        let live_auth = read_optional_text(&home.join("auth.json"))?;
+        let source = if auth_contents_looks_like_chatgpt_auth(&live_auth) {
+            live_auth.as_str()
+        } else if auth_contents_looks_like_chatgpt_auth(&profile.auth_contents) {
+            profile.auth_contents.as_str()
+        } else {
+            anyhow::bail!("OpenAI 会话身份需要 ChatGPT 登录；未找到当前或已保存的官方账号凭据，请先登录官方账号。原配置未改动。");
+        };
+        remove_openai_api_key_from_auth_contents(source)?
+    } else {
+        serde_json::to_string_pretty(&json!({"OPENAI_API_KEY": bearer_token.trim()}))?
+    };
     let bearer_token = bearer_token.trim();
     if bearer_token.is_empty() {
         anyhow::bail!("聚合代理 Key 不能为空");
@@ -406,16 +419,10 @@ pub fn apply_aggregate_relay_profile_to_home_with_session_provider(
     let config_with_common = merge_common_config_into_config(&profile_config, &selected_common)?;
     let config_with_common =
         preserve_unmanaged_live_context_entries(home, &config_with_common, common_config_contents)?;
-    let config_with_limits = apply_context_limits_to_config(
-        &config_with_common,
-        &effective_profile.context_window,
-        &effective_profile.auto_compact_limit,
-    )?;
+    let config_with_limits =
+        apply_profile_context_to_config(&effective_profile, &config_with_common)?;
     let config_with_catalog =
         apply_model_catalog_to_config(home, &effective_profile, &config_with_limits)?;
-    let auth_contents = serde_json::to_string_pretty(&json!({
-        "OPENAI_API_KEY": bearer_token
-    }))?;
     apply_relay_files_to_home(home, &config_with_catalog, &auth_contents)
 }
 
@@ -495,11 +502,7 @@ pub fn apply_relay_profile_files_to_home_with_context(
     let config_with_common = merge_common_config_into_config(&profile_config, &selected_common)?;
     let config_with_common =
         preserve_unmanaged_live_context_entries(home, &config_with_common, common_config_contents)?;
-    let config_with_limits = apply_context_limits_to_config(
-        &config_with_common,
-        &profile.context_window,
-        &profile.auto_compact_limit,
-    )?;
+    let config_with_limits = apply_profile_context_to_config(profile, &config_with_common)?;
     let config_with_catalog = apply_model_catalog_to_config(home, profile, &config_with_limits)?;
     let compatible_config = apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
     let auth_contents = relay_profile_auth_contents_for_apply(profile)?;
@@ -520,11 +523,7 @@ pub fn apply_relay_profile_to_home_with_switch_rules(
     let config_with_common = merge_common_config_into_config(&profile_config, &selected_common)?;
     let config_with_common =
         preserve_unmanaged_live_context_entries(home, &config_with_common, common_config_contents)?;
-    let config_with_limits = apply_context_limits_to_config(
-        &config_with_common,
-        &profile.context_window,
-        &profile.auto_compact_limit,
-    )?;
+    let config_with_limits = apply_profile_context_to_config(profile, &config_with_common)?;
     let config_with_catalog = apply_model_catalog_to_config(home, profile, &config_with_limits)?;
     let compatible_config = apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
 
@@ -557,11 +556,7 @@ pub fn apply_relay_profile_config_to_home_with_context(
     };
     let profile_config = complete_relay_profile_config(profile)?;
     let config_with_common = merge_common_config_into_config(&profile_config, &selected_common)?;
-    let config_with_limits = apply_context_limits_to_config(
-        &config_with_common,
-        &profile.context_window,
-        &profile.auto_compact_limit,
-    )?;
+    let config_with_limits = apply_profile_context_to_config(profile, &config_with_common)?;
     let config_with_catalog = apply_model_catalog_to_config(home, profile, &config_with_limits)?;
     let compatible_config = apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
     apply_relay_config_file_to_home(home, &compatible_config)
@@ -1720,6 +1715,44 @@ fn apply_context_limits_to_config(
     Ok(normalize_optional_toml(doc))
 }
 
+fn apply_profile_context_to_config(
+    profile: &RelayProfile,
+    config_text: &str,
+) -> anyhow::Result<String> {
+    let config_text = apply_context_limits_to_config(
+        config_text,
+        &profile.context_window,
+        &profile.auto_compact_limit,
+    )?;
+    if profile.relay_mode != crate::settings::RelayMode::Aggregate {
+        return Ok(config_text);
+    }
+    let mut doc = parse_toml_document(&config_text)?;
+    if doc.get("features").and_then(Item::as_table_like).is_none() {
+        doc["features"] = toml_edit::table();
+    }
+    let features = doc
+        .get_mut("features")
+        .and_then(Item::as_table_like_mut)
+        .expect("features table was created above");
+    if features
+        .get("context_management")
+        .and_then(Item::as_table_like)
+        .is_none()
+    {
+        features.insert("context_management", toml_edit::table());
+    }
+    features
+        .get_mut("context_management")
+        .and_then(Item::as_table_like_mut)
+        .expect("context_management table was created above")
+        .insert(
+            "experimental_mode",
+            toml_edit::value(profile.new_context_management),
+        );
+    Ok(normalize_optional_toml(doc))
+}
+
 fn apply_model_catalog_to_config(
     home: &Path,
     profile: &RelayProfile,
@@ -2807,7 +2840,7 @@ fn config_has_model_provider(config_contents: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn auth_contents_looks_like_chatgpt_auth(contents: &str) -> bool {
+pub(crate) fn auth_contents_looks_like_chatgpt_auth(contents: &str) -> bool {
     let Ok(value) = serde_json::from_str::<Value>(contents) else {
         return false;
     };

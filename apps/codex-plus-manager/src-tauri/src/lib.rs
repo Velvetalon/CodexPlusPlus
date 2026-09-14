@@ -1,4 +1,5 @@
 pub mod commands;
+pub mod cli;
 pub mod install;
 
 use std::sync::atomic::{AtomicBool, Ordering};

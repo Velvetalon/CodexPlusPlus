@@ -1625,13 +1625,22 @@ async fn handle_protocol_proxy_connection(
     if upstream.is_stream {
         write_http_stream_headers(stream, "200 OK", "text/event-stream; charset=utf-8").await?;
         if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
+            let mut native_agents = upstream.native_agent_plaintext
+                .then(crate::native_agents::NativeAgentSseRewriter::default);
             let mut bytes_stream = upstream.response.bytes_stream();
             while let Some(chunk) = bytes_stream.next().await {
                 if let Ok(bytes) = chunk {
-                    stream.write_all(&bytes).await?;
+                    if let Some(rewriter) = &mut native_agents {
+                        stream.write_all(&rewriter.push_bytes(&bytes)).await?;
+                    } else {
+                        stream.write_all(&bytes).await?;
+                    }
                 } else {
                     break;
                 }
+            }
+            if let Some(rewriter) = &mut native_agents {
+                stream.write_all(&rewriter.finish()).await?;
             }
             log_helper_response(
                 "helper.protocol_proxy_stream_ok",
@@ -1688,6 +1697,11 @@ async fn handle_protocol_proxy_connection(
     }
     let upstream_body = upstream.response.bytes().await?;
     if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
+        let body = if upstream.native_agent_plaintext {
+            crate::native_agents::restore_json(&upstream_body)
+        } else {
+            upstream_body.to_vec()
+        };
         write_http_response(
             stream,
             "200 OK",
@@ -1696,7 +1710,7 @@ async fn handle_protocol_proxy_connection(
             } else {
                 &upstream.content_type
             },
-            &upstream_body,
+            &body,
         )
         .await?;
         log_helper_response(
@@ -1947,8 +1961,9 @@ mod computer_use_tests {
 }
 
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
-const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
-const MAX_HTTP_ENCODED_BODY_BYTES: usize = 64 * 1024 * 1024;
+// Krill Responses 实测：100 MiB 成功，多一个字节返回上游 413（2026-09-09）。
+const MAX_HTTP_BODY_BYTES: usize = 100 * 1024 * 1024;
+const MAX_HTTP_ENCODED_BODY_BYTES: usize = 2 * MAX_HTTP_BODY_BYTES;
 
 struct HttpRequest {
     headers: Vec<u8>,
@@ -3318,6 +3333,20 @@ mod tests {
         assert!(decode_protocol_proxy_request_body(body, Some("gzip")).is_err());
     }
 
+    #[test]
+    fn protocol_proxy_zstd_body_accepts_upstream_limit_and_rejects_one_byte_more() {
+        let mut body = vec![b' '; MAX_HTTP_BODY_BYTES];
+        let compressed = zstd::stream::encode_all(std::io::Cursor::new(&body), 1).unwrap();
+        let decoded = decode_protocol_proxy_request_body(&compressed, Some("zstd")).unwrap();
+        assert_eq!(decoded.len(), MAX_HTTP_BODY_BYTES);
+        drop(decoded);
+
+        body.push(b' ');
+        let compressed = zstd::stream::encode_all(std::io::Cursor::new(&body), 1).unwrap();
+        let error = decode_protocol_proxy_request_body(&compressed, Some("zstd")).unwrap_err();
+        assert!(error.to_string().contains("解压后的请求体超过大小限制"));
+    }
+
     #[tokio::test]
     async fn helper_replaces_chatgpt_auth_when_proxying_zstd_responses_request() {
         let _settings_guard = crate::paths::settings_path_test_guard();
@@ -3416,7 +3445,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn helper_cooldown_routes_apply_three_failure_threshold_and_reset() {
+    async fn helper_cooldown_routes_hide_429_and_apply_three_failure_threshold_and_reset() {
         let _settings_guard = crate::paths::settings_path_test_guard();
         let temp = tempfile::tempdir().unwrap();
         let settings_path = temp.path().join("settings.json");
@@ -3489,9 +3518,7 @@ mod tests {
         );
         for expected_failures in [1, 2] {
             let response = send_raw_helper_request(request.as_bytes()).await;
-            assert!(
-                String::from_utf8_lossy(&response).starts_with("HTTP/1.1 429 Too Many Requests")
-            );
+            assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK"));
             let status = helper_json_response(
                 &send_raw_helper_request(
                     b"GET /relay-rotation/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
@@ -3503,7 +3530,7 @@ mod tests {
                 expected_failures
             );
             assert_eq!(status["members"][0]["cooldownRemainingSeconds"], 0);
-            assert_eq!(working_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(working_calls.load(Ordering::SeqCst), expected_failures);
         }
 
         let response = send_raw_helper_request(request.as_bytes()).await;
@@ -3533,7 +3560,7 @@ mod tests {
         let response = send_raw_helper_request(request.as_bytes()).await;
         assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK"));
         assert_eq!(failing_calls.load(Ordering::SeqCst), 3);
-        assert_eq!(working_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(working_calls.load(Ordering::SeqCst), 4);
 
         let reset = helper_json_response(
             &send_raw_helper_request(
@@ -3545,9 +3572,9 @@ mod tests {
         assert_eq!(reset["members"][0]["cooldownRemainingSeconds"], 0);
 
         let response = send_raw_helper_request(request.as_bytes()).await;
-        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 429 Too Many Requests"));
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK"));
         assert_eq!(failing_calls.load(Ordering::SeqCst), 4);
-        assert_eq!(working_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(working_calls.load(Ordering::SeqCst), 5);
 
         failing_server.abort();
         working_server.abort();

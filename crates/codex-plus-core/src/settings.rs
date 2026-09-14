@@ -56,6 +56,8 @@ pub struct RelayProfile {
     pub context_window: String,
     #[serde(rename = "autoCompactLimit", default)]
     pub auto_compact_limit: String,
+    #[serde(default)]
+    pub new_context_management: bool,
     #[serde(rename = "modelInsertMode", default)]
     pub model_insert_mode: RelayModelInsertMode,
     #[serde(rename = "modelList", default)]
@@ -182,6 +184,7 @@ impl Default for RelayProfile {
             use_common_config: true,
             context_window: String::new(),
             auto_compact_limit: String::new(),
+            new_context_management: false,
             model_insert_mode: RelayModelInsertMode::Patch,
             model_list: String::new(),
             model_windows: String::new(),
@@ -649,6 +652,7 @@ impl BackendSettings {
                 use_common_config: true,
                 context_window: String::new(),
                 auto_compact_limit: String::new(),
+                new_context_management: false,
                 model_insert_mode: RelayModelInsertMode::Patch,
                 model_list: String::new(),
                 model_windows: String::new(),
@@ -670,6 +674,19 @@ impl BackendSettings {
         {
             let mut profile = profile.clone();
             self.apply_aggregate_context_fallback(&mut profile);
+            if profile.relay_mode == RelayMode::Aggregate
+                && self.active_aggregate_relay_profile().is_some_and(|aggregate|
+                    aggregate.session_provider == RelaySessionProvider::Openai)
+                && !crate::relay_config::auth_contents_looks_like_chatgpt_auth(&profile.auth_contents)
+            {
+                if let Some(official) = self.relay_profiles.iter().find(|candidate|
+                    candidate.id == default_active_relay_id()
+                        && candidate.relay_mode == RelayMode::Official
+                        && crate::relay_config::auth_contents_looks_like_chatgpt_auth(&candidate.auth_contents))
+                {
+                    profile.auth_contents = official.auth_contents.clone();
+                }
+            }
             return profile;
         }
 
@@ -703,6 +720,7 @@ impl BackendSettings {
             use_common_config: true,
             context_window: String::new(),
             auto_compact_limit: String::new(),
+            new_context_management: false,
             model_insert_mode: RelayModelInsertMode::Patch,
             model_list: String::new(),
             model_windows: String::new(),
@@ -749,15 +767,32 @@ impl BackendSettings {
         let Some(aggregate) = self.active_aggregate_relay_profile() else {
             return;
         };
+        let preferred_model = relay_profile_models(profile).into_iter().next();
+        let member_profiles = aggregate
+            .members
+            .iter()
+            .filter_map(|member| {
+                self.relay_profiles
+                    .iter()
+                    .find(|candidate| candidate.id == member.relay_id)
+            })
+            .collect::<Vec<_>>();
+        let mut aggregate_models = Vec::new();
+        for member in &member_profiles {
+            for model in relay_profile_models(member) {
+                if !aggregate_models.contains(&model) {
+                    aggregate_models.push(model);
+                }
+            }
+        }
+        if !aggregate_models.is_empty() {
+            profile.model = preferred_model
+                .filter(|model| aggregate_models.contains(model))
+                .unwrap_or_else(|| aggregate_models[0].clone());
+            profile.model_list = aggregate_models.join("\n");
+        }
         let mut source: Option<(&RelayProfile, u64)> = None;
-        for member in &aggregate.members {
-            let Some(member_profile) = self
-                .relay_profiles
-                .iter()
-                .find(|candidate| candidate.id == member.relay_id)
-            else {
-                continue;
-            };
+        for member_profile in member_profiles {
             let Some(context_window) = member_profile
                 .context_window
                 .trim()
@@ -794,9 +829,6 @@ impl BackendSettings {
             if profile.model.trim().is_empty() {
                 profile.model = source.model.clone();
             }
-            if profile.model_list.trim().is_empty() {
-                profile.model_list = source.model_list.clone();
-            }
             if profile.model_windows.trim().is_empty() {
                 profile.model_windows = source.model_windows.clone();
             }
@@ -832,6 +864,19 @@ impl BackendSettings {
             || self.active_relay_profile().uses_no_auth()
             || self.active_relay_session_provider() == RelaySessionProvider::Openai
     }
+}
+
+fn relay_profile_models(profile: &RelayProfile) -> Vec<String> {
+    let mut models = Vec::new();
+    for raw in std::iter::once(profile.model.as_str())
+        .chain(profile.model_list.split(['\r', '\n', ',']).map(str::trim))
+    {
+        let (model, _) = crate::model_suffix::parse_model_suffix(raw);
+        if !model.is_empty() && !models.contains(&model) {
+            models.push(model);
+        }
+    }
+    models
 }
 
 pub fn default_stepwise_api_key_env() -> String {
@@ -1148,6 +1193,16 @@ impl Default for SettingsStore {
 impl SettingsStore {
     pub fn new(path: PathBuf) -> Self {
         Self { path }
+    }
+
+    /// GUI and CLI control operations share a cross-process write lock.
+    pub fn control_lock(&self) -> anyhow::Result<fs::File> {
+        if let Some(parent) = self.path.parent() { fs::create_dir_all(parent)?; }
+        let file = fs::OpenOptions::new().read(true).write(true).create(true)
+            .truncate(false).open(self.path.with_extension("control.lock"))?;
+        fs2::FileExt::try_lock_exclusive(&file)
+            .context("Another Codex++ control operation is writing settings; retry later")?;
+        Ok(file)
     }
 
     pub fn load(&self) -> anyhow::Result<BackendSettings> {
@@ -2665,6 +2720,61 @@ experimental_bearer_token = "sk-existing""#
         let active = settings.active_relay_profile();
         assert_eq!(active.context_window, "500000");
         assert_eq!(active.auto_compact_limit, "450000");
+    }
+
+    #[test]
+    fn active_aggregate_lists_the_union_of_member_models_in_member_order() {
+        let settings = BackendSettings {
+            relay_profiles: vec![
+                RelayProfile {
+                    id: "openai".to_string(),
+                    model_list: "gpt-6-astra\ngpt-5.6-sol\ngpt-5.6-terra\ngpt-5.5\ngpt-5.4"
+                        .to_string(),
+                    ..RelayProfile::default()
+                },
+                RelayProfile {
+                    id: "krill".to_string(),
+                    model_list: "gpt-5.6-sol\ngpt-5.4\ngpt-5.5\ngpt-5.6-terra\ngpt-image-2"
+                        .to_string(),
+                    ..RelayProfile::default()
+                },
+                RelayProfile {
+                    id: "shuai".to_string(),
+                    model_list: "gpt-5.6-sol\ngpt-5.4\ngpt-5.6-terra\ngpt-5.5".to_string(),
+                    ..RelayProfile::default()
+                },
+                RelayProfile {
+                    id: "agg".to_string(),
+                    relay_mode: RelayMode::Aggregate,
+                    model_list: "gpt-5.6-sol".to_string(),
+                    ..RelayProfile::default()
+                },
+            ],
+            active_relay_id: "agg".to_string(),
+            active_aggregate_relay_id: "agg".to_string(),
+            aggregate_relay_profiles: vec![AggregateRelayProfile {
+                id: "agg".to_string(),
+                name: "聚合".to_string(),
+                session_provider: RelaySessionProvider::Custom,
+                code_mode_host: false,
+                strategy: AggregateRelayStrategy::PriorityFallback,
+                members: ["openai", "krill", "shuai"]
+                    .into_iter()
+                    .map(|relay_id| AggregateRelayMember {
+                        relay_id: relay_id.to_string(),
+                        weight: 1,
+                    })
+                    .collect(),
+            }],
+            ..BackendSettings::default()
+        };
+
+        let active = settings.active_relay_profile();
+        assert_eq!(active.model, "gpt-5.6-sol");
+        assert_eq!(
+            active.model_list,
+            "gpt-6-astra\ngpt-5.6-sol\ngpt-5.6-terra\ngpt-5.5\ngpt-5.4\ngpt-image-2"
+        );
     }
 
     #[test]

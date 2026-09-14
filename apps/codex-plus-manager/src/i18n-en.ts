@@ -478,6 +478,7 @@ export const EN_PLAIN: Record<string, string> = {
   "固定成员优先级；失败成员冷却，到期后自动回切。": "Keep fixed member priority; cool down failed members and automatically fail back after expiry.",
   "优先降级会跳过仍在冷却的失败成员，并在冷却到期后的下一请求自动恢复其原始优先级。": "Priority fallback skips failed members while they cool down and restores their original priority on the first request after expiry.",
   "code_mode_host 兼容": "code_mode_host compatibility",
+  "新版上下文管理模式": "New context management mode",
   "仅向聚合上游转发函数工具；保留终端工具，过滤自定义语法与托管工具。":
     "Forward only function tools to aggregate upstreams; keep terminal tools while filtering custom-grammar and hosted tools.",
   "留空继承成员：{0}": "Leave blank to inherit from member: {0}",

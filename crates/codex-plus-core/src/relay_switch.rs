@@ -120,6 +120,17 @@ fn backfill_profile_before_switch(
         .iter_mut()
         .find(|profile| profile.id == previous_active_relay_id)
         .with_context(|| "当前供应商已不在配置列表中，已停止切换以避免覆盖用户改动。")?;
+    // A live aggregate endpoint is a projection, not a single provider's source config.
+    if profile.relay_mode == RelayMode::Aggregate {
+        let auth_path = home.join("auth.json");
+        if auth_path.is_file() {
+            let auth = std::fs::read_to_string(auth_path)?;
+            if crate::relay_config::auth_contents_looks_like_chatgpt_auth(&auth) {
+                profile.auth_contents = auth;
+            }
+        }
+        return Ok(());
+    }
     backfill_relay_profile_from_home_with_common(
         home,
         profile,
@@ -138,6 +149,13 @@ fn apply_selected_relay_profile(
         let auth_contents =
             (!relay.auth_contents.trim().is_empty()).then_some(relay.auth_contents.as_str());
         crate::relay_config::clear_relay_config_to_home_with_auth(home, auth_contents)?
+    } else if relay.relay_mode == RelayMode::Aggregate {
+        let aggregate = settings.active_aggregate_relay_profile()
+            .context("Active aggregate configuration is incomplete")?;
+        crate::relay_config::apply_aggregate_relay_profile_to_home_with_session_provider(
+            home, &relay, &common_config, "codex-plus-aggregate",
+            crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT, aggregate.session_provider,
+        )?
     } else {
         validate_switch_profile_files(&relay)?;
         crate::relay_config::apply_relay_profile_to_home_with_switch_rules(

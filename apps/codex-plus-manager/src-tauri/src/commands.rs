@@ -790,7 +790,7 @@ fn restore_optional_file_bytes(path: &Path, contents: Option<&[u8]>) -> anyhow::
     Ok(())
 }
 
-fn sync_active_relay_to_home(
+pub(crate) fn sync_active_relay_to_home(
     settings: &BackendSettings,
     home: &Path,
 ) -> anyhow::Result<codex_plus_core::relay_config::RelayApplyResult> {
@@ -2646,7 +2646,7 @@ fn normalized_codex_app_path_for_save(raw: &str) -> String {
         .unwrap_or_default()
 }
 
-fn normalize_settings_before_save(mut settings: BackendSettings) -> BackendSettings {
+pub(crate) fn normalize_settings_before_save(mut settings: BackendSettings) -> BackendSettings {
     settings.codex_app_path = normalized_codex_app_path_for_save(&settings.codex_app_path);
     settings.relay_common_config_contents =
         codex_plus_core::relay_config::sanitize_common_config_contents(
@@ -5556,9 +5556,24 @@ fn relay_switch_payload(
     }
 }
 
-fn relay_switch_mutex() -> &'static Mutex<()> {
-    static RELAY_SWITCH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    RELAY_SWITCH_LOCK.get_or_init(|| Mutex::new(()))
+struct RelayControlLock(Mutex<()>);
+
+struct RelayControlGuard<'a> {
+    _thread: std::sync::MutexGuard<'a, ()>,
+    _process: fs::File,
+}
+
+impl RelayControlLock {
+    fn lock(&self) -> anyhow::Result<RelayControlGuard<'_>> {
+        let thread = self.0.lock().map_err(|_| anyhow::anyhow!("Control lock poisoned"))?;
+        let process = SettingsStore::default().control_lock()?;
+        Ok(RelayControlGuard { _thread: thread, _process: process })
+    }
+}
+
+fn relay_switch_mutex() -> &'static RelayControlLock {
+    static RELAY_SWITCH_LOCK: OnceLock<RelayControlLock> = OnceLock::new();
+    RELAY_SWITCH_LOCK.get_or_init(|| RelayControlLock(Mutex::new(())))
 }
 
 fn empty_context_entries() -> codex_plus_core::relay_config::CodexContextEntries {

@@ -306,6 +306,7 @@ export type RelayProfile = {
   useCommonConfig: boolean;
   contextWindow: string;
   autoCompactLimit: string;
+  newContextManagement?: boolean;
   modelList: string;
   modelWindows: string;
   modelVlm: string;
@@ -8994,6 +8995,17 @@ function AggregateRelayProfileEditor({
           </span>
           <ToggleVisual />
         </label>
+        <label className="switch-row compact relay-switch-row relay-field-context-management">
+          <input
+            checked={profile.newContextManagement === true}
+            onChange={(event) => onProfileChange({ ...profile, newContextManagement: event.currentTarget.checked })}
+            type="checkbox"
+          />
+          <span>
+            <strong>{t("新版上下文管理模式")}</strong>
+          </span>
+          <ToggleVisual />
+        </label>
       </div>
       <div className="aggregate-strategy-grid">
         {aggregateStrategyOptions.map((option) => (
@@ -11390,6 +11402,7 @@ function normalizeRelayProfile(profile: RelayProfile): RelayProfile {
         useCommonConfig: profile.useCommonConfig !== false,
         contextWindow: profile.contextWindow || "",
         autoCompactLimit: profile.autoCompactLimit || "",
+        newContextManagement: profile.newContextManagement === true,
         modelList: profile.modelList || "",
         modelWindows: profile.modelWindows || "",
         modelRoutes: [],
@@ -12290,6 +12303,7 @@ function createAggregateRelayProfile(settings: BackendSettings): RelayProfile {
       useCommonConfig: true,
       contextWindow: "",
       autoCompactLimit: "",
+      newContextManagement: false,
       modelList: "",
       modelWindows: "",
       modelVlm: "",
