@@ -16,6 +16,7 @@ use codex_plus_core::relay_rotation::priority_fallback_cooldown_status;
 use codex_plus_core::settings::{
     AggregateRelayMember, AggregateRelayProfile, AggregateRelayStrategy, BackendSettings,
     RelayMode, RelayModelRoute, RelayProfile, RelayProtocol, RelaySessionProvider,
+    ResponsesReasoningPolicy,
 };
 use serde_json::json;
 use std::io::{Read, Write};
@@ -1860,6 +1861,62 @@ async fn aggregate_proxy_fails_over_to_next_member_in_same_request() {
 }
 
 #[tokio::test]
+async fn aggregate_attempts_apply_each_responses_reasoning_policy_to_an_independent_body() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let first = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let first_addr = first.local_addr().unwrap();
+    let second = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let second_addr = second.local_addr().unwrap();
+    let first_server = tokio::spawn(capture_request_and_respond_once(
+        first,
+        "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 11\r\ncontent-type: application/json\r\n\r\n{\"error\":1}",
+    ));
+    let second_server = tokio::spawn(capture_json_request_once(second));
+    let mut settings = aggregate_proxy_settings(
+        "reasoning-policy-independent",
+        format!("http://{first_addr}/v1"),
+        format!("http://{second_addr}/v1"),
+    );
+    settings.relay_profiles[0].responses_reasoning_policy = ResponsesReasoningPolicy::Strip;
+    settings.relay_profiles[1].responses_reasoning_policy = ResponsesReasoningPolicy::OpenAiOpaque;
+    for relay in settings.relay_profiles.iter_mut().take(2) {
+        relay.relay_mode = RelayMode::PureApi;
+        relay.no_auth = true;
+        relay.api_key.clear();
+    }
+
+    let result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-5-mini","input":[{"type":"message","role":"user","content":"before"},{"type":"reasoning","content":"visible","encrypted_content":"cipher"},{"type":"function_call","call_id":"call-1","name":"lookup"}],"stream":false}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.status_code, 200);
+
+    let first_request = first_server.await.unwrap();
+    let first_body = first_request
+        .split_once("\r\n\r\n")
+        .and_then(|(_, body)| serde_json::from_str::<serde_json::Value>(body).ok())
+        .unwrap();
+    assert!(
+        first_body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item.get("type").and_then(serde_json::Value::as_str) != Some("reasoning"))
+    );
+
+    let (_, second_body) = second_server.await.unwrap();
+    assert_eq!(second_body["input"][1]["type"], "reasoning");
+    assert_eq!(second_body["input"][1]["content"], json!([]));
+    assert_eq!(second_body["input"][2]["type"], "function_call");
+}
+
+#[tokio::test]
 async fn priority_fallback_waits_for_third_failure_before_failing_over() {
     let _lock = settings_path_test_lock().lock().unwrap();
     let first = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -2331,7 +2388,9 @@ async fn model_route_uses_exact_match_and_keeps_other_models_on_source_provider(
 
 #[tokio::test]
 async fn disabled_model_route_uses_source_and_expired_route_uses_target() {
-    let source = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let source = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let source_addr = source.local_addr().unwrap();
     let source_server = tokio::spawn(capture_json_request_once(source));
     let request = json!({ "model": "gpt-5.6-terra", "input": "source", "stream": false });
@@ -2351,7 +2410,9 @@ async fn disabled_model_route_uses_source_and_expired_route_uses_target() {
     assert!(headers.to_ascii_lowercase().contains("bearer sk-source"));
     assert_eq!(body["model"], "gpt-5.6-terra");
 
-    let target = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let target_addr = target.local_addr().unwrap();
     let target_server = tokio::spawn(capture_json_request_once(target));
     let mut expired = model_route_settings(

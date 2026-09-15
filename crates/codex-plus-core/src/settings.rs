@@ -36,6 +36,8 @@ pub struct RelayProfile {
     pub api_key: String,
     #[serde(default)]
     pub protocol: RelayProtocol,
+    #[serde(rename = "responsesReasoningPolicy", default)]
+    pub responses_reasoning_policy: ResponsesReasoningPolicy,
     #[serde(rename = "relayMode", default)]
     pub relay_mode: RelayMode,
     #[serde(rename = "officialMixApiKey", default)]
@@ -118,7 +120,10 @@ pub struct RelayModelRoute {
 
 impl RelayModelRoute {
     pub fn is_effectively_enabled_at(&self, now_ms: u64) -> bool {
-        self.enabled || self.restore_at.is_some_and(|restore_at| restore_at <= now_ms)
+        self.enabled
+            || self
+                .restore_at
+                .is_some_and(|restore_at| restore_at <= now_ms)
     }
 }
 
@@ -233,6 +238,7 @@ impl Default for RelayProfile {
             upstream_base_url: String::new(),
             api_key: String::new(),
             protocol: RelayProtocol::Responses,
+            responses_reasoning_policy: ResponsesReasoningPolicy::default(),
             relay_mode: RelayMode::Official,
             official_mix_api_key: false,
             no_auth: false,
@@ -285,6 +291,25 @@ pub enum RelayProtocol {
     #[default]
     Responses,
     ChatCompletions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ResponsesReasoningPolicy {
+    #[default]
+    Passthrough,
+    OpenAiOpaque,
+    Strip,
+}
+
+impl ResponsesReasoningPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Passthrough => "passthrough",
+            Self::OpenAiOpaque => "openAiOpaque",
+            Self::Strip => "strip",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -701,6 +726,7 @@ impl BackendSettings {
                 },
                 api_key: self.relay_api_key.clone(),
                 protocol: RelayProtocol::Responses,
+                responses_reasoning_policy: ResponsesReasoningPolicy::default(),
                 relay_mode: RelayMode::MixedApi,
                 official_mix_api_key: true,
                 no_auth: false,
@@ -734,15 +760,22 @@ impl BackendSettings {
             let mut profile = profile.clone();
             self.apply_aggregate_context_fallback(&mut profile);
             if profile.relay_mode == RelayMode::Aggregate
-                && self.active_aggregate_relay_profile().is_some_and(|aggregate|
-                    aggregate.session_provider == RelaySessionProvider::Openai)
-                && !crate::relay_config::auth_contents_looks_like_chatgpt_auth(&profile.auth_contents)
+                && self
+                    .active_aggregate_relay_profile()
+                    .is_some_and(|aggregate| {
+                        aggregate.session_provider == RelaySessionProvider::Openai
+                    })
+                && !crate::relay_config::auth_contents_looks_like_chatgpt_auth(
+                    &profile.auth_contents,
+                )
             {
-                if let Some(official) = self.relay_profiles.iter().find(|candidate|
+                if let Some(official) = self.relay_profiles.iter().find(|candidate| {
                     candidate.id == default_active_relay_id()
                         && candidate.relay_mode == RelayMode::Official
-                        && crate::relay_config::auth_contents_looks_like_chatgpt_auth(&candidate.auth_contents))
-                {
+                        && crate::relay_config::auth_contents_looks_like_chatgpt_auth(
+                            &candidate.auth_contents,
+                        )
+                }) {
                     profile.auth_contents = official.auth_contents.clone();
                 }
             }
@@ -769,6 +802,7 @@ impl BackendSettings {
             },
             api_key: self.relay_api_key.clone(),
             protocol: RelayProtocol::Responses,
+            responses_reasoning_policy: ResponsesReasoningPolicy::default(),
             relay_mode: RelayMode::Official,
             official_mix_api_key: false,
             no_auth: false,
@@ -1260,9 +1294,15 @@ impl SettingsStore {
 
     /// GUI and CLI control operations share a cross-process write lock.
     pub fn control_lock(&self) -> anyhow::Result<fs::File> {
-        if let Some(parent) = self.path.parent() { fs::create_dir_all(parent)?; }
-        let file = fs::OpenOptions::new().read(true).write(true).create(true)
-            .truncate(false).open(self.path.with_extension("control.lock"))?;
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.path.with_extension("control.lock"))?;
         fs2::FileExt::try_lock_exclusive(&file)
             .context("Another Codex++ control operation is writing settings; retry later")?;
         Ok(file)
@@ -1359,8 +1399,7 @@ impl SettingsStore {
         let provider = profiles
             .iter_mut()
             .find(|value| {
-                value.get("id").and_then(Value::as_str).map(str::trim)
-                    == Some(request.id.trim())
+                value.get("id").and_then(Value::as_str).map(str::trim) == Some(request.id.trim())
             })
             .context("Provider not found")?;
         let routes = provider
@@ -1384,9 +1423,9 @@ impl SettingsStore {
                 route_object.remove("restoreAt");
             }
         }
-        let candidate = normalize_settings_config_sections(
-            serde_json::from_value::<BackendSettings>(Value::Object(raw.clone()))?,
-        );
+        let candidate = normalize_settings_config_sections(serde_json::from_value::<
+            BackendSettings,
+        >(Value::Object(raw.clone()))?);
         let provider = candidate
             .relay_profiles
             .iter()
@@ -2291,6 +2330,34 @@ mod tests {
         assert!(!profile.official_mix_api_key);
         assert!(!profile.hide_official_usage_alert);
         assert!(profile.test_model.is_empty());
+    }
+
+    #[test]
+    fn relay_profile_reasoning_policy_defaults_and_round_trips() {
+        let legacy: RelayProfile =
+            serde_json::from_str(r#"{"id":"legacy","name":"Legacy"}"#).unwrap();
+        assert_eq!(
+            legacy.responses_reasoning_policy,
+            ResponsesReasoningPolicy::Passthrough
+        );
+
+        for (raw, expected) in [
+            ("passthrough", ResponsesReasoningPolicy::Passthrough),
+            ("openAiOpaque", ResponsesReasoningPolicy::OpenAiOpaque),
+            ("strip", ResponsesReasoningPolicy::Strip),
+        ] {
+            let profile: RelayProfile = serde_json::from_value(json!({
+                "id": "relay",
+                "name": "Relay",
+                "responsesReasoningPolicy": raw
+            }))
+            .unwrap();
+            assert_eq!(profile.responses_reasoning_policy, expected);
+            assert_eq!(
+                serde_json::to_value(profile).unwrap()["responsesReasoningPolicy"],
+                raw
+            );
+        }
     }
 
     #[test]
@@ -3691,11 +3758,16 @@ experimental_bearer_token = "sk-existing""#
             .unwrap();
         assert!(enabled.route.enabled);
         let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(saved["relayProfiles"][0]["modelRoutes"][0]["futureField"], "keep");
+        assert_eq!(
+            saved["relayProfiles"][0]["modelRoutes"][0]["futureField"],
+            "keep"
+        );
         assert_eq!(saved["relayProfiles"][0]["modelRoutes"][0]["enabled"], true);
-        assert!(saved["relayProfiles"][0]["modelRoutes"][0]
-            .get("restoreAt")
-            .is_none());
+        assert!(
+            saved["relayProfiles"][0]["modelRoutes"][0]
+                .get("restoreAt")
+                .is_none()
+        );
     }
 
     #[test]

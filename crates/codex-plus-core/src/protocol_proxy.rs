@@ -10,7 +10,7 @@ use anyhow::Context;
 use serde_json::{Value, json};
 
 use crate::relay_rotation::{RelayRequestOutcome, RotationContext};
-use crate::settings::{RelayProtocol, SettingsStore};
+use crate::settings::{RelayProtocol, ResponsesReasoningPolicy, SettingsStore};
 
 pub const DEFAULT_PROTOCOL_PROXY_PORT: u16 = 57321;
 pub const NO_AUTH_PROXY_BEARER_TOKEN: &str = "codex-plus-no-auth";
@@ -963,6 +963,11 @@ async fn upstream_request_parts(
         RelayProtocol::ChatCompletions => responses_to_chat_completions(request_json)?,
     };
     if relay.protocol == RelayProtocol::Responses {
+        normalize_responses_reasoning_policy(
+            &mut body,
+            relay.responses_reasoning_policy,
+            &relay.id,
+        );
         if crate::native_agents::is_glm_url(&relay.base_url) {
             crate::native_agents::prepare_glm_messages(&mut body);
         }
@@ -1037,6 +1042,122 @@ async fn upstream_request_parts(
         body,
         wire_api,
     ))
+}
+
+fn normalize_responses_reasoning_policy(
+    body: &mut Value,
+    policy: ResponsesReasoningPolicy,
+    relay_id: &str,
+) {
+    let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    let mut index = 0;
+    input.retain_mut(|item| {
+        let item_index = index;
+        index += 1;
+        if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+            return true;
+        }
+
+        let content_length = responses_reasoning_content_length(item.get("content"));
+        let has_non_empty_content = content_is_non_empty(item.get("content"));
+        let encrypted_content_present = item
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty());
+        let mut content_cleared = false;
+        let keep = match policy {
+            ResponsesReasoningPolicy::Passthrough => true,
+            ResponsesReasoningPolicy::OpenAiOpaque if has_non_empty_content => {
+                if encrypted_content_present {
+                    if let Some(object) = item.as_object_mut() {
+                        object.insert("content".to_string(), Value::Array(Vec::new()));
+                    }
+                    content_cleared = true;
+                    true
+                } else {
+                    false
+                }
+            }
+            ResponsesReasoningPolicy::OpenAiOpaque => true,
+            ResponsesReasoningPolicy::Strip => false,
+        };
+
+        let reasoning_content_removed = if keep && policy == ResponsesReasoningPolicy::OpenAiOpaque
+        {
+            item.as_object_mut()
+                .and_then(|object| object.remove("reasoning_content"))
+                .is_some()
+        } else {
+            false
+        };
+        let action = if !keep {
+            "item_removed"
+        } else if content_cleared && reasoning_content_removed {
+            "content_cleared_and_reasoning_content_removed"
+        } else if content_cleared {
+            "content_cleared"
+        } else if reasoning_content_removed {
+            "reasoning_content_removed"
+        } else {
+            "passthrough"
+        };
+
+        if action != "passthrough" {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "protocol_proxy.reasoning_normalization",
+                responses_reasoning_normalization_detail(
+                    item_index,
+                    content_length,
+                    encrypted_content_present,
+                    action,
+                    policy,
+                    relay_id,
+                ),
+            );
+        }
+        keep
+    });
+}
+
+fn responses_reasoning_normalization_detail(
+    index: usize,
+    content_length: usize,
+    encrypted_content_present: bool,
+    action: &str,
+    policy: ResponsesReasoningPolicy,
+    relay_id: &str,
+) -> Value {
+    json!({
+        "index": index,
+        "contentLength": content_length,
+        "encryptedContentPresent": encrypted_content_present,
+        "action": action,
+        "policy": policy.as_str(),
+        "relay": relay_id,
+    })
+}
+
+fn content_is_non_empty(content: Option<&Value>) -> bool {
+    match content {
+        None | Some(Value::Null) => false,
+        Some(Value::String(value)) => !value.is_empty(),
+        Some(Value::Array(value)) => !value.is_empty(),
+        Some(Value::Object(value)) => !value.is_empty(),
+        Some(_) => true,
+    }
+}
+
+fn responses_reasoning_content_length(content: Option<&Value>) -> usize {
+    match content {
+        None | Some(Value::Null) => 0,
+        Some(Value::String(value)) => usize::from(!value.is_empty()),
+        Some(Value::Array(values)) => values.len(),
+        Some(Value::Object(values)) => usize::from(!values.is_empty()),
+        Some(_) => 1,
+    }
 }
 
 fn normalize_glm_additional_tools(base_url: &str, body: &mut Value) {
@@ -4825,11 +4946,14 @@ mod glm_additional_tools_tests {
             ]
         });
         normalize_glm_additional_tools("https://open.bigmodel.cn/api/v1/", &mut body);
-        assert_eq!(body["tools"], json!([
-            {"type": "function", "name": "existing"},
-            {"type": "custom", "name": "first"},
-            {"type": "function", "name": "second"}
-        ]));
+        assert_eq!(
+            body["tools"],
+            json!([
+                {"type": "function", "name": "existing"},
+                {"type": "custom", "name": "first"},
+                {"type": "function", "name": "second"}
+            ])
+        );
         assert_eq!(body["input"], json!([{"role": "user", "content": "hello"}]));
         let once = body.clone();
         normalize_glm_additional_tools("https://open.bigmodel.cn/api/v1", &mut body);
@@ -4857,5 +4981,216 @@ mod glm_additional_tools_tests {
         let expected = ordinary.clone();
         normalize_glm_additional_tools("https://open.bigmodel.cn/api/v1", &mut ordinary);
         assert_eq!(ordinary, expected);
+    }
+}
+
+#[cfg(test)]
+mod responses_reasoning_policy_tests {
+    use super::*;
+
+    fn request() -> Value {
+        json!({
+            "model": "gpt-5.4",
+            "input": [
+                {"type": "message", "role": "user", "content": "before"},
+                {"type": "reasoning", "content": "visible", "encrypted_content": "cipher", "reasoning_content": "secret-one", "summary": [{"type": "summary_text", "text": "official-one"}]},
+                {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "visible"}], "encrypted_content": "cipher-array", "reasoning_content": "secret-two", "summary": [{"type": "summary_text", "text": "official-two"}]},
+                {"type": "reasoning", "content": [], "encrypted_content": "cipher", "reasoning_content": "secret-three", "summary": [{"type": "summary_text", "text": "official-three"}]},
+                {"type": "reasoning", "encrypted_content": "", "reasoning_content": "secret-four", "summary": [{"type": "summary_text", "text": "official-four"}]},
+                {"type": "function_call", "call_id": "call-1", "name": "lookup"},
+                {"type": "message", "role": "user", "content": "after"}
+            ]
+        })
+    }
+
+    #[test]
+    fn missing_policy_defaults_to_passthrough_and_serializes_camel_case() {
+        let profile: crate::settings::RelayProfile = serde_json::from_value(json!({
+            "id": "relay",
+            "name": "Relay"
+        }))
+        .unwrap();
+        assert_eq!(
+            profile.responses_reasoning_policy,
+            ResponsesReasoningPolicy::Passthrough
+        );
+        assert_eq!(
+            serde_json::to_value(profile).unwrap()["responsesReasoningPolicy"],
+            "passthrough"
+        );
+    }
+
+    #[test]
+    fn passthrough_preserves_reasoning_items_and_order() {
+        let mut actual = request();
+        normalize_responses_reasoning_policy(
+            &mut actual,
+            ResponsesReasoningPolicy::Passthrough,
+            "relay-a",
+        );
+        assert_eq!(actual, request());
+    }
+
+    #[test]
+    fn open_ai_opaque_removes_plaintext_reasoning_and_preserves_summary() {
+        let mut actual = request();
+        normalize_responses_reasoning_policy(
+            &mut actual,
+            ResponsesReasoningPolicy::OpenAiOpaque,
+            "relay-a",
+        );
+
+        assert_eq!(
+            actual["input"],
+            json!([
+                {"type": "message", "role": "user", "content": "before"},
+                {"type": "reasoning", "content": [], "encrypted_content": "cipher", "summary": [{"type": "summary_text", "text": "official-one"}]},
+                {"type": "reasoning", "content": [], "encrypted_content": "cipher-array", "summary": [{"type": "summary_text", "text": "official-two"}]},
+                {"type": "reasoning", "content": [], "encrypted_content": "cipher", "summary": [{"type": "summary_text", "text": "official-three"}]},
+                {"type": "reasoning", "encrypted_content": "", "summary": [{"type": "summary_text", "text": "official-four"}]},
+                {"type": "function_call", "call_id": "call-1", "name": "lookup"},
+                {"type": "message", "role": "user", "content": "after"}
+            ])
+        );
+    }
+
+    #[test]
+    fn open_ai_opaque_retains_object_array_content_as_one_item_before_clearing() {
+        let content = json!([
+            {
+                "type": "reasoning_text",
+                "text": "a deliberately long reasoning summary that still counts as one item"
+            }
+        ]);
+        assert_eq!(responses_reasoning_content_length(Some(&content)), 1);
+        assert!(content_is_non_empty(Some(&content)));
+
+        let mut actual = json!({
+            "input": [{
+                "type": "reasoning",
+                "content": content,
+                "encrypted_content": "cipher",
+                "reasoning_content": "plaintext",
+                "summary": [{"type": "summary_text", "text": "official"}]
+            }]
+        });
+        normalize_responses_reasoning_policy(
+            &mut actual,
+            ResponsesReasoningPolicy::OpenAiOpaque,
+            "relay-a",
+        );
+        assert_eq!(actual["input"].as_array().unwrap().len(), 1);
+        assert_eq!(actual["input"][0]["content"], json!([]));
+        assert_eq!(
+            actual["input"][0]["summary"],
+            json!([{"type": "summary_text", "text": "official"}])
+        );
+        assert!(actual["input"][0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn passthrough_preserves_reasoning_content_and_summary() {
+        let mut actual = request();
+        normalize_responses_reasoning_policy(
+            &mut actual,
+            ResponsesReasoningPolicy::Passthrough,
+            "relay-a",
+        );
+        assert_eq!(actual["input"][1]["reasoning_content"], json!("secret-one"));
+        assert_eq!(
+            actual["input"][1]["summary"],
+            json!([{"type": "summary_text", "text": "official-one"}])
+        );
+    }
+
+    #[test]
+    fn strip_removes_all_reasoning_but_keeps_tools_and_order() {
+        let mut actual = request();
+        normalize_responses_reasoning_policy(
+            &mut actual,
+            ResponsesReasoningPolicy::Strip,
+            "relay-a",
+        );
+        assert_eq!(
+            actual["input"],
+            json!([
+                {"type": "message", "role": "user", "content": "before"},
+                {"type": "function_call", "call_id": "call-1", "name": "lookup"},
+                {"type": "message", "role": "user", "content": "after"}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_policy_is_not_applied_to_chat_completions() {
+        let relay = crate::settings::RelayProfile {
+            protocol: RelayProtocol::ChatCompletions,
+            responses_reasoning_policy: ResponsesReasoningPolicy::Strip,
+            base_url: "https://relay.example/v1".to_string(),
+            ..Default::default()
+        };
+        let (_, actual, wire_api) = upstream_request_parts(&relay, request(), "/responses")
+            .await
+            .unwrap();
+        assert!(matches!(wire_api, UpstreamWireApi::ChatCompletions));
+        assert!(
+            actual["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| {
+                    message
+                        .get("reasoning_content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| text.contains("secret-one"))
+                })
+        );
+    }
+
+    #[test]
+    fn candidates_can_normalize_independently_without_leaking_content_changes() {
+        let mut first = request();
+        normalize_responses_reasoning_policy(
+            &mut first,
+            ResponsesReasoningPolicy::Strip,
+            "relay-strip",
+        );
+        let mut second = request();
+        normalize_responses_reasoning_policy(
+            &mut second,
+            ResponsesReasoningPolicy::OpenAiOpaque,
+            "relay-opaque",
+        );
+
+        assert_eq!(first["input"].as_array().unwrap().len(), 3);
+        assert_eq!(second["input"][1]["content"], json!([]));
+        assert_eq!(second["input"][2]["content"], json!([]));
+    }
+
+    #[test]
+    fn reasoning_diagnostic_detail_is_redacted() {
+        let detail = responses_reasoning_normalization_detail(
+            4,
+            12,
+            true,
+            "content_cleared_and_reasoning_content_removed",
+            ResponsesReasoningPolicy::OpenAiOpaque,
+            "relay-a",
+        );
+        assert_eq!(
+            detail,
+            json!({
+                "index": 4,
+                "contentLength": 12,
+                "encryptedContentPresent": true,
+                "action": "content_cleared_and_reasoning_content_removed",
+                "policy": "openAiOpaque",
+                "relay": "relay-a"
+            })
+        );
+        let serialized = detail.to_string();
+        assert!(!serialized.contains("visible"));
+        assert!(!serialized.contains("cipher"));
+        assert!(!serialized.contains("sk-"));
     }
 }

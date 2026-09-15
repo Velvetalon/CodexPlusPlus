@@ -652,3 +652,27 @@ fn redact(value: &mut Value) {
         _ => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_plus_core::settings::{RelayProfile, ResponsesReasoningPolicy};
+
+    #[test]
+    fn provider_update_accepts_responses_reasoning_policy() {
+        let profile = RelayProfile::default();
+        let mut next = serde_json::to_value(&profile).unwrap();
+        let patch = json!({"responsesReasoningPolicy": "strip"});
+
+        for key in patch.as_object().unwrap().keys() {
+            assert!(next.get(key).is_some(), "provider-update rejected {key}");
+        }
+        merge_object(&mut next, &patch);
+
+        let updated: RelayProfile = serde_json::from_value(next).unwrap();
+        assert_eq!(
+            updated.responses_reasoning_policy,
+            ResponsesReasoningPolicy::Strip
+        );
+    }
+}

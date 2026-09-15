@@ -295,6 +295,7 @@ export type RelayProfile = {
   upstreamBaseUrl: string;
   apiKey: string;
   protocol: RelayProtocol;
+  responsesReasoningPolicy: ResponsesReasoningPolicy;
   relayMode: RelayMode;
   sessionProvider?: RelaySessionProvider;
   officialMixApiKey: boolean;
@@ -319,6 +320,8 @@ export type RelayProfile = {
   modelRoutes?: RelayModelRoute[];
   aggregate?: RelayAggregateConfig | null;
 };
+
+type ResponsesReasoningPolicy = "passthrough" | "openAiOpaque" | "strip";
 
 type RelayAggregateStrategy =
   | "failover"
@@ -1122,6 +1125,7 @@ const defaultSettings: BackendSettings = {
       upstreamBaseUrl: "",
       apiKey: "",
       protocol: "responses",
+      responsesReasoningPolicy: "passthrough",
       relayMode: "official",
       officialMixApiKey: false,
       noAuth: false,
@@ -8916,6 +8920,24 @@ function RelayProfileEditor({
                   placeholder={tf("留空使用默认：{0}", [form.relayTestModel || defaultSettings.relayTestModel])}
                 />
               </Field>
+              <Field className="relay-field-reasoning-policy" label={t("Responses reasoning 兼容")}>
+                <AppSelect
+                  value={profile.responsesReasoningPolicy}
+                  disabled={profile.protocol !== "responses"}
+                  onChange={(value) => updateDraft({ responsesReasoningPolicy: value })}
+                  options={[
+                    { value: "passthrough", label: t("原样透传") },
+                    { value: "openAiOpaque", label: t("OpenAI opaque 兼容") },
+                    { value: "strip", label: t("移除 reasoning") },
+                  ]}
+                  title={profile.protocol !== "responses" ? t("仅 Responses API 生效") : undefined}
+                />
+                <p className="field-hint">
+                  {profile.protocol === "responses"
+                    ? t("仅处理 Responses 顶层 input 的 reasoning 条目；Chat Completions 不受影响。")
+                    : t("仅 Responses API 生效。")}
+                </p>
+              </Field>
               <Field className="relay-field-context-window" label={t("上下文大小")}>
                 <Input
                   inputMode="numeric"
@@ -11450,6 +11472,7 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
             upstreamBaseUrl: settings.relayBaseUrl || defaultSettings.relayBaseUrl,
             apiKey: settings.relayApiKey || "",
             protocol: "responses" as RelayProtocol,
+            responsesReasoningPolicy: "passthrough" as ResponsesReasoningPolicy,
             relayMode: "official" as RelayMode,
             sessionProvider: "custom" as RelaySessionProvider,
             officialMixApiKey: false,
@@ -11535,6 +11558,7 @@ function normalizeRelayProfile(profile: RelayProfile): RelayProfile {
         upstreamBaseUrl: "",
         apiKey: "",
         protocol: "responses",
+        responsesReasoningPolicy: normalizeResponsesReasoningPolicy(profile.responsesReasoningPolicy),
         relayMode: "aggregate",
         sessionProvider: normalizeRelaySessionProvider(profile.sessionProvider),
         officialMixApiKey: false,
@@ -11566,6 +11590,7 @@ function normalizeRelayProfile(profile: RelayProfile): RelayProfile {
     upstreamBaseUrl: profile.upstreamBaseUrl || profile.baseUrl || "",
     apiKey: noAuth ? "" : profile.apiKey || "",
     protocol: profile.protocol === "chatCompletions" ? "chatCompletions" : "responses",
+    responsesReasoningPolicy: normalizeResponsesReasoningPolicy(profile.responsesReasoningPolicy),
     relayMode,
     sessionProvider: relaySessionProvider(profile),
     officialMixApiKey,
@@ -11630,6 +11655,10 @@ function normalizeRelayMode(mode: RelayMode | undefined): RelayMode {
   if (mode === "aggregate") return mode;
   if (mode === "pureApi") return mode;
   return "official";
+}
+
+function normalizeResponsesReasoningPolicy(value: string | undefined): ResponsesReasoningPolicy {
+  return value === "openAiOpaque" || value === "strip" ? value : "passthrough";
 }
 
 function normalizeRelaySessionProvider(value: string | undefined): RelaySessionProvider {
@@ -12399,6 +12428,7 @@ function createRelayProfile(settings: BackendSettings): RelayProfile {
     upstreamBaseUrl: defaultSettings.relayBaseUrl,
     apiKey: "",
     protocol: "responses" as RelayProtocol,
+    responsesReasoningPolicy: "passthrough" as ResponsesReasoningPolicy,
     relayMode: "official" as RelayMode,
     sessionProvider: "custom" as RelaySessionProvider,
     officialMixApiKey: false,
@@ -12436,6 +12466,7 @@ function createAggregateRelayProfile(settings: BackendSettings): RelayProfile {
       upstreamBaseUrl: "",
       apiKey: "",
       protocol: "responses",
+      responsesReasoningPolicy: "passthrough",
       relayMode: "aggregate",
       sessionProvider: "custom",
       officialMixApiKey: false,
@@ -12583,6 +12614,7 @@ function normalizeAggregateRelayProfile(profile: RelayProfile, settings: Backend
     upstreamBaseUrl: "",
     apiKey: "",
     protocol: "responses",
+    responsesReasoningPolicy: normalizeResponsesReasoningPolicy(profile.responsesReasoningPolicy),
     relayMode: "aggregate",
     sessionProvider: normalizeRelaySessionProvider(profile.sessionProvider),
     officialMixApiKey: false,
