@@ -1625,23 +1625,35 @@ async fn handle_protocol_proxy_connection(
     if upstream.is_stream {
         write_http_stream_headers(stream, "200 OK", "text/event-stream; charset=utf-8").await?;
         if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
-            let mut native_agents = upstream.native_agent_plaintext
+            let mut native_agents = upstream
+                .native_agent_plaintext
                 .then(crate::native_agents::NativeAgentSseRewriter::default);
+            let mut namespace_agents = crate::protocol_proxy::ResponsesNamespaceSseRewriter::new(
+                upstream.namespace_tools.clone(),
+            );
             let mut bytes_stream = upstream.response.bytes_stream();
             while let Some(chunk) = bytes_stream.next().await {
                 if let Ok(bytes) = chunk {
-                    if let Some(rewriter) = &mut native_agents {
-                        stream.write_all(&rewriter.push_bytes(&bytes)).await?;
+                    let bytes = namespace_agents.push_bytes(&bytes);
+                    let bytes = if let Some(rewriter) = &mut native_agents {
+                        rewriter.push_bytes(&bytes)
                     } else {
-                        stream.write_all(&bytes).await?;
-                    }
+                        bytes
+                    };
+                    stream.write_all(&bytes).await?;
                 } else {
                     break;
                 }
             }
-            if let Some(rewriter) = &mut native_agents {
-                stream.write_all(&rewriter.finish()).await?;
-            }
+            let namespace_tail = namespace_agents.finish();
+            let tail = if let Some(rewriter) = &mut native_agents {
+                let mut tail = rewriter.push_bytes(&namespace_tail);
+                tail.extend(rewriter.finish());
+                tail
+            } else {
+                namespace_tail
+            };
+            stream.write_all(&tail).await?;
             log_helper_response(
                 "helper.protocol_proxy_stream_ok",
                 method,
@@ -1696,6 +1708,10 @@ async fn handle_protocol_proxy_connection(
         return Ok(());
     }
     let upstream_body = upstream.response.bytes().await?;
+    let upstream_body = crate::protocol_proxy::restore_responses_tool_namespace_json(
+        &upstream_body,
+        &upstream.namespace_tools,
+    );
     if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
         let body = if upstream.native_agent_plaintext {
             crate::native_agents::restore_json(&upstream_body)

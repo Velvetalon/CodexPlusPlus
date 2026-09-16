@@ -1655,7 +1655,7 @@ fn injection_script_unlocks_custom_model_catalog() {
     assert!(script.contains("loadAppServerRequestCandidates"));
     assert!(script.contains("appServerFallbackAssetUrls"));
     assert!(script.contains("collectAppServerRequestCandidatesFromModule"));
-    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"6\""));
+    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"9\""));
 
     assert!(script.contains("list-models-for-host"));
     assert!(script.contains("appServerModelRequestMethod"));
@@ -1808,7 +1808,10 @@ fn injection_script_discovers_app_server_request_clients_without_hardcoded_hash(
 
     assert!(script.contains("loadAppServerRequestCandidates"));
     assert!(script.contains("appServerFallbackAssetUrls"));
-    assert!(script.contains("[\"use-host-config-\", \"app-server-manager-signals-\"]"));
+    assert!(
+        script
+            .contains("[\"use-host-config-\", \"app-server-manager-signals-\", \"message-bus-\"]")
+    );
     assert!(script.contains("loadOptionalCodexAppModule(assetPrefix)"));
     assert!(script.contains("candidateCount: candidates.length"));
     assert!(script.contains("discovery:"));
@@ -1981,6 +1984,15 @@ fn injection_script_applies_fast_service_tier_contract() {
     assert_eq!(cases["pureApiOtherProviderUnchanged"], true);
     assert_eq!(cases["pureApiRecoveryUnscheduled"], true);
     assert_eq!(cases["pureOfficialProviderUnchanged"], true);
+    assert_eq!(cases["providerSwitchFirstTurnCount"], 1);
+    assert_eq!(cases["providerSwitchResumeProvider"], "provider_b");
+    assert_eq!(cases["providerSwitchTurnStarts"], 3);
+    assert_eq!(cases["providerSwitchResumeCount"], 1);
+    assert_eq!(cases["messageBusPatched"], true);
+    assert_eq!(cases["messageBusTurnProvider"], "");
+    assert_eq!(cases["messageBusPatchVersion"], "9");
+    assert_eq!(cases["messageBusCallCount"], 3);
+    assert_eq!(cases["messageBusDiagnosticCount"], 0);
 }
 
 fn run_service_tier_contract_harness() -> serde_json::Value {
@@ -2553,6 +2565,80 @@ api.setBackendSettings({{
 }});
 const pureOfficialParams = {{ cwd: "C:/mobile", modelProvider: "openai" }};
 const pureOfficialProviderUnchanged = api.applyProviderOverride("thread/start", pureOfficialParams) === pureOfficialParams;
+
+const providerSwitchClient = {{
+  calls: [],
+  async sendRequest(method, params) {{
+    this.calls.push({{ method, params }});
+    return {{ ok: true }};
+  }},
+}};
+api.patchAppServerClient(providerSwitchClient);
+const providerSwitchProfile = (id, provider) => ({{
+  relayProfilesEnabled: true,
+  activeRelayId: id,
+  activeRelayCodexProvider: provider,
+  relayProfiles: [{{
+    id,
+    relayMode: "pureApi",
+    officialMixApiKey: true,
+    modelWindows: JSON.stringify({{ "same-model": "200000" }}),
+    modelAutoCompact: "{{}}",
+    modelMetadata: "{{}}",
+  }}],
+}});
+api.setBackendSettings(providerSwitchProfile("provider-a", "provider_a"));
+await providerSwitchClient.sendRequest("thread/start", {{
+  threadId: "thread-provider-switch",
+  model: "same-model",
+}});
+await providerSwitchClient.sendRequest("turn/start", {{
+  threadId: "thread-provider-switch",
+  model: "same-model",
+  input: [],
+}});
+const providerSwitchFirstTurnCount = providerSwitchClient.calls.filter((call) => call.method === "turn/start").length;
+api.setBackendSettings(providerSwitchProfile("provider-b", "provider_b"));
+await providerSwitchClient.sendRequest("turn/start", {{
+  threadId: "thread-provider-switch",
+  model: "same-model",
+  input: [],
+}});
+const providerSwitchResumeProvider = providerSwitchClient.calls.filter((call) => call.method === "thread/resume").at(-1)?.params?.modelProvider || "";
+await providerSwitchClient.sendRequest("turn/start", {{
+  threadId: "thread-provider-switch",
+  model: "same-model",
+  input: [],
+}});
+const providerSwitchTurnStarts = providerSwitchClient.calls.filter((call) => call.method === "turn/start").length;
+const providerSwitchResumeCount = providerSwitchClient.calls.filter((call) => call.method === "thread/resume").length;
+
+const messageBusCalls = [];
+const messageBus = {{
+  handlers: new Map(),
+  dispatchMessage(type, payload) {{
+    messageBusCalls.push({{ type, method: payload?.request?.method, params: payload?.request?.params }});
+    return Promise.resolve({{ ok: true }});
+  }},
+  subscribe(type) {{
+    this.handlers.set(type, new Set());
+    return () => this.handlers.delete(type);
+  }},
+}};
+const messageBusPatched = api.patchAppServerMessageBus(messageBus);
+api.setBackendSettings(providerSwitchProfile("provider-a", "provider_a"));
+await messageBus.dispatchMessage("mcp-request", {{
+  request: {{ id: "bus-1", method: "turn/start", params: {{ threadId: "thread-message-bus", model: "same-model" }} }},
+  hostId: "local",
+}});
+await messageBus.dispatchMessage("mcp-request", {{
+  request: {{ id: "bus-2", method: "turn/start", params: {{ threadId: "thread-message-bus", model: "same-model" }} }},
+  hostId: "local",
+}});
+const messageBusTurnProvider = messageBusCalls.at(-1)?.params?.modelProvider || "";
+const messageBusPatchVersion = messageBus.__codexPlusModelRequestPatch;
+const messageBusCallCount = messageBusCalls.length;
+const messageBusDiagnosticCount = api.diagnostics().filter((item) => item.event === "message_bus_provider_refresh_failed").length;
 process.stdout.write(JSON.stringify({{
   supportedFast,
   unsupportedModel,
@@ -2619,6 +2705,15 @@ process.stdout.write(JSON.stringify({{
   pureApiOtherProviderUnchanged,
   pureApiRecoveryUnscheduled,
   pureOfficialProviderUnchanged,
+  providerSwitchFirstTurnCount,
+  providerSwitchResumeProvider,
+  providerSwitchTurnStarts,
+  providerSwitchResumeCount,
+  messageBusPatched,
+  messageBusTurnProvider,
+  messageBusPatchVersion,
+  messageBusCallCount,
+  messageBusDiagnosticCount,
 }}));
 }}).catch((error) => {{
   console.error(error);

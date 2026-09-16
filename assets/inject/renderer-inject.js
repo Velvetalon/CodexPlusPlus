@@ -1,4 +1,4 @@
-(() => {
+﻿(() => {
   // The launcher targets the Codex app page, but keep a renderer-side guard
   // so this bundle cannot create UI in embedded browser documents.
   const codexPlusIsNodeTestHarness = typeof process === "object" && !!process.versions?.node;
@@ -473,7 +473,7 @@
   const codexThreadServiceTierMaxEntries = 120;
   const codexThreadServiceTierDraftBindWindowMs = 60 * 1000;
   const codexServiceTierRequestOverrideVersion = "9";
-  const codexAppServerModelRequestPatchVersion = "6";
+  const codexAppServerModelRequestPatchVersion = "9";
   const codexRemoteSessionRecoveryVersion = "5";
   const codexPluginMarketplaceUnlockVersion = "15";
   const codexThreadScrollMaxEntries = 120;
@@ -2539,6 +2539,13 @@
     return candidates;
   }
 
+  function appServerRequestCandidatesFromMessageBusModule(module, assetPrefix) {
+    const bus = module?.r;
+    if (!bus || typeof bus.dispatchMessage !== "function" || typeof bus.subscribe !== "function") return [];
+    patchAppServerMessageBusRequestClient(bus);
+    return bus.__codexPlusModelRequestPatch === codexAppServerModelRequestPatchVersion ? [bus] : [];
+  }
+
   async function loadAppServerRequestModules() {
     const modules = [];
     const sources = [];
@@ -2550,10 +2557,13 @@
       modules.push(module);
       sources.push(source);
     };
-    for (const assetPrefix of ["use-host-config-", "app-server-manager-signals-"]) {
+    for (const assetPrefix of ["use-host-config-", "app-server-manager-signals-", "message-bus-"]) {
       try {
         const module = await loadOptionalCodexAppModule(assetPrefix);
-        if (module) pushModule(module, assetPrefix);
+      if (module) {
+        pushModule(module, assetPrefix);
+        appServerRequestCandidatesFromMessageBusModule(module, assetPrefix);
+      }
       } catch {
       }
     }
@@ -2577,6 +2587,9 @@
         if (seen.has(candidate)) continue;
         seen.add(candidate);
         candidates.push(candidate);
+      }
+      if (module?.r && candidates.indexOf(module.r) === -1) {
+        candidates.push(module.r);
       }
     }
     const usedFallback = sources.some((source) => !source.endsWith("-"));
@@ -3326,6 +3339,18 @@
       || codexModelCatalog?.modelProvider
       || ""
     ).trim();
+  }
+
+  function codexRemoteSessionProviderFingerprint() {
+    const profile = codexRemoteSessionActiveProfile();
+    const fromConfig = codexRelayConfigModelProvider(profile?.configContents || "");
+    return [
+      String(profile?.id || ""),
+      String(profile?.name || ""),
+      String(profile?.relayMode || ""),
+      fromConfig || codexRemoteSessionTargetProvider(),
+      codexModelCatalog?.model_provider || codexModelCatalog?.codex_model_provider || "",
+    ].join("\u0000");
   }
 
   function codexRemoteSessionProviderRequestMethod(method) {
@@ -6359,10 +6384,80 @@
     return await codexStateCall("set-global-state", { params: { key, value } });
   }
 
-  function dispatchCodexPlusMessage(dispatcher, type, payload) {
+  function dispatchMessageBusThreadModelRefresh(dispatcher, originalDispatch, nextPayload, request) {
+    const params = request?.params;
+    const threadId = String(params?.threadId || "").trim();
+    const model = String(params?.model || "").trim();
+    if (!threadId || !model) return;
+    const state = { requestMethod: "turn/start", threadId, model };
+    const contextKey = codexThreadModelContextKey(state);
+    const previousKey = window.__codexPlusThreadModelContexts?.get(threadId) || "";
+    if (previousKey === contextKey) return;
+    const targetProvider = codexRemoteSessionTargetProvider();
+    const resumeParams = { threadId, model };
+    // For non-OpenAI targets include modelProvider so the app-server binds the
+    // thread to the correct provider. For OpenAI the default is already right.
+    if (targetProvider && targetProvider !== "openai") {
+      resumeParams.modelProvider = targetProvider;
+    }
+    try {
+      originalDispatch.call(dispatcher, "mcp-request", {
+        hostId: nextPayload?.hostId || "",
+        priority: nextPayload?.priority || "normal",
+        source: nextPayload?.source || "codex-plus-provider-refresh",
+        request: {
+          id: "codex-plus-provider-refresh-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
+          method: "thread/resume",
+          params: resumeParams,
+        },
+      });
+      if (!window.__codexPlusThreadModelContexts) window.__codexPlusThreadModelContexts = new Map();
+      window.__codexPlusThreadModelContexts.set(threadId, contextKey);
+      sendCodexPlusDiagnostic("thread_model_context_refreshed", {
+        threadId,
+        model,
+        providerChanged: !!previousKey && previousKey.split("\u0000").slice(1).join("\u0000") !== contextKey.split("\u0000").slice(1).join("\u0000"),
+      });
+    } catch (error) {
+      sendCodexPlusDiagnostic("thread_model_context_refresh_failed", {
+        threadId,
+        model,
+        errorName: error?.name || "",
+        errorMessage: error?.message || String(error),
+      });
+    }
+  }
+
+  async function dispatchCodexPlusMessage(dispatcher, type, payload) {
     const message = codexServiceTierRequestOverride({ ...(payload || {}), type });
     const nextType = message?.type || type;
     const { type: _type, ...nextPayload } = message || {};
+    if (String(nextType || "") === "mcp-request") {
+      if (!codexPlusBackendSettingsLoaded) {
+        const loaded = await loadBackendSettingsState();
+        if (!loaded) sendCodexPlusDiagnostic("message_bus_provider_refresh_failed", {});
+      }
+      if (codexRemoteSessionProviderPatchEnabled()) {
+        const request = nextPayload?.request;
+        if (request?.method === "turn/start" && request.params
+            && !Object.prototype.hasOwnProperty.call(request.params, "modelProvider")) {
+          request.params = applyCodexRemoteSessionProviderOverride("turn/start", request.params);
+        }
+      }
+    }
+    if (window.__codexPlusAppServerMessageBus === dispatcher && String(nextType || "") === "mcp-request") {
+      const request = nextPayload?.request;
+      if (request?.method === "turn/start" && request.params) {
+        request.params = applyCodexRemoteSessionProviderOverride("turn/start", request.params);
+        if (codexRemoteSessionProviderPatchEnabled()) {
+          const originalDispatch = dispatcher.__codexServiceTierOriginalDispatchMessage
+            || dispatcher.__codexPlusOriginalDispatchMessage;
+          if (typeof originalDispatch === "function") {
+            dispatchMessageBusThreadModelRefresh(dispatcher, originalDispatch, nextPayload, request);
+          }
+        }
+      }
+    }
     if (nextType === "browser-use-session-route-capture") {
       observeCodexRemoteSessionNotification({ type: nextType, params: nextPayload });
     }
@@ -6430,6 +6525,7 @@
         codexPlusBackendSettings = { ...codexPlusBackendSettings, ...settings };
         codexPlusBackendSettingsLoaded = true;
       },
+      providerFingerprint: () => codexRemoteSessionProviderFingerprint(),
       providerPatchEnabled: () => codexRemoteSessionProviderPatchEnabled(),
       providerNormalizationEnabled: () => codexRemoteSessionProviderNormalizationEnabled(),
       setServiceTierState: (state = {}) => {
@@ -6448,6 +6544,7 @@
       stateApiFromModule: codexStateApiFromModule,
       dispatcherFromModule: codexServiceTierDispatcherFromModule,
       patchAppServerClient: patchAppServerModelRequestClient,
+      patchAppServerMessageBus: patchAppServerMessageBusRequestClient,
     };
     return;
   }
@@ -6844,6 +6941,61 @@
     return String(method || "");
   }
 
+  function codexThreadModelState(method, params, result) {
+    const requestMethod = String(method || "");
+    const threadId = String(
+      params?.threadId
+      || params?.conversationId
+      || result?.thread?.id
+      || result?.threadId
+      || ""
+    ).trim();
+    const model = String(params?.model || result?.thread?.model || "").trim();
+    return { requestMethod, threadId, model };
+  }
+
+  function codexThreadModelContextKey(state) {
+    return [
+      state.model,
+      codexRemoteSessionProviderFingerprint(),
+    ].join("\u0000");
+  }
+
+  async function refreshCodexThreadModelBeforeTurn(originalSendRequest, method, params, options) {
+    if (String(method || "") !== "turn/start") return null;
+    if (!codexRemoteSessionProviderPatchEnabled()) return null;
+    const state = codexThreadModelState(method, params);
+    if (!state.threadId || !state.model) return null;
+    const contextKey = codexThreadModelContextKey(state);
+    const previousKey = window.__codexPlusThreadModelContexts?.get(state.threadId) || "";
+    if (previousKey === contextKey) return null;
+    const resumeParams = {
+      threadId: state.threadId,
+      model: state.model,
+      modelProvider: String(codexPlusBackendSettings.activeRelayCodexProvider || "").trim()
+        || codexRemoteSessionTargetProvider(),
+    };
+    try {
+      await originalSendRequest("thread/resume", resumeParams, options);
+      if (!window.__codexPlusThreadModelContexts) window.__codexPlusThreadModelContexts = new Map();
+      window.__codexPlusThreadModelContexts.set(state.threadId, contextKey);
+      sendCodexPlusDiagnostic("thread_model_context_refreshed", {
+        threadId: state.threadId,
+        model: state.model,
+        providerChanged: !!previousKey && previousKey.split("\u0000").slice(1).join("\u0000") !== contextKey.split("\u0000").slice(1).join("\u0000"),
+      });
+      return true;
+    } catch (error) {
+      sendCodexPlusDiagnostic("thread_model_context_refresh_failed", {
+        threadId: state.threadId,
+        model: state.model,
+        errorName: error?.name || "",
+        errorMessage: error?.message || String(error),
+      });
+      return false;
+    }
+  }
+
   function patchAppServerModelResult(method, result) {
     if (method !== "list-models-for-host") return result;
     try {
@@ -6885,12 +7037,33 @@
       const nextParams = providerRefreshFailed
         ? params
         : applyCodexRemoteSessionProviderOverride(requestMethod, params);
+      await refreshCodexThreadModelBeforeTurn(originalSendRequest, method, nextParams, options);
       const result = await originalSendRequest(method, nextParams, options);
+      const threadState = codexThreadModelState(requestMethod, nextParams, result);
+      if (threadState.threadId && threadState.model
+          && ["thread/start", "thread/resume", "turn/start"].includes(threadState.requestMethod)) {
+        if (!window.__codexPlusThreadModelContexts) window.__codexPlusThreadModelContexts = new Map();
+        window.__codexPlusThreadModelContexts.set(threadState.threadId, codexThreadModelContextKey(threadState));
+      }
       if (!codexPlusModelUnlockEnabled()) return result;
       if (!codexPlusModelNames().length) await loadCodexModelCatalog();
       return patchAppServerModelResult(requestMethod, result);
     };
     client.__codexPlusModelRequestPatch = codexAppServerModelRequestPatchVersion;
+    return true;
+  }
+
+  function patchAppServerMessageBusRequestClient(bus) {
+    if (!bus || typeof bus.dispatchMessage !== "function" || typeof bus.subscribe !== "function") return false;
+    if (bus.__codexPlusModelRequestPatch === codexAppServerModelRequestPatchVersion) return true;
+    if (bus.__codexPlusOriginalDispatchMessage) return true;
+    const originalDispatchMessage = bus.dispatchMessage.bind(bus);
+    bus.__codexPlusOriginalDispatchMessage = originalDispatchMessage;
+    bus.__codexServiceTierOriginalDispatchMessage = originalDispatchMessage;
+    bus.dispatchMessage = (type, payload) => dispatchCodexPlusMessage(bus, type, payload);
+    window.__codexPlusAppServerMessageBus = bus;
+    window.__codexPlusAppServerMessageBusAsset = "message-bus";
+    bus.__codexPlusModelRequestPatch = codexAppServerModelRequestPatchVersion;
     return true;
   }
 
@@ -6951,7 +7124,8 @@
         }
         let patchedCount = 0;
         for (const candidate of candidates) {
-          if (patchAppServerModelRequestClient(candidate)) patchedCount += 1;
+          if (patchAppServerModelRequestClient(candidate)
+              || patchAppServerMessageBusRequestClient(candidate)) patchedCount += 1;
         }
         if (patchedCount > 0) {
           clearTimeout(appServerModelRequestPatchRetryTimer);

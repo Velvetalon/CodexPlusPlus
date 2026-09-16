@@ -110,14 +110,14 @@ fn rollout_files_snapshot(path: &Path) -> Vec<(String, Vec<u8>, SystemTime)> {
 
 fn catalog_rows_snapshot(path: &Path) -> Vec<(String, String)> {
     let db = Connection::open(path).unwrap();
-    db.prepare(
-        "SELECT host_id, thread_id FROM local_thread_catalog ORDER BY host_id, thread_id",
-    )
-    .unwrap()
-    .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-    .unwrap()
-    .collect::<rusqlite::Result<Vec<_>>>()
-    .unwrap()
+    db.prepare("SELECT host_id, thread_id FROM local_thread_catalog ORDER BY host_id, thread_id")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
 }
 
 fn write_subagent_rollout(path: &Path, provider: &str, thread_id: &str, cwd: &str) {
@@ -568,10 +568,7 @@ fn provider_sync_ignores_spawned_subagent_threads() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(
-        child,
-        ("openai".to_string(), 0, "C:/child-old".to_string())
-    );
+    assert_eq!(child, ("openai".to_string(), 0, "C:/child-old".to_string()));
 }
 
 #[test]
@@ -592,18 +589,8 @@ fn provider_sync_preserves_marked_subagents_and_explicit_user_priority() {
         "structured-child",
         "C:/structured-new",
     );
-    write_subagent_rollout(
-        &rollout_child,
-        "openai",
-        "rollout-child",
-        "C:/rollout-new",
-    );
-    write_rollout(
-        &marked_rollout,
-        "openai",
-        "marked-child",
-        "C:/marked-new",
-    );
+    write_subagent_rollout(&rollout_child, "openai", "rollout-child", "C:/rollout-new");
+    write_rollout(&marked_rollout, "openai", "marked-child", "C:/marked-new");
     write_rollout(
         &explicit_user_rollout,
         "openai",
@@ -679,19 +666,15 @@ fn provider_sync_preserves_marked_subagents_and_explicit_user_priority() {
         (&explicit_user_rollout, "apigather"),
         (&guardian_user_rollout, "openai"),
     ] {
-        let first: serde_json::Value = serde_json::from_str(
-            fs::read_to_string(path).unwrap().lines().next().unwrap(),
-        )
-        .unwrap();
+        let first: serde_json::Value =
+            serde_json::from_str(fs::read_to_string(path).unwrap().lines().next().unwrap())
+                .unwrap();
         assert_eq!(first["payload"]["model_provider"], provider);
     }
 
     let db = Connection::open(state).unwrap();
     for (id, expected) in [
-        (
-            "structured-child",
-            ("openai", 0_i64, "C:/structured-old"),
-        ),
+        ("structured-child", ("openai", 0_i64, "C:/structured-old")),
         ("rollout-child", ("openai", 0_i64, "C:/rollout-old")),
         ("marked-child", ("openai", 0_i64, "C:/marked-old")),
         ("explicit-user", ("apigather", 1_i64, "C:/user-new")),
@@ -704,7 +687,10 @@ fn provider_sync_preserves_marked_subagents_and_explicit_user_priority() {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!(actual, (expected.0.to_string(), expected.1, expected.2.to_string()));
+        assert_eq!(
+            actual,
+            (expected.0.to_string(), expected.1, expected.2.to_string())
+        );
     }
 }
 
@@ -1081,12 +1067,7 @@ fn provider_sync_catalogs_user_threads_but_skips_subagents() {
     let rollout_dir = home.join("sessions/catalog-eligibility");
     for (id, source, thread_source, updated_at) in [
         ("user-one", "vscode", "user", 200000_i64),
-        (
-            "explicit-user",
-            "subagent_review",
-            "user",
-            205000_i64,
-        ),
+        ("explicit-user", "subagent_review", "user", 205000_i64),
         (
             "guardian-user",
             r#"{"subagent":{"other":"guardian"}}"#,
@@ -1156,7 +1137,11 @@ fn provider_sync_catalogs_user_threads_but_skips_subagents() {
             r#"{"sub_agent":{"other":"review"}}"#,
             235000_i64,
         ),
-        ("internal-child", "internal_memory_consolidation", 237000_i64),
+        (
+            "internal-child",
+            "internal_memory_consolidation",
+            237000_i64,
+        ),
         ("edge-child", "cli", 240000_i64),
     ] {
         let rollout_path = rollout_dir.join(format!("{id}.jsonl"));
@@ -1202,7 +1187,9 @@ fn provider_sync_catalogs_user_threads_but_skips_subagents() {
     assert_eq!(result.sqlite_rows_updated, 5);
     let db = Connection::open(&catalog_db).unwrap();
     let mut stmt = db
-        .prepare("SELECT thread_id FROM local_thread_catalog WHERE host_id = 'local' ORDER BY thread_id")
+        .prepare(
+            "SELECT thread_id FROM local_thread_catalog WHERE host_id = 'local' ORDER BY thread_id",
+        )
         .unwrap();
     let ids = stmt
         .query_map([], |row| row.get::<_, String>(0))
@@ -1316,9 +1303,7 @@ fn provider_sync_prunes_existing_local_subagent_catalog_rows() {
 
     let db = Connection::open(&catalog_db).unwrap();
     let mut stmt = db
-        .prepare(
-            "SELECT host_id, thread_id FROM local_thread_catalog ORDER BY host_id, thread_id",
-        )
+        .prepare("SELECT host_id, thread_id FROM local_thread_catalog ORDER BY host_id, thread_id")
         .unwrap();
     let rows = stmt
         .query_map([], |row| {

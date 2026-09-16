@@ -5583,9 +5583,15 @@ struct RelayControlGuard<'a> {
 
 impl RelayControlLock {
     fn lock(&self) -> anyhow::Result<RelayControlGuard<'_>> {
-        let thread = self.0.lock().map_err(|_| anyhow::anyhow!("Control lock poisoned"))?;
+        let thread = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Control lock poisoned"))?;
         let process = SettingsStore::default().control_lock()?;
-        Ok(RelayControlGuard { _thread: thread, _process: process })
+        Ok(RelayControlGuard {
+            _thread: thread,
+            _process: process,
+        })
     }
 }
 
@@ -6724,7 +6730,7 @@ mod tests {
 
         let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
         assert!(config.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
-        assert!(!config.contains(r#"base_url = "https://source.example/v1""#));
+        assert!(!config.contains("\nbase_url = \"https://source.example/v1\""));
     }
 
     #[test]

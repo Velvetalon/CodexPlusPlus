@@ -38,6 +38,8 @@ pub struct RelayProfile {
     pub protocol: RelayProtocol,
     #[serde(rename = "responsesReasoningPolicy", default)]
     pub responses_reasoning_policy: ResponsesReasoningPolicy,
+    #[serde(rename = "nativeAgentInterop", default)]
+    pub native_agent_interop: NativeAgentInterop,
     #[serde(rename = "relayMode", default)]
     pub relay_mode: RelayMode,
     #[serde(rename = "officialMixApiKey", default)]
@@ -98,6 +100,12 @@ pub struct RelayProfile {
     pub sub2api_multiplier: String,
     #[serde(rename = "modelRoutes", default, skip_serializing_if = "Vec::is_empty")]
     pub model_routes: Vec<RelayModelRoute>,
+    #[serde(
+        rename = "modelAliases",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub model_aliases: Vec<RelayModelAlias>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -239,6 +247,7 @@ impl Default for RelayProfile {
             api_key: String::new(),
             protocol: RelayProtocol::Responses,
             responses_reasoning_policy: ResponsesReasoningPolicy::default(),
+            native_agent_interop: NativeAgentInterop::default(),
             relay_mode: RelayMode::Official,
             official_mix_api_key: false,
             no_auth: false,
@@ -261,6 +270,7 @@ impl Default for RelayProfile {
             sub2api_enabled: false,
             sub2api_multiplier: String::new(),
             model_routes: Vec::new(),
+            model_aliases: Vec::new(),
         }
     }
 }
@@ -300,6 +310,32 @@ pub enum ResponsesReasoningPolicy {
     Passthrough,
     OpenAiOpaque,
     Strip,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum NativeAgentInterop {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl NativeAgentInterop {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayModelAlias {
+    pub alias: String,
+    pub model: String,
 }
 
 impl ResponsesReasoningPolicy {
@@ -727,6 +763,7 @@ impl BackendSettings {
                 api_key: self.relay_api_key.clone(),
                 protocol: RelayProtocol::Responses,
                 responses_reasoning_policy: ResponsesReasoningPolicy::default(),
+                native_agent_interop: NativeAgentInterop::default(),
                 relay_mode: RelayMode::MixedApi,
                 official_mix_api_key: true,
                 no_auth: false,
@@ -749,6 +786,7 @@ impl BackendSettings {
                 sub2api_enabled: false,
                 sub2api_multiplier: String::new(),
                 model_routes: Vec::new(),
+                model_aliases: Vec::new(),
             };
         }
 
@@ -803,6 +841,7 @@ impl BackendSettings {
             api_key: self.relay_api_key.clone(),
             protocol: RelayProtocol::Responses,
             responses_reasoning_policy: ResponsesReasoningPolicy::default(),
+            native_agent_interop: NativeAgentInterop::default(),
             relay_mode: RelayMode::Official,
             official_mix_api_key: false,
             no_auth: false,
@@ -825,6 +864,7 @@ impl BackendSettings {
             sub2api_enabled: false,
             sub2api_multiplier: String::new(),
             model_routes: Vec::new(),
+            model_aliases: Vec::new(),
         }
     }
 
@@ -2411,6 +2451,23 @@ mod tests {
         let saved = serde_json::to_value(profile).unwrap();
         assert_eq!(saved["modelRoutes"][0]["targetRelayId"], "relay-b");
         assert_eq!(saved["modelRoutes"][0]["targetModel"], "provider-luna");
+    }
+
+    #[test]
+    fn relay_profile_native_interop_and_model_aliases_roundtrip() {
+        let profile: RelayProfile = serde_json::from_value(json!({
+            "id": "relay",
+            "name": "Relay",
+            "nativeAgentInterop": "on",
+            "modelAliases": [{"alias": "luna", "model": "glm-5.3-flash"}]
+        }))
+        .unwrap();
+        assert_eq!(profile.native_agent_interop, NativeAgentInterop::On);
+        assert_eq!(profile.model_aliases.first().unwrap().alias, "luna");
+        assert_eq!(
+            profile.model_aliases.first().unwrap().model,
+            "glm-5.3-flash"
+        );
     }
 
     /// 旧版按供应商勾选上下文条目的 `contextSelection` / `contextSelectionInitialized`

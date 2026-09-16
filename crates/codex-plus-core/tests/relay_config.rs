@@ -594,7 +594,7 @@ fn openai_session_provider_rejects_chat_completions() {
 }
 
 #[test]
-fn responses_profile_stays_direct_and_backfill_repairs_legacy_local_proxy() {
+fn responses_profile_uses_proxy_and_backfill_repairs_legacy_local_proxy() {
     let temp = tempfile::tempdir().unwrap();
     let profile = RelayProfile {
         id: "custom".to_string(),
@@ -617,9 +617,11 @@ base_url = "https://responses.example.test/v1"
     apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
     let config_path = temp.path().join("config.toml");
     let updated = std::fs::read_to_string(&config_path).unwrap();
-
-    assert!(updated.contains("https://responses.example.test/v1"));
-    assert!(!updated.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
+    assert!(updated.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
+    assert!(
+        updated.contains(r#"codex_plus_upstream_base_url = "https://responses.example.test/v1""#)
+    );
+    assert!(!updated.contains("\nbase_url = \"https://responses.example.test/v1\""));
     assert_eq!(
         codex_plus_core::relay_config::relay_profile_base_url(&profile),
         "https://responses.example.test/v1"
@@ -840,10 +842,13 @@ fn aggregate_openai_session_keeps_openai_identity_explicit() {
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
     let config = config.parse::<toml_edit::DocumentMut>().unwrap();
     assert_eq!(config["model_provider"].as_str(), Some("openai"));
-    let restored: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(temp.path().join("auth.json")).unwrap()
-    ).unwrap();
-    assert_eq!(restored, serde_json::from_str::<serde_json::Value>(login).unwrap());
+    let restored: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(temp.path().join("auth.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        restored,
+        serde_json::from_str::<serde_json::Value>(login).unwrap()
+    );
     assert!(restored.get("OPENAI_API_KEY").is_none());
     assert_eq!(
         config["model_providers"]["custom"]["requires_openai_auth"].as_bool(),
@@ -896,9 +901,23 @@ fn aggregate_openai_recovers_saved_official_login_and_prefers_refreshed_live_tok
         "aggregateRelayProfiles":[{"id":"agg","name":"Aggregate","sessionProvider":"openai","members":[]}]
     })).unwrap();
     let profile = settings.active_relay_profile();
-    for identity in [RelaySessionProvider::Openai, RelaySessionProvider::Custom, RelaySessionProvider::Openai] {
-        apply_aggregate_relay_profile_to_home_with_session_provider(temp.path(), &profile, "", "local-key", 57321, identity).unwrap();
-        let auth: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(temp.path().join("auth.json")).unwrap()).unwrap();
+    for identity in [
+        RelaySessionProvider::Openai,
+        RelaySessionProvider::Custom,
+        RelaySessionProvider::Openai,
+    ] {
+        apply_aggregate_relay_profile_to_home_with_session_provider(
+            temp.path(),
+            &profile,
+            "",
+            "local-key",
+            57321,
+            identity,
+        )
+        .unwrap();
+        let auth: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(temp.path().join("auth.json")).unwrap())
+                .unwrap();
         if identity == RelaySessionProvider::Openai {
             assert_eq!(auth, login);
             assert!(auth.get("OPENAI_API_KEY").is_none());
@@ -910,8 +929,18 @@ fn aggregate_openai_recovers_saved_official_login_and_prefers_refreshed_live_tok
     let mut fresh = login.clone();
     fresh["tokens"]["access_token"] = serde_json::json!("refreshed-live-access");
     std::fs::write(temp.path().join("auth.json"), fresh.to_string()).unwrap();
-    apply_aggregate_relay_profile_to_home_with_session_provider(temp.path(), &profile, "", "local-key", 57321, RelaySessionProvider::Openai).unwrap();
-    let auth: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(temp.path().join("auth.json")).unwrap()).unwrap();
+    apply_aggregate_relay_profile_to_home_with_session_provider(
+        temp.path(),
+        &profile,
+        "",
+        "local-key",
+        57321,
+        RelaySessionProvider::Openai,
+    )
+    .unwrap();
+    let auth: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(temp.path().join("auth.json")).unwrap())
+            .unwrap();
     assert_eq!(auth, fresh);
 }
 
@@ -922,11 +951,27 @@ fn aggregate_openai_missing_login_does_not_replace_config_or_auth() {
     let auth = r#"{"OPENAI_API_KEY":"existing-key"}"#;
     std::fs::write(temp.path().join("config.toml"), config).unwrap();
     std::fs::write(temp.path().join("auth.json"), auth).unwrap();
-    let profile = RelayProfile {relay_mode: RelayMode::Aggregate, ..RelayProfile::default()};
-    let result = apply_aggregate_relay_profile_to_home_with_session_provider(temp.path(), &profile, "", "local-key", 57321, RelaySessionProvider::Openai);
+    let profile = RelayProfile {
+        relay_mode: RelayMode::Aggregate,
+        ..RelayProfile::default()
+    };
+    let result = apply_aggregate_relay_profile_to_home_with_session_provider(
+        temp.path(),
+        &profile,
+        "",
+        "local-key",
+        57321,
+        RelaySessionProvider::Openai,
+    );
     assert!(result.is_err());
-    assert_eq!(std::fs::read_to_string(temp.path().join("config.toml")).unwrap(), config);
-    assert_eq!(std::fs::read_to_string(temp.path().join("auth.json")).unwrap(), auth);
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("config.toml")).unwrap(),
+        config
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("auth.json")).unwrap(),
+        auth
+    );
 }
 
 #[test]
@@ -994,7 +1039,10 @@ fn aggregate_new_context_management_roundtrips_and_writes_on_off_for_both_entryp
             );
             let auth = std::fs::read_to_string(home.join("auth.json")).unwrap();
             if let Some(previous) = auth_by_entrypoint.insert(manager_path, auth.clone()) {
-                assert_eq!(auth, previous, "toggle must preserve each entrypoint's auth");
+                assert_eq!(
+                    auth, previous,
+                    "toggle must preserve each entrypoint's auth"
+                );
             }
         }
     }

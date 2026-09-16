@@ -386,7 +386,9 @@ pub fn apply_aggregate_relay_profile_to_home_with_session_provider(
         } else if auth_contents_looks_like_chatgpt_auth(&profile.auth_contents) {
             profile.auth_contents.as_str()
         } else {
-            anyhow::bail!("OpenAI 会话身份需要 ChatGPT 登录；未找到当前或已保存的官方账号凭据，请先登录官方账号。原配置未改动。");
+            anyhow::bail!(
+                "OpenAI 会话身份需要 ChatGPT 登录；未找到当前或已保存的官方账号凭据，请先登录官方账号。原配置未改动。"
+            );
         };
         remove_openai_api_key_from_auth_contents(source)?
     } else {
@@ -498,7 +500,7 @@ pub fn apply_relay_profile_files_to_home_with_context(
     } else {
         String::new()
     };
-    let profile_config = complete_relay_profile_config(profile)?;
+    let profile_config = complete_relay_profile_config_with_proxy(profile, true)?;
     let config_with_common = merge_common_config_into_config(&profile_config, &selected_common)?;
     let config_with_common =
         preserve_unmanaged_live_context_entries(home, &config_with_common, common_config_contents)?;
@@ -519,7 +521,7 @@ pub fn apply_relay_profile_to_home_with_switch_rules(
     } else {
         String::new()
     };
-    let profile_config = complete_relay_profile_config(profile)?;
+    let profile_config = complete_relay_profile_config_with_proxy(profile, true)?;
     let config_with_common = merge_common_config_into_config(&profile_config, &selected_common)?;
     let config_with_common =
         preserve_unmanaged_live_context_entries(home, &config_with_common, common_config_contents)?;
@@ -554,7 +556,7 @@ pub fn apply_relay_profile_config_to_home_with_context(
     } else {
         String::new()
     };
-    let profile_config = complete_relay_profile_config(profile)?;
+    let profile_config = complete_relay_profile_config_with_proxy(profile, true)?;
     let config_with_common = merge_common_config_into_config(&profile_config, &selected_common)?;
     let config_with_limits = apply_profile_context_to_config(profile, &config_with_common)?;
     let config_with_catalog = apply_model_catalog_to_config(home, profile, &config_with_limits)?;
@@ -743,6 +745,7 @@ fn codex_base_url_for_protocol(base_url: &str, protocol: RelayProtocol, proxy_po
 }
 
 const OPENAI_BASE_URL_KEY: &str = "openai_base_url";
+const CODEX_PLUS_UPSTREAM_BASE_URL_KEY: &str = "codex_plus_upstream_base_url";
 
 fn managed_openai_base_url() -> String {
     crate::protocol_proxy::local_responses_proxy_base_url(
@@ -903,6 +906,8 @@ pub fn backfill_relay_profile_from_home_with_common(
     };
     profile.config_contents =
         restore_profile_provider_id_for_backfill(&profile.config_contents, &template_config)?;
+    profile.config_contents =
+        remove_root_key(&profile.config_contents, CODEX_PLUS_UPSTREAM_BASE_URL_KEY);
     if profile.protocol == RelayProtocol::Responses
         && provider_string_from_config(&profile.config_contents, "base_url").as_deref()
             == Some(
@@ -1906,6 +1911,15 @@ pub fn apply_deepseek_responses_compatibility(
 }
 
 fn uses_official_deepseek_responses_for_config(profile: &RelayProfile, config_text: &str) -> bool {
+    if let Some(base_url) = root_key_string(config_text, CODEX_PLUS_UPSTREAM_BASE_URL_KEY)
+        .filter(|value| !value.trim().is_empty())
+        && base_url.trim()
+            != crate::protocol_proxy::local_responses_proxy_base_url(
+                crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+            )
+    {
+        return deepseek_api_base_url(&base_url);
+    }
     if let Ok(doc) = parse_toml_document(config_text) {
         if let Some(provider_id) = active_provider_id(&doc) {
             if let Some(provider) = doc
@@ -1923,6 +1937,13 @@ fn uses_official_deepseek_responses_for_config(profile: &RelayProfile, config_te
                     return false;
                 }
                 if let Some(base_url) = provider.get("base_url").and_then(Item::as_str) {
+                    if base_url.trim()
+                        == crate::protocol_proxy::local_responses_proxy_base_url(
+                            crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+                        )
+                    {
+                        return uses_official_deepseek_responses(profile);
+                    }
                     return deepseek_api_base_url(base_url);
                 }
             }
@@ -1931,6 +1952,13 @@ fn uses_official_deepseek_responses_for_config(profile: &RelayProfile, config_te
         if profile.protocol == RelayProtocol::Responses
             && let Some(base_url) = root_key_string(config_text, "base_url")
         {
+            if base_url.trim()
+                == crate::protocol_proxy::local_responses_proxy_base_url(
+                    crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+                )
+            {
+                return uses_official_deepseek_responses(profile);
+            }
             return deepseek_api_base_url(&base_url);
         }
     }
@@ -2582,6 +2610,13 @@ pub fn relay_profile_api_key(profile: &RelayProfile) -> String {
 }
 
 fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<String> {
+    complete_relay_profile_config_with_proxy(profile, false)
+}
+
+fn complete_relay_profile_config_with_proxy(
+    profile: &RelayProfile,
+    force_proxy: bool,
+) -> anyhow::Result<String> {
     let mut doc = parse_toml_document(&profile.config_contents)?;
     let session_provider_id = active_session_provider_id(&doc);
     let uses_openai_provider = session_provider_id == "openai";
@@ -2633,6 +2668,11 @@ fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<Strin
 
     let base_url = relay_profile_base_url(profile);
     let api_key = relay_profile_api_key(profile);
+    if force_proxy && profile.protocol == RelayProtocol::Responses {
+        doc[CODEX_PLUS_UPSTREAM_BASE_URL_KEY] = toml_edit::value(base_url.trim());
+    } else {
+        doc.as_table_mut().remove(CODEX_PLUS_UPSTREAM_BASE_URL_KEY);
+    }
     doc.as_table_mut().remove(CHAT_UPSTREAM_BASE_URL_KEY);
     retain_only_provider_table(&mut doc, &transport_provider_id);
     for legacy_provider in LEGACY_RELAY_PROVIDERS {
@@ -2667,7 +2707,7 @@ fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<Strin
     {
         provider["requires_openai_auth"] = toml_edit::value(true);
     }
-    let provider_base_url = if profile.has_model_routes() || profile.uses_no_auth() {
+    let provider_base_url = if force_proxy || profile.has_model_routes() || profile.uses_no_auth() {
         crate::protocol_proxy::local_responses_proxy_base_url(
             crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
         )

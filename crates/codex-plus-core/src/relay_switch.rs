@@ -150,11 +150,16 @@ fn apply_selected_relay_profile(
             (!relay.auth_contents.trim().is_empty()).then_some(relay.auth_contents.as_str());
         crate::relay_config::clear_relay_config_to_home_with_auth(home, auth_contents)?
     } else if relay.relay_mode == RelayMode::Aggregate {
-        let aggregate = settings.active_aggregate_relay_profile()
+        let aggregate = settings
+            .active_aggregate_relay_profile()
             .context("Active aggregate configuration is incomplete")?;
         crate::relay_config::apply_aggregate_relay_profile_to_home_with_session_provider(
-            home, &relay, &common_config, "codex-plus-aggregate",
-            crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT, aggregate.session_provider,
+            home,
+            &relay,
+            &common_config,
+            "codex-plus-aggregate",
+            crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+            aggregate.session_provider,
         )?
     } else {
         validate_switch_profile_files(&relay)?;

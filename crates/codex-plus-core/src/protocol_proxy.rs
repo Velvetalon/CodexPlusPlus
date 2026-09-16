@@ -294,6 +294,7 @@ pub struct UpstreamProxyResponse {
     pub is_stream: bool,
     pub wire_api: UpstreamWireApi,
     pub native_agent_plaintext: bool,
+    pub namespace_tools: BTreeMap<String, (String, String)>,
     pub response: reqwest::Response,
 }
 
@@ -560,8 +561,6 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     request_path: &str,
 ) -> anyhow::Result<UpstreamProxyResponse> {
     let mut request_json: Value = serde_json::from_str(body)?;
-    let native_agent_plaintext = crate::native_agents::enabled(&settings)
-        && crate::native_agents::prepare_request(&mut request_json);
     if settings
         .active_aggregate_relay_profile()
         .is_some_and(|aggregate| aggregate.code_mode_host)
@@ -601,10 +600,13 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         relays.first().map(|item| item.id.as_str()),
         Some(relay.id.as_str())
     );
+    let native_agent_plaintext =
+        crate::native_agents::interop_enabled(relays.first().unwrap_or(&relay))
+            && crate::native_agents::prepare_request(&mut request_json);
     let relay_count = relays.len();
     for (attempt, relay) in relays.into_iter().enumerate() {
         validate_upstream(&relay)?;
-        let (endpoint, upstream_body, wire_api) =
+        let (endpoint, upstream_body, wire_api, namespace_tools) =
             upstream_request_parts(&relay, request_json.clone(), request_path).await?;
         let has_more_candidates = attempt + 1 < relay_count;
         let header_timeout = response_header_timeout(is_stream);
@@ -716,6 +718,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 content_type,
                 wire_api,
                 native_agent_plaintext,
+                namespace_tools,
                 response: upstream,
             });
         }
@@ -840,6 +843,7 @@ pub async fn open_models_proxy_request(
         content_type,
         wire_api: UpstreamWireApi::Responses,
         native_agent_plaintext: false,
+        namespace_tools: BTreeMap::new(),
         response: upstream,
     })
 }
@@ -890,6 +894,7 @@ pub async fn open_audio_transcriptions_proxy_request(
         content_type,
         wire_api: UpstreamWireApi::AudioTranscriptions,
         native_agent_plaintext: false,
+        namespace_tools: BTreeMap::new(),
         response: upstream,
     })
 }
@@ -945,6 +950,7 @@ pub async fn open_chat_completions_proxy_request(
         content_type,
         wire_api: UpstreamWireApi::ChatCompletions,
         native_agent_plaintext: false,
+        namespace_tools: BTreeMap::new(),
         response: upstream,
     })
 }
@@ -953,7 +959,12 @@ async fn upstream_request_parts(
     relay: &crate::settings::RelayProfile,
     request_json: Value,
     request_path: &str,
-) -> anyhow::Result<(String, Value, UpstreamWireApi)> {
+) -> anyhow::Result<(
+    String,
+    Value,
+    UpstreamWireApi,
+    BTreeMap<String, (String, String)>,
+)> {
     let compact = is_responses_compact_proxy_path(request_path);
     if compact && relay.protocol == RelayProtocol::ChatCompletions {
         anyhow::bail!("Chat Completions 协议暂不支持 Responses compact 请求");
@@ -962,16 +973,28 @@ async fn upstream_request_parts(
         RelayProtocol::Responses => request_json,
         RelayProtocol::ChatCompletions => responses_to_chat_completions(request_json)?,
     };
+    let mut namespace_tools = BTreeMap::new();
     if relay.protocol == RelayProtocol::Responses {
+        if let Some(model) = body.get("model").and_then(Value::as_str).map(str::trim) {
+            if let Some(alias) = relay
+                .model_aliases
+                .iter()
+                .find(|alias| alias.alias.eq_ignore_ascii_case(model))
+            {
+                body["model"] = Value::String(alias.model.trim().to_string());
+            }
+        }
         normalize_responses_reasoning_policy(
             &mut body,
             relay.responses_reasoning_policy,
             &relay.id,
         );
-        if crate::native_agents::is_glm_url(&relay.base_url) {
+        normalize_responses_item_ids(&mut body);
+        if crate::native_agents::interop_enabled(relay) {
             crate::native_agents::prepare_glm_messages(&mut body);
         }
-        normalize_glm_additional_tools(&relay.base_url, &mut body);
+        normalize_responses_additional_tools(&mut body);
+        namespace_tools = flatten_responses_tool_namespaces(&mut body);
         normalize_responses_custom_tool_call_ids(&mut body);
     }
 
@@ -1041,6 +1064,7 @@ async fn upstream_request_parts(
         },
         body,
         wire_api,
+        namespace_tools,
     ))
 }
 
@@ -1081,7 +1105,7 @@ fn normalize_responses_reasoning_policy(
                     false
                 }
             }
-            ResponsesReasoningPolicy::OpenAiOpaque => true,
+            ResponsesReasoningPolicy::OpenAiOpaque => encrypted_content_present,
             ResponsesReasoningPolicy::Strip => false,
         };
 
@@ -1140,6 +1164,38 @@ fn responses_reasoning_normalization_detail(
     })
 }
 
+fn normalize_responses_item_ids(body: &mut Value) {
+    let Some(input) = body.get_mut("input") else {
+        return;
+    };
+    match input {
+        Value::Array(items) => {
+            for item in items {
+                normalize_responses_item_id(item);
+            }
+        }
+        Value::Object(_) => normalize_responses_item_id(input),
+        _ => {}
+    }
+}
+
+fn normalize_responses_item_id(item: &mut Value) {
+    let Some(id) = item.get("id").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(suffix) = id.strip_prefix("item_") else {
+        return;
+    };
+    let prefix = match item.get("type").and_then(Value::as_str) {
+        Some("message") => "msg_",
+        Some("reasoning") => "rs_",
+        Some("function_call") => "fc_",
+        Some("custom_tool_call") => "ct_",
+        _ => return,
+    };
+    item["id"] = json!(format!("{prefix}{suffix}"));
+}
+
 fn content_is_non_empty(content: Option<&Value>) -> bool {
     match content {
         None | Some(Value::Null) => false,
@@ -1160,12 +1216,8 @@ fn responses_reasoning_content_length(content: Option<&Value>) -> usize {
     }
 }
 
-fn normalize_glm_additional_tools(base_url: &str, body: &mut Value) {
-    if !reqwest::Url::parse(base_url)
-        .ok()
-        .is_some_and(|url| url.host_str() == Some("open.bigmodel.cn"))
-        || body.get("tools").is_some_and(|tools| !tools.is_array())
-    {
+fn normalize_responses_additional_tools(body: &mut Value) {
+    if body.get("tools").is_some_and(|tools| !tools.is_array()) {
         return;
     }
     let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
@@ -1190,6 +1242,258 @@ fn normalize_glm_additional_tools(base_url: &str, body: &mut Value) {
         tools.extend(additional_tools);
     } else {
         body["tools"] = Value::Array(additional_tools);
+    }
+}
+
+fn flatten_responses_namespace_children(
+    namespace_tool: &Value,
+    parent_namespace: &str,
+    parent_description: &str,
+    wire_tools: &mut Vec<Value>,
+    namespace_tools: &mut BTreeMap<String, (String, String)>,
+) {
+    let child_namespace = namespace_tool
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let namespace = flatten_namespace_tool_name(parent_namespace, child_namespace);
+    let namespace_description = combine_namespace_description(
+        parent_description,
+        namespace_tool
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+    );
+    let children = namespace_tool
+        .get("tools")
+        .and_then(Value::as_array)
+        .or_else(|| namespace_tool.get("children").and_then(Value::as_array));
+    let Some(children) = children else {
+        return;
+    };
+    for child in children {
+        if child.get("type").and_then(Value::as_str) == Some("namespace") {
+            flatten_responses_namespace_children(
+                child,
+                &namespace,
+                &namespace_description,
+                wire_tools,
+                namespace_tools,
+            );
+            continue;
+        }
+        let Some(name) = child
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let flat = flatten_namespace_tool_name(&namespace, name);
+        namespace_tools.insert(flat.clone(), (namespace.clone(), name.to_string()));
+        if child.get("type").and_then(Value::as_str) != Some("function") {
+            let mut wire_tool = child.clone();
+            wire_tool["name"] = json!(flat);
+            wire_tools.push(wire_tool);
+            continue;
+        }
+        let description = combine_namespace_description(
+            &namespace_description,
+            child
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        );
+        let mut wire_tool = json!({
+            "type": "function",
+            "name": flat,
+            "parameters": child
+                .get("parameters")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+        });
+        if let Some(function) = child.get("function").and_then(Value::as_object) {
+            if let Some(parameters) = function.get("parameters") {
+                wire_tool["parameters"] = parameters.clone();
+            }
+            if let Some(strict) = function.get("strict") {
+                wire_tool["strict"] = strict.clone();
+            }
+        }
+        if !description.is_empty() {
+            wire_tool["description"] = json!(description);
+        }
+        wire_tools.push(wire_tool);
+    }
+}
+
+fn flatten_responses_tool_namespaces(body: &mut Value) -> BTreeMap<String, (String, String)> {
+    let mut namespace_tools = BTreeMap::new();
+    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+        flatten_responses_tool_namespace_value(body);
+        return namespace_tools;
+    };
+    let source_tools = std::mem::take(tools);
+    let mut wire_tools = Vec::with_capacity(source_tools.len());
+    for tool in source_tools {
+        if tool.get("type").and_then(Value::as_str) != Some("namespace") {
+            wire_tools.push(tool);
+            continue;
+        }
+        flatten_responses_namespace_children(&tool, "", "", &mut wire_tools, &mut namespace_tools);
+    }
+    body["tools"] = Value::Array(wire_tools);
+    flatten_responses_tool_namespace_value(body);
+    namespace_tools
+}
+
+fn flatten_responses_tool_namespace_value(value: &mut Value) {
+    match value {
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(flatten_responses_tool_namespace_value),
+        Value::Object(object) => {
+            if matches!(
+                object.get("type").and_then(Value::as_str),
+                Some("function_call") | Some("custom_tool_call")
+            ) && object
+                .get("namespace")
+                .and_then(Value::as_str)
+                .is_some_and(|namespace| !namespace.trim().is_empty())
+            {
+                let namespace = object
+                    .get("namespace")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let name = object
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                object.insert(
+                    "name".to_string(),
+                    json!(flatten_namespace_tool_name(&namespace, &name)),
+                );
+                object.remove("namespace");
+            }
+            for (_, child) in object.iter_mut() {
+                flatten_responses_tool_namespace_value(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn restore_responses_tool_namespaces(
+    value: &mut Value,
+    namespace_tools: &BTreeMap<String, (String, String)>,
+) {
+    match value {
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| restore_responses_tool_namespaces(item, namespace_tools)),
+        Value::Object(object) => {
+            if matches!(
+                object.get("type").and_then(Value::as_str),
+                Some("function_call") | Some("custom_tool_call")
+            ) && object.get("namespace").is_none()
+            {
+                if let Some(name) = object.get("name").and_then(Value::as_str) {
+                    if let Some((namespace, original_name)) = namespace_tools.get(name) {
+                        object.insert("namespace".to_string(), json!(namespace));
+                        object.insert("name".to_string(), json!(original_name));
+                    }
+                }
+            }
+            for (_, child) in object.iter_mut() {
+                restore_responses_tool_namespaces(child, namespace_tools);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub fn restore_responses_tool_namespace_json(
+    bytes: &[u8],
+    namespace_tools: &BTreeMap<String, (String, String)>,
+) -> Vec<u8> {
+    let Ok(mut value) = serde_json::from_slice::<Value>(bytes) else {
+        return bytes.to_vec();
+    };
+    restore_responses_tool_namespaces(&mut value, namespace_tools);
+    serde_json::to_vec(&value).unwrap_or_else(|_| bytes.to_vec())
+}
+
+pub struct ResponsesNamespaceSseRewriter {
+    buffer: Vec<u8>,
+    namespace_tools: BTreeMap<String, (String, String)>,
+}
+
+impl ResponsesNamespaceSseRewriter {
+    pub fn new(namespace_tools: BTreeMap<String, (String, String)>) -> Self {
+        Self {
+            buffer: Vec::new(),
+            namespace_tools,
+        }
+    }
+
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.buffer.extend_from_slice(bytes);
+        let mut output = Vec::new();
+        loop {
+            let lf = self
+                .buffer
+                .windows(2)
+                .position(|window| window == b"\n\n")
+                .map(|index| index + 2);
+            let crlf = self
+                .buffer
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|index| index + 4);
+            let Some(end) = lf.into_iter().chain(crlf).min() else {
+                break;
+            };
+            let frame: Vec<u8> = self.buffer.drain(..end).collect();
+            output.extend(self.rewrite_frame(&frame));
+        }
+        output
+    }
+
+    pub fn finish(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.buffer)
+    }
+
+    fn rewrite_frame(&self, frame: &[u8]) -> Vec<u8> {
+        let Ok(text) = std::str::from_utf8(frame) else {
+            return frame.to_vec();
+        };
+        let data = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(|line| line.strip_prefix(' ').unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let Ok(mut value) = serde_json::from_str::<Value>(&data) else {
+            return frame.to_vec();
+        };
+        restore_responses_tool_namespaces(&mut value, &self.namespace_tools);
+        let mut output = String::new();
+        let mut wrote_data = false;
+        for line in text.split_inclusive('\n') {
+            if line.starts_with("data:") {
+                if !wrote_data {
+                    output.push_str("data: ");
+                    output.push_str(&value.to_string());
+                    output.push_str(if line.ends_with("\r\n") { "\r\n" } else { "\n" });
+                    wrote_data = true;
+                }
+            } else {
+                output.push_str(line);
+            }
+        }
+        output.into_bytes()
     }
 }
 
@@ -1278,15 +1582,29 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
     }
 
     if wire_api == UpstreamWireApi::Responses {
-        let body = if native_agent_plaintext && is_stream {
-            let mut rewriter = crate::native_agents::NativeAgentSseRewriter::default();
-            let mut body = rewriter.push_bytes(&upstream_body);
-            body.extend(rewriter.finish());
+        let body = if is_stream {
+            let mut native_rewriter =
+                native_agent_plaintext.then(crate::native_agents::NativeAgentSseRewriter::default);
+            let mut namespace_rewriter =
+                ResponsesNamespaceSseRewriter::new(upstream.namespace_tools.clone());
+            let mut namespace_output = namespace_rewriter.push_bytes(&upstream_body);
+            namespace_output.extend(namespace_rewriter.finish());
+            let body = if let Some(rewriter) = &mut native_rewriter {
+                let mut output = rewriter.push_bytes(&namespace_output);
+                output.extend(rewriter.finish());
+                output
+            } else {
+                namespace_output
+            };
             body
-        } else if native_agent_plaintext {
-            crate::native_agents::restore_json(&upstream_body)
         } else {
-            upstream_body.to_vec()
+            let body =
+                restore_responses_tool_namespace_json(&upstream_body, &upstream.namespace_tools);
+            if native_agent_plaintext {
+                crate::native_agents::restore_json(&body)
+            } else {
+                body
+            }
         };
         return Ok(ProxyHttpResponse {
             status: "200 OK".to_string(),
@@ -4925,14 +5243,179 @@ mod glm_additional_tools_tests {
             base_url: "https://open.bigmodel.cn/api/v1".to_string(),
             ..Default::default()
         };
-        let (endpoint, actual, _) = upstream_request_parts(&relay, request.clone(), "/responses")
-            .await
-            .unwrap();
+        let (endpoint, actual, _, _) =
+            upstream_request_parts(&relay, request.clone(), "/responses")
+                .await
+                .unwrap();
         let mut expected = request;
         expected["input"] = json!([message, agent]);
-        expected["tools"] = tools;
+        expected["tools"] = json!([
+            {"type": "custom", "name": "functions__exec", "format": {"type": "text"}},
+            {"type": "function", "name": "functions__wait", "parameters": {"type": "object"}},
+            {"type": "future_tool", "opaque": {"keep": true}}
+        ]);
         assert_eq!(endpoint, "https://open.bigmodel.cn/api/v1/responses");
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn responses_namespace_tool_wire_round_trips_for_glm_and_openai() {
+        let request = json!({
+            "model": "any-compatible-model",
+            "tools": [{"type": "function", "name": "plain__tool", "parameters": {"type": "object"}}],
+            "input": [
+                {"type": "additional_tools", "tools": [{
+                    "type": "namespace", "name": "functions", "tools": [
+                        {"type": "function", "name": "inspect", "parameters": {"type": "object"}},
+                        {"type": "custom", "name": "exec", "format": {"type": "text"}}
+                    ]
+                }]},
+                {"type": "function_call", "namespace": "functions", "name": "inspect", "call_id": "call-1", "arguments": "{}"},
+                {"type": "custom_tool_call", "namespace": "functions", "name": "exec", "call_id": "call-2", "input": "pwd"}
+            ]
+        });
+        let relay = crate::settings::RelayProfile::default();
+        let (_, wire, _, namespace_tools) = upstream_request_parts(&relay, request, "/responses")
+            .await
+            .unwrap();
+        assert_eq!(
+            wire["tools"],
+            json!([
+                {"type": "function", "name": "plain__tool", "parameters": {"type": "object"}},
+                {"type": "function", "name": "functions__inspect", "parameters": {"type": "object"}},
+                {"type": "custom", "name": "functions__exec", "format": {"type": "text"}}
+            ])
+        );
+        assert!(!namespace_tools.contains_key("plain__tool"));
+        assert_eq!(wire["input"][0]["name"], "functions__inspect");
+        assert_eq!(wire["input"][0].get("namespace"), None);
+        assert_eq!(wire["input"][1]["name"], "functions__exec");
+        assert_eq!(wire["input"][1].get("namespace"), None);
+
+        let response = json!({"output": [
+            {"type": "function_call", "name": "functions__inspect", "call_id": "call-1", "arguments": "{}"},
+            {"type": "custom_tool_call", "name": "functions__exec", "call_id": "call-2", "input": "pwd"},
+            {"type": "function_call", "name": "plain__tool", "call_id": "call-3", "arguments": "{}"}
+        ]});
+        let restored: Value = serde_json::from_slice(&restore_responses_tool_namespace_json(
+            &serde_json::to_vec(&response).unwrap(),
+            &namespace_tools,
+        ))
+        .unwrap();
+        assert_eq!(restored["output"][0]["namespace"], "functions");
+        assert_eq!(restored["output"][0]["name"], "inspect");
+        assert_eq!(restored["output"][1]["namespace"], "functions");
+        assert_eq!(restored["output"][1]["name"], "exec");
+        assert_eq!(restored["output"][2].get("namespace"), None);
+        assert_eq!(restored["output"][2]["name"], "plain__tool");
+
+        let frame = format!(
+            "event: response.output_item.done\ndata: {}\n\n",
+            serde_json::to_string(&response).unwrap()
+        );
+        let mut sse = ResponsesNamespaceSseRewriter::new(namespace_tools);
+        let mut stream = Vec::new();
+        for chunk in frame.as_bytes().chunks(9) {
+            stream.extend(sse.push_bytes(chunk));
+        }
+        stream.extend(sse.finish());
+        let stream = String::from_utf8(stream).unwrap();
+        assert!(stream.contains(r#""namespace":"functions""#));
+        assert!(stream.contains(r#""name":"inspect""#));
+        assert!(stream.contains(r#""name":"plain__tool""#));
+    }
+
+    #[test]
+    fn namespace_flattening_handles_nested_namespaces_and_history_without_tools() {
+        let mut body = json!({
+            "input": [
+                {"type": "function_call", "namespace": "outer__inner", "name": "run", "call_id": "call", "arguments": "{}"}
+            ]
+        });
+        let map = flatten_responses_tool_namespaces(&mut body);
+        assert!(map.is_empty());
+        assert_eq!(body["input"][0]["name"], "outer__inner__run");
+        assert_eq!(body["input"][0].get("namespace"), None);
+
+        let mut body = json!({
+            "tools": [{
+                "type": "namespace", "name": "outer", "tools": [{
+                    "type": "namespace", "name": "inner", "tools": [
+                        {"type": "function", "name": "run", "parameters": {"type": "object"}}
+                    ]
+                }]
+            }]
+        });
+        let map = flatten_responses_tool_namespaces(&mut body);
+        assert_eq!(
+            body["tools"],
+            json!([{"type": "function", "name": "outer__inner__run", "parameters": {"type": "object"}}])
+        );
+        assert_eq!(
+            map.get("outer__inner__run"),
+            Some(&("outer__inner".to_string(), "run".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn native_agent_namespace_restoration_composes_in_correct_order() {
+        let mut request = json!({
+            "tools": [{
+                "type": "namespace", "name": "collaboration", "tools": [
+                    {"type": "function", "name": "spawn_agent", "parameters": {"type": "object"}}
+                ]
+            }]
+        });
+        assert!(crate::native_agents::prepare_request(&mut request));
+        let relay = crate::settings::RelayProfile::default();
+        let (_, wire, _, namespace_tools) = upstream_request_parts(&relay, request, "/responses")
+            .await
+            .unwrap();
+        assert_eq!(
+            wire["tools"][0]["name"],
+            "codexpp_native_collaboration__spawn_agent"
+        );
+
+        let upstream_response = json!({"output": [{
+            "type": "function_call",
+            "name": "codexpp_native_collaboration__spawn_agent",
+            "call_id": "call",
+            "arguments": "{\"message\":\"run\"}"
+        }]});
+        let restored: Value = serde_json::from_slice(&restore_responses_tool_namespace_json(
+            &serde_json::to_vec(&upstream_response).unwrap(),
+            &namespace_tools,
+        ))
+        .unwrap();
+        assert_eq!(
+            restored["output"][0]["namespace"],
+            "codexpp_native_collaboration"
+        );
+        let restored: Value = serde_json::from_slice(&crate::native_agents::restore_json(
+            &serde_json::to_vec(&restored).unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(restored["output"][0]["namespace"], "collaboration");
+        assert_eq!(restored["output"][0]["name"], "spawn_agent");
+        assert_eq!(restored["output"][0]["encrypted_function_args"], json!([]));
+
+        let frame = format!(
+            "event: response.output_item.done\ndata: {}\n\n",
+            serde_json::to_string(&upstream_response).unwrap()
+        );
+        let mut namespace_rewriter = ResponsesNamespaceSseRewriter::new(namespace_tools);
+        let native_input = {
+            let mut output = namespace_rewriter.push_bytes(frame.as_bytes());
+            output.extend(namespace_rewriter.finish());
+            output
+        };
+        let mut native_rewriter = crate::native_agents::NativeAgentSseRewriter::default();
+        let mut output = native_rewriter.push_bytes(&native_input);
+        output.extend(native_rewriter.finish());
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains(r#""namespace":"collaboration""#));
+        assert!(output.contains(r#""name":"spawn_agent""#));
+        assert!(output.contains(r#""encrypted_function_args":[]"#));
     }
 
     #[test]
@@ -4945,7 +5428,7 @@ mod glm_additional_tools_tests {
                 {"type": "additional_tools", "tools": [{"type": "function", "name": "second"}]}
             ]
         });
-        normalize_glm_additional_tools("https://open.bigmodel.cn/api/v1/", &mut body);
+        normalize_responses_additional_tools(&mut body);
         assert_eq!(
             body["tools"],
             json!([
@@ -4956,31 +5439,71 @@ mod glm_additional_tools_tests {
         );
         assert_eq!(body["input"], json!([{"role": "user", "content": "hello"}]));
         let once = body.clone();
-        normalize_glm_additional_tools("https://open.bigmodel.cn/api/v1", &mut body);
+        normalize_responses_additional_tools(&mut body);
         assert_eq!(body, once);
     }
 
+    #[tokio::test]
+    async fn glm_model_behind_local_proxy_preserves_plaintext_agent_context() {
+        let relay = crate::settings::RelayProfile {
+            base_url: "http://127.0.0.1:8788/v1".to_string(),
+            ..Default::default()
+        };
+        let content = json!([{"type": "input_text", "text": "CTX8788-K9"}]);
+        let request = json!({
+            "model": "glm-5.3",
+            "input": [
+                {"type": "agent_message", "content": content},
+                {"type": "additional_tools", "tools": [{"type": "function", "name": "inspect"}]}
+            ]
+        });
+        let (_, actual, _, _) = upstream_request_parts(&relay, request, "/responses")
+            .await
+            .unwrap();
+        assert_eq!(
+            actual["input"],
+            json!([{"type": "message", "role": "user", "content": content}])
+        );
+        assert_eq!(
+            actual["tools"],
+            json!([{"type": "function", "name": "inspect"}])
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_model_aliases_rewrite_responses_and_forwarded_requests() {
+        let relay = crate::settings::RelayProfile {
+            base_url: "https://provider.example/v1".to_string(),
+            model_aliases: vec![crate::settings::RelayModelAlias {
+                alias: "gpt-5.6-luna".to_string(),
+                model: "provider-canonical".to_string(),
+            }],
+            ..Default::default()
+        };
+        let request = json!({
+            "model": "GPT-5.6-LUNA",
+            "input": [{"type": "message", "role": "user", "content": "hello"}]
+        });
+        let (_, actual, _, _) = upstream_request_parts(&relay, request, "/responses")
+            .await
+            .unwrap();
+        assert_eq!(actual["model"], "provider-canonical");
+    }
+
     #[test]
-    fn other_responses_providers_and_ordinary_glm_requests_are_unchanged() {
+    fn responses_additional_tools_are_normalized_without_target_restrictions() {
         let request = json!({
             "input": [{"type": "additional_tools", "tools": [{"type": "custom", "name": "exec"}]}]
         });
-        for base in [
-            "http://127.0.0.1:8787/v1",
-            "https://api.cdn-krill-ai.com/codex/v1",
-            "https://open.bigmodel.cn.example.com/api/v1",
-        ] {
-            let mut actual = request.clone();
-            normalize_glm_additional_tools(base, &mut actual);
-            assert_eq!(actual, request);
-        }
-        let mut ordinary = json!({
-            "tools": [{"type": "function", "name": "sum"}],
-            "input": [{"role": "user", "content": "hello"}]
-        });
-        let expected = ordinary.clone();
-        normalize_glm_additional_tools("https://open.bigmodel.cn/api/v1", &mut ordinary);
-        assert_eq!(ordinary, expected);
+        let mut actual = request;
+        normalize_responses_additional_tools(&mut actual);
+        assert_eq!(
+            actual,
+            json!({
+                "input": [],
+                "tools": [{"type": "custom", "name": "exec"}]
+            })
+        );
     }
 }
 
@@ -4996,11 +5519,98 @@ mod responses_reasoning_policy_tests {
                 {"type": "reasoning", "content": "visible", "encrypted_content": "cipher", "reasoning_content": "secret-one", "summary": [{"type": "summary_text", "text": "official-one"}]},
                 {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "visible"}], "encrypted_content": "cipher-array", "reasoning_content": "secret-two", "summary": [{"type": "summary_text", "text": "official-two"}]},
                 {"type": "reasoning", "content": [], "encrypted_content": "cipher", "reasoning_content": "secret-three", "summary": [{"type": "summary_text", "text": "official-three"}]},
-                {"type": "reasoning", "encrypted_content": "", "reasoning_content": "secret-four", "summary": [{"type": "summary_text", "text": "official-four"}]},
+                {"type": "reasoning", "id": "item_foreign", "content": null, "encrypted_content": null, "summary": [{"type": "summary_text", "text": "foreign-summary"}]},
                 {"type": "function_call", "call_id": "call-1", "name": "lookup"},
                 {"type": "message", "role": "user", "content": "after"}
             ]
         })
+    }
+
+    #[test]
+    fn open_ai_opaque_removes_foreign_summary_only_reasoning() {
+        let mut actual = json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "before"},
+                {"type": "reasoning", "id": "item_foreign", "content": null, "encrypted_content": null, "summary": [{"type": "summary_text", "text": "foreign-summary"}]},
+                {"type": "message", "role": "user", "content": "after"}
+            ]
+        });
+        normalize_responses_reasoning_policy(
+            &mut actual,
+            ResponsesReasoningPolicy::OpenAiOpaque,
+            "relay-a",
+        );
+        assert_eq!(
+            actual["input"],
+            json!([
+                {"type": "message", "role": "user", "content": "before"},
+                {"type": "message", "role": "user", "content": "after"}
+            ])
+        );
+    }
+
+    #[test]
+    fn foreign_item_ids_are_normalized_by_responses_item_type() {
+        let mut actual = json!({
+            "input": [
+                {"type": "message", "id": "item_message", "role": "user", "content": "before"},
+                {"type": "function_call", "id": "item_function", "call_id": "call-1", "name": "lookup"},
+                {"type": "custom_tool_call", "id": "item_custom", "call_id": "call-2", "name": "exec", "input": "pwd"}
+            ]
+        });
+        normalize_responses_item_ids(&mut actual);
+        assert_eq!(
+            actual["input"],
+            json!([
+                {"type": "message", "id": "msg_message", "role": "user", "content": "before"},
+                {"type": "function_call", "id": "fc_function", "call_id": "call-1", "name": "lookup"},
+                {"type": "custom_tool_call", "id": "ct_custom", "call_id": "call-2", "name": "exec", "input": "pwd"}
+            ])
+        );
+    }
+
+    #[test]
+    fn reasoning_item_ids_are_normalized_to_rs_prefix() {
+        let mut actual = json!({
+            "input": [
+                {"type": "message", "id": "item_message", "role": "user", "content": "before"},
+                {"type": "reasoning", "id": "item_reasoning", "summary": [{"type": "summary_text", "text": "glm-thought"}]}
+            ]
+        });
+        normalize_responses_item_ids(&mut actual);
+        assert_eq!(
+            actual["input"],
+            json!([
+                {"type": "message", "id": "msg_message", "role": "user", "content": "before"},
+                {"type": "reasoning", "id": "rs_reasoning", "summary": [{"type": "summary_text", "text": "glm-thought"}]}
+            ])
+        );
+    }
+
+    #[test]
+    fn open_ai_opaque_normalizes_function_id_and_preserves_call_pairing() {
+        let mut actual = json!({
+            "input": [
+                {"type": "message", "id": "item_msg", "role": "user", "content": "before"},
+                {"type": "reasoning", "id": "item_reasoning", "content": null, "encrypted_content": null, "summary": [{"type": "summary_text", "text": "foreign-summary"}]},
+                {"type": "function_call", "id": "item_call", "call_id": "call_foreign", "name": "lookup"},
+                {"type": "function_call_output", "id": "item_output", "call_id": "call_foreign", "output": "done"}
+            ]
+        });
+        normalize_responses_reasoning_policy(
+            &mut actual,
+            ResponsesReasoningPolicy::OpenAiOpaque,
+            "relay-a",
+        );
+        normalize_responses_item_ids(&mut actual);
+        assert_eq!(
+            actual["input"],
+            json!([
+                {"type": "message", "id": "msg_msg", "role": "user", "content": "before"},
+                {"type": "function_call", "id": "fc_call", "call_id": "call_foreign", "name": "lookup"},
+                {"type": "function_call_output", "id": "item_output", "call_id": "call_foreign", "output": "done"}
+            ])
+        );
     }
 
     #[test]
@@ -5047,7 +5657,6 @@ mod responses_reasoning_policy_tests {
                 {"type": "reasoning", "content": [], "encrypted_content": "cipher", "summary": [{"type": "summary_text", "text": "official-one"}]},
                 {"type": "reasoning", "content": [], "encrypted_content": "cipher-array", "summary": [{"type": "summary_text", "text": "official-two"}]},
                 {"type": "reasoning", "content": [], "encrypted_content": "cipher", "summary": [{"type": "summary_text", "text": "official-three"}]},
-                {"type": "reasoning", "encrypted_content": "", "summary": [{"type": "summary_text", "text": "official-four"}]},
                 {"type": "function_call", "call_id": "call-1", "name": "lookup"},
                 {"type": "message", "role": "user", "content": "after"}
             ])
@@ -5129,7 +5738,7 @@ mod responses_reasoning_policy_tests {
             base_url: "https://relay.example/v1".to_string(),
             ..Default::default()
         };
-        let (_, actual, wire_api) = upstream_request_parts(&relay, request(), "/responses")
+        let (_, actual, wire_api, _) = upstream_request_parts(&relay, request(), "/responses")
             .await
             .unwrap();
         assert!(matches!(wire_api, UpstreamWireApi::ChatCompletions));

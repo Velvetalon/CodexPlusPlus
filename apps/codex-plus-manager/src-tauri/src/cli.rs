@@ -278,6 +278,7 @@ fn execute(options: &Options) -> anyhow::Result<Value> {
                         "apiKey",
                         "userAgent",
                         "modelRoutes",
+                        "modelAliases",
                         "modelWindows",
                         "modelVlm",
                         "vlmApiKey",

@@ -100,6 +100,7 @@ import {
   serializeModelWindowRows,
   type ImageHandling,
   type ModelWindowRow,
+  type RelayModelAlias,
 } from "./model-windows";
 import { relayAuthForLiveDraft, shouldBackfillRelayProfileBeforeSwitch } from "./relay-live-files";
 import { orderAggregateMembersByCandidates } from "./relay-aggregate-order";
@@ -296,6 +297,7 @@ export type RelayProfile = {
   apiKey: string;
   protocol: RelayProtocol;
   responsesReasoningPolicy: ResponsesReasoningPolicy;
+  nativeAgentInterop: NativeAgentInterop;
   relayMode: RelayMode;
   sessionProvider?: RelaySessionProvider;
   officialMixApiKey: boolean;
@@ -318,10 +320,12 @@ export type RelayProfile = {
   sub2apiEnabled: boolean;
   sub2apiMultiplier: string;
   modelRoutes?: RelayModelRoute[];
+  modelAliases?: RelayModelAlias[];
   aggregate?: RelayAggregateConfig | null;
 };
 
 type ResponsesReasoningPolicy = "passthrough" | "openAiOpaque" | "strip";
+type NativeAgentInterop = "auto" | "on" | "off";
 
 type RelayAggregateStrategy =
   | "failover"
@@ -1126,6 +1130,7 @@ const defaultSettings: BackendSettings = {
       apiKey: "",
       protocol: "responses",
       responsesReasoningPolicy: "passthrough",
+      nativeAgentInterop: "auto",
       relayMode: "official",
       officialMixApiKey: false,
       noAuth: false,
@@ -1139,6 +1144,7 @@ const defaultSettings: BackendSettings = {
       modelList: "",
       modelWindows: "",
       modelVlm: "",
+      modelAliases: [],
       vlmApiKey: "",
       vlmModel: "",
       vlmBaseUrl: "",
@@ -7957,7 +7963,12 @@ function RelayProfileDetail({
 }) {
   const [draft, setDraft] = useState<RelayProfile>(profile);
   const [modelWindowRows, setModelWindowRows] = useState<ModelWindowRow[]>(
-    modelWindowRowsFromProfile(profile.modelList, profile.modelWindows || "", profile.modelVlm),
+    modelWindowRowsFromProfile(
+      profile.modelList,
+      profile.modelWindows || "",
+      profile.modelVlm,
+      profile.modelAliases || "",
+    ),
   );
   const [doctorResult, setDoctorResult] = useState<ProviderDoctorResult | null>(null);
   const [doctorOpen, setDoctorOpen] = useState(false);
@@ -7985,8 +7996,13 @@ function RelayProfileDetail({
       ? applyRelayProfilePatchToFiles(liveDraft, { apiKey: storedApiKey })
       : liveDraft;
     setDraft(nextDraft);
-    setModelWindowRows(modelWindowRowsFromProfile(nextDraft.modelList, nextDraft.modelWindows || "", nextDraft.modelVlm));
-  }, [profile.id, profile.modelList, profile.modelWindows, profileUsesLiveFiles, isActive, isNew, relayFiles?.configContents, relayFiles?.authContents]);
+    setModelWindowRows(modelWindowRowsFromProfile(
+      nextDraft.modelList,
+      nextDraft.modelWindows || "",
+      nextDraft.modelVlm,
+      nextDraft.modelAliases || "",
+    ));
+  }, [profile.id, profile.modelList, profile.modelWindows, profile.modelAliases, profileUsesLiveFiles, isActive, isNew, relayFiles?.configContents, relayFiles?.authContents]);
   const validationSettings = relaySettingsWithDraft(form, profile.id, draft, isNew);
   const validationError = relaySessionProviderValidation(draft)
     ?? (isAggregateRelayProfile(draft)
@@ -7994,7 +8010,13 @@ function RelayProfileDetail({
       : relayModelRoutesSettingsValidation(validationSettings));
   const draftWithModelRows = () => {
     const serializedRows = serializeModelWindowRows(modelWindowRows);
-    return { ...draft, modelList: serializedRows.modelList, modelWindows: serializedRows.modelWindows, modelVlm: serializedRows.modelVlm };
+    return {
+      ...draft,
+      modelList: serializedRows.modelList,
+      modelWindows: serializedRows.modelWindows,
+      modelVlm: serializedRows.modelVlm,
+      modelAliases: serializedRows.modelAliases,
+    };
   };
   const saveDraft = async () => {
     if (validationError) return;
@@ -8380,7 +8402,7 @@ function RelayProfileEditor({
   };
   const removeModelWindowRow = (index: number) => {
     const nextRows = modelWindowRows.filter((_, rowIndex) => rowIndex !== index);
-    setModelWindowRows(nextRows.length ? nextRows : [{ model: "", window: "", imageHandling: "" }]);
+    setModelWindowRows(nextRows.length ? nextRows : [{ model: "", aliases: "", window: "", imageHandling: "" }]);
   };
   const addModelWindowRows = (rows: ModelWindowRow[]) => {
     setModelWindowRows(mergeModelWindowRows(modelWindowRows, rows));
@@ -8566,7 +8588,7 @@ function RelayProfileEditor({
             </div>
             <div className="relay-model-list-tools">
               <Button
-                onClick={() => setModelWindowRows([...modelWindowRows, { model: "", window: "", imageHandling: "" }])}
+                onClick={() => setModelWindowRows([...modelWindowRows, { model: "", aliases: "", window: "", imageHandling: "" }])}
                 size="sm"
                 type="button"
                 variant="secondary"
@@ -8583,7 +8605,7 @@ function RelayProfileEditor({
                     modelWindows: serializedRows.modelWindows,
                   });
                   if (models?.length) {
-                    addModelWindowRows(models.map((model) => ({ model, window: "", imageHandling: "" })));
+                    addModelWindowRows(models.map((model) => ({ model, aliases: "", window: "", imageHandling: "" })));
                   }
                 }}
                 size="sm"
@@ -8595,7 +8617,7 @@ function RelayProfileEditor({
               </Button>
               <Button
                 disabled={!modelWindowRows.some((row) => row.model.trim())}
-                onClick={() => setModelWindowRows([{ model: "", window: "", imageHandling: "send-as-is" }])}
+                onClick={() => setModelWindowRows([{ model: "", aliases: "", window: "", imageHandling: "send-as-is" }])}
                 size="sm"
                 title={t("清空模型")}
                 type="button"
@@ -8609,6 +8631,7 @@ function RelayProfileEditor({
           <div className="relay-model-row-editor">
             <div className="relay-model-row relay-model-row-head">
               <span>{t("模型名称")}</span>
+              <span>{t("模型别名")}</span>
               <span>{t("上下文窗口")}</span>
               <span>{t("图片处理方式")}</span>
             </div>
@@ -8618,6 +8641,11 @@ function RelayProfileEditor({
                   value={row.model}
                   onChange={(event) => updateModelWindowRow(index, { model: event.currentTarget.value })}
                   placeholder="deepseek/deepseek-v4-flash"
+                />
+                <Input
+                  value={row.aliases}
+                  onChange={(event) => updateModelWindowRow(index, { aliases: event.currentTarget.value })}
+                  placeholder="luna, glm-flash"
                 />
                 <Input
                   value={row.window}
@@ -8935,6 +8963,24 @@ function RelayProfileEditor({
                 <p className="field-hint">
                   {profile.protocol === "responses"
                     ? t("仅处理 Responses 顶层 input 的 reasoning 条目；Chat Completions 不受影响。")
+                    : t("仅 Responses API 生效。")}
+                </p>
+              </Field>
+              <Field className="relay-field-native-agent-interop" label={t("原生任务兼容")}>
+                <AppSelect
+                  value={profile.nativeAgentInterop}
+                  disabled={profile.protocol !== "responses"}
+                  onChange={(value) => updateDraft({ nativeAgentInterop: value })}
+                  options={[
+                    { value: "auto", label: t("自动识别") },
+                    { value: "on", label: t("始终启用") },
+                    { value: "off", label: t("关闭") },
+                  ]}
+                  title={profile.protocol !== "responses" ? t("仅 Responses API 生效") : undefined}
+                />
+                <p className="field-hint">
+                  {profile.protocol === "responses"
+                    ? t("请求转发到该供应商时，用明文协议保留原生子任务消息与工具参数。")
                     : t("仅 Responses API 生效。")}
                 </p>
               </Field>
@@ -11473,6 +11519,7 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
             apiKey: settings.relayApiKey || "",
             protocol: "responses" as RelayProtocol,
             responsesReasoningPolicy: "passthrough" as ResponsesReasoningPolicy,
+            nativeAgentInterop: "auto" as NativeAgentInterop,
             relayMode: "official" as RelayMode,
             sessionProvider: "custom" as RelaySessionProvider,
             officialMixApiKey: false,
@@ -11487,6 +11534,7 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
             modelList: "",
             modelWindows: "",
             modelVlm: "",
+            modelAliases: [],
             vlmApiKey: "",
             vlmModel: "",
             vlmBaseUrl: "",
@@ -11559,6 +11607,7 @@ function normalizeRelayProfile(profile: RelayProfile): RelayProfile {
         apiKey: "",
         protocol: "responses",
         responsesReasoningPolicy: normalizeResponsesReasoningPolicy(profile.responsesReasoningPolicy),
+        nativeAgentInterop: normalizeNativeAgentInterop(profile.nativeAgentInterop),
         relayMode: "aggregate",
         sessionProvider: normalizeRelaySessionProvider(profile.sessionProvider),
         officialMixApiKey: false,
@@ -11574,6 +11623,7 @@ function normalizeRelayProfile(profile: RelayProfile): RelayProfile {
         modelList: profile.modelList || "",
         modelWindows: profile.modelWindows || "",
         modelRoutes: [],
+        modelAliases: [],
         sub2apiEnabled: false,
         sub2apiMultiplier: "",
       },
@@ -11591,6 +11641,7 @@ function normalizeRelayProfile(profile: RelayProfile): RelayProfile {
     apiKey: noAuth ? "" : profile.apiKey || "",
     protocol: profile.protocol === "chatCompletions" ? "chatCompletions" : "responses",
     responsesReasoningPolicy: normalizeResponsesReasoningPolicy(profile.responsesReasoningPolicy),
+    nativeAgentInterop: normalizeNativeAgentInterop(profile.nativeAgentInterop),
     relayMode,
     sessionProvider: relaySessionProvider(profile),
     officialMixApiKey,
@@ -11605,6 +11656,7 @@ function normalizeRelayProfile(profile: RelayProfile): RelayProfile {
     modelList: profile.modelList || "",
     modelWindows: profile.modelWindows || "",
     modelRoutes: relayMode === "official" && !officialMixApiKey ? [] : normalizeRelayModelRoutes(profile.modelRoutes),
+    modelAliases: profile.modelAliases || [],
     userAgent: profile.userAgent || "",
     sub2apiEnabled: noAuth ? false : profile.sub2apiEnabled === true,
     sub2apiMultiplier: !noAuth && profile.sub2apiEnabled === true ? profile.sub2apiMultiplier || "" : "",
@@ -11659,6 +11711,10 @@ function normalizeRelayMode(mode: RelayMode | undefined): RelayMode {
 
 function normalizeResponsesReasoningPolicy(value: string | undefined): ResponsesReasoningPolicy {
   return value === "openAiOpaque" || value === "strip" ? value : "passthrough";
+}
+
+function normalizeNativeAgentInterop(value: string | undefined): NativeAgentInterop {
+  return value === "on" || value === "off" ? value : "auto";
 }
 
 function normalizeRelaySessionProvider(value: string | undefined): RelaySessionProvider {
@@ -12429,6 +12485,7 @@ function createRelayProfile(settings: BackendSettings): RelayProfile {
     apiKey: "",
     protocol: "responses" as RelayProtocol,
     responsesReasoningPolicy: "passthrough" as ResponsesReasoningPolicy,
+    nativeAgentInterop: "auto" as NativeAgentInterop,
     relayMode: "official" as RelayMode,
     sessionProvider: "custom" as RelaySessionProvider,
     officialMixApiKey: false,
@@ -12443,6 +12500,7 @@ function createRelayProfile(settings: BackendSettings): RelayProfile {
     modelList: "",
     modelWindows: "",
     modelVlm: "",
+    modelAliases: [],
     vlmApiKey: "",
     vlmModel: "",
     vlmBaseUrl: "",
@@ -12467,6 +12525,7 @@ function createAggregateRelayProfile(settings: BackendSettings): RelayProfile {
       apiKey: "",
       protocol: "responses",
       responsesReasoningPolicy: "passthrough",
+      nativeAgentInterop: "auto",
       relayMode: "aggregate",
       sessionProvider: "custom",
       officialMixApiKey: false,
@@ -12482,6 +12541,7 @@ function createAggregateRelayProfile(settings: BackendSettings): RelayProfile {
       modelList: "",
       modelWindows: "",
       modelVlm: "",
+      modelAliases: [],
       vlmApiKey: "",
       vlmModel: "",
       vlmBaseUrl: "",
@@ -12615,6 +12675,7 @@ function normalizeAggregateRelayProfile(profile: RelayProfile, settings: Backend
     apiKey: "",
     protocol: "responses",
     responsesReasoningPolicy: normalizeResponsesReasoningPolicy(profile.responsesReasoningPolicy),
+    nativeAgentInterop: normalizeNativeAgentInterop(profile.nativeAgentInterop),
     relayMode: "aggregate",
     sessionProvider: normalizeRelaySessionProvider(profile.sessionProvider),
     officialMixApiKey: false,

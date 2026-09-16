@@ -7,25 +7,13 @@ fn is_message_tool(name: &str) -> bool {
     matches!(name, "spawn_agent" | "send_message" | "followup_task")
 }
 
-pub(crate) fn is_glm_url(base_url: &str) -> bool {
-    reqwest::Url::parse(base_url)
-        .ok()
-        .is_some_and(|url| url.host_str() == Some("open.bigmodel.cn"))
-}
-
-pub(crate) fn enabled(settings: &crate::settings::BackendSettings) -> bool {
-    let source = settings.active_relay_profile();
-    if source.protocol != crate::settings::RelayProtocol::Responses {
-        return false;
+pub(crate) fn interop_enabled(profile: &crate::settings::RelayProfile) -> bool {
+    use crate::settings::NativeAgentInterop;
+    match profile.native_agent_interop {
+        NativeAgentInterop::On => true,
+        NativeAgentInterop::Off => false,
+        NativeAgentInterop::Auto => profile.protocol == crate::settings::RelayProtocol::Responses,
     }
-    is_glm_url(&source.base_url)
-        || source.model_routes.iter().any(|route| {
-            settings.relay_profiles.iter().any(|target| {
-                target.id == route.target_relay_id
-                    && target.protocol == crate::settings::RelayProtocol::Responses
-                    && is_glm_url(&target.base_url)
-            })
-        })
 }
 
 pub(crate) fn prepare_request(body: &mut Value) -> bool {
@@ -225,41 +213,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_active_glm_routes_enable_interop() {
-        use crate::settings::{BackendSettings, RelayModelRoute, RelayProfile};
-        let mut settings = BackendSettings {
-            relay_profiles_enabled: true,
-            active_relay_id: "source".to_string(),
-            relay_profiles: vec![
-                RelayProfile {
-                    id: "source".to_string(),
-                    base_url: "http://127.0.0.1:8787/v1".to_string(),
-                    ..Default::default()
-                },
-                RelayProfile {
-                    id: "glm".to_string(),
-                    base_url: "https://open.bigmodel.cn/api/v1".to_string(),
-                    ..Default::default()
-                },
-            ],
+    fn native_agent_interop_mode_overrides_automatic_detection() {
+        use crate::settings::{NativeAgentInterop, RelayProfile, RelayProtocol};
+        let mut profile = RelayProfile {
+            base_url: "http://127.0.0.1:8788/v1".to_string(),
+            protocol: RelayProtocol::Responses,
             ..Default::default()
         };
-        assert!(!enabled(&settings));
-        settings.relay_profiles[0]
-            .model_routes
-            .push(RelayModelRoute {
-                model: "gpt-5.6-luna".to_string(),
-                target_relay_id: "glm".to_string(),
-                target_model: "glm-5.3-flash".to_string(),
-                enabled: true,
-                restore_at: None,
-        });
-        assert!(enabled(&settings));
-        settings.relay_profiles[0].protocol = crate::settings::RelayProtocol::ChatCompletions;
-        assert!(!enabled(&settings));
-        settings.relay_profiles[0].protocol = crate::settings::RelayProtocol::Responses;
-        settings.relay_profiles[1].base_url = "https://other.example/v1".to_string();
-        assert!(!enabled(&settings));
+        assert!(interop_enabled(&profile));
+        profile.native_agent_interop = NativeAgentInterop::On;
+        assert!(interop_enabled(&profile));
+        profile.native_agent_interop = NativeAgentInterop::Off;
+        assert!(!interop_enabled(&profile));
     }
 
     #[test]

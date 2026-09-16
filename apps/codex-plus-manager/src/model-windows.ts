@@ -29,8 +29,14 @@ export type ImageHandling = "" | "send-as-is" | "strip" | "vlm";
 
 export type ModelWindowRow = {
   model: string;
+  aliases: string;
   window: string;
   imageHandling: ImageHandling;
+};
+
+export type RelayModelAlias = {
+  alias: string;
+  model: string;
 };
 
 export function mergeModelWindowRows(
@@ -43,14 +49,24 @@ export function mergeModelWindowRows(
     const model = row.model.trim();
     if (!model || seen.has(model)) return;
     seen.add(model);
-    rows.push({ model, window: row.window.trim(), imageHandling: row.imageHandling ?? "send-as-is" });
+    rows.push({
+      model,
+      aliases: (row.aliases ?? "").trim(),
+      window: row.window.trim(),
+      imageHandling: row.imageHandling ?? "send-as-is",
+    });
   };
   currentRows.forEach(append);
   incomingRows.forEach(append);
-  return rows.length ? rows : [{ model: "", window: "", imageHandling: "send-as-is" }];
+  return rows.length ? rows : [{ model: "", aliases: "", window: "", imageHandling: "send-as-is" }];
 }
 
-export function modelWindowRowsFromProfile(modelList: string, modelWindows: string, modelVlm?: string): ModelWindowRow[] {
+export function modelWindowRowsFromProfile(
+  modelList: string,
+  modelWindows: string,
+  modelVlm?: string,
+  modelAliases?: string | RelayModelAlias[],
+): ModelWindowRow[] {
   let map: Record<string, string> = {};
   try {
     map = JSON.parse(modelWindows || "{}") as Record<string, string>;
@@ -72,15 +88,26 @@ export function modelWindowRowsFromProfile(modelList: string, modelWindows: stri
   } catch {
     vlmMap = {};
   }
+  const aliasRows = modelAliasMapToRows(modelList, modelAliases);
   const rows = modelList
     .split("\n")
     .map((model) => model.trim())
     .filter(Boolean)
-    .map((model) => ({ model, window: map[model] ?? "", imageHandling: vlmMap[model] ?? "send-as-is" }));
-  return rows.length ? rows : [{ model: "", window: "", imageHandling: "send-as-is" }];
+    .map((model) => ({
+      model,
+      aliases: aliasRows[model] ?? "",
+      window: map[model] ?? "",
+      imageHandling: vlmMap[model] ?? "send-as-is",
+    }));
+  return rows.length ? rows : [{ model: "", aliases: "", window: "", imageHandling: "send-as-is" }];
 }
 
-export function serializeModelWindowRows(rows: ModelWindowRow[]): { modelList: string; modelWindows: string; modelVlm: string } {
+export function serializeModelWindowRows(rows: ModelWindowRow[]): {
+  modelList: string;
+  modelWindows: string;
+  modelVlm: string;
+  modelAliases: RelayModelAlias[];
+} {
   const modelList: string[] = [];
   const modelWindows: Record<string, string> = {};
   const modelVlm: Record<string, string> = {};
@@ -101,7 +128,55 @@ export function serializeModelWindowRows(rows: ModelWindowRow[]): { modelList: s
     modelList: modelList.join("\n"),
     modelWindows: JSON.stringify(modelWindows),
     modelVlm: JSON.stringify(modelVlm),
+    modelAliases: serializeModelAliases(rows),
   };
+}
+
+export function modelAliasesFromProfile(modelAliases?: string | RelayModelAlias[]): Record<string, string> {
+  if (Array.isArray(modelAliases)) {
+    return Object.fromEntries(modelAliases.map((alias) => [alias.alias, alias.model]));
+  }
+  try {
+    return JSON.parse(modelAliases || "{}") as Record<string, string>;
+  } catch {
+    return {};
+  }
+}
+
+export function modelAliasMapToRows(
+  modelList: string,
+  modelAliases?: string | RelayModelAlias[],
+): Record<string, string> {
+  const aliases = modelAliasesFromProfile(modelAliases);
+  const grouped: Record<string, string[]> = {};
+  Object.entries(aliases).forEach(([alias, model]) => {
+    grouped[model] = [...(grouped[model] ?? []), alias];
+  });
+  const rowAliases: Record<string, string> = {};
+  modelList
+    .split("\n")
+    .map((model) => model.trim())
+    .filter(Boolean)
+    .forEach((model) => {
+      rowAliases[model] = (grouped[model] ?? []).join(", ");
+    });
+  return rowAliases;
+}
+
+export function serializeModelAliases(rows: ModelWindowRow[]): RelayModelAlias[] {
+  const aliases: Record<string, string> = {};
+  mergeModelWindowRows(rows, []).forEach((row) => {
+    const model = row.model.trim();
+    if (!model) return;
+    row.aliases
+      .split(/[,;\n]/)
+      .map((alias) => alias.trim())
+      .filter(Boolean)
+      .forEach((alias) => {
+        aliases[alias] = model;
+      });
+  });
+  return Object.entries(aliases).map(([alias, model]) => ({ alias, model }));
 }
 
 export type BuildModelWindowsResult =
