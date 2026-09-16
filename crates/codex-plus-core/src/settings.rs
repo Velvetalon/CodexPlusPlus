@@ -38,6 +38,8 @@ pub struct RelayProfile {
     pub protocol: RelayProtocol,
     #[serde(rename = "responsesReasoningPolicy", default)]
     pub responses_reasoning_policy: ResponsesReasoningPolicy,
+    #[serde(rename = "responsesWirePolicy", default)]
+    pub responses_wire_policy: ResponsesWirePolicy,
     #[serde(rename = "nativeAgentInterop", default)]
     pub native_agent_interop: NativeAgentInterop,
     #[serde(rename = "relayMode", default)]
@@ -247,6 +249,7 @@ impl Default for RelayProfile {
             api_key: String::new(),
             protocol: RelayProtocol::Responses,
             responses_reasoning_policy: ResponsesReasoningPolicy::default(),
+            responses_wire_policy: ResponsesWirePolicy::default(),
             native_agent_interop: NativeAgentInterop::default(),
             relay_mode: RelayMode::Official,
             official_mix_api_key: false,
@@ -327,6 +330,27 @@ impl NativeAgentInterop {
             Self::Auto => "auto",
             Self::On => "on",
             Self::Off => "off",
+        }
+    }
+}
+
+/// R08/R07.2：Responses wire 结构策略。
+/// compatible：沿用既有兼容能力（namespace 扁平化、ID 规范化、原生子任务别名等）；
+/// passthrough：跳过全部 Codex 扩展/工具/任务/ID 结构改写，供原生透传链路使用。
+/// 缺失该字段的旧 profile 反序列化时取 Compatible，保持既有行为不变。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ResponsesWirePolicy {
+    #[default]
+    Compatible,
+    Passthrough,
+}
+
+impl ResponsesWirePolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Compatible => "compatible",
+            Self::Passthrough => "passthrough",
         }
     }
 }
@@ -763,7 +787,8 @@ impl BackendSettings {
                 api_key: self.relay_api_key.clone(),
                 protocol: RelayProtocol::Responses,
                 responses_reasoning_policy: ResponsesReasoningPolicy::default(),
-                native_agent_interop: NativeAgentInterop::default(),
+                responses_wire_policy: ResponsesWirePolicy::default(),
+            native_agent_interop: NativeAgentInterop::default(),
                 relay_mode: RelayMode::MixedApi,
                 official_mix_api_key: true,
                 no_auth: false,
@@ -841,6 +866,7 @@ impl BackendSettings {
             api_key: self.relay_api_key.clone(),
             protocol: RelayProtocol::Responses,
             responses_reasoning_policy: ResponsesReasoningPolicy::default(),
+            responses_wire_policy: ResponsesWirePolicy::default(),
             native_agent_interop: NativeAgentInterop::default(),
             relay_mode: RelayMode::Official,
             official_mix_api_key: false,
@@ -2451,6 +2477,29 @@ mod tests {
         let saved = serde_json::to_value(profile).unwrap();
         assert_eq!(saved["modelRoutes"][0]["targetRelayId"], "relay-b");
         assert_eq!(saved["modelRoutes"][0]["targetModel"], "provider-luna");
+    }
+
+    // R08：wire 策略字段 serde round-trip；缺失字段默认 compatible，不改变旧 profile 行为。
+    #[test]
+    fn relay_profile_responses_wire_policy_roundtrip() {
+        let missing: RelayProfile = serde_json::from_str(
+            r#"{ "id":"relay-a", "name":"A" }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            missing.responses_wire_policy,
+            ResponsesWirePolicy::Compatible,
+            "旧 profile 缺失新字段时保持既有兼容行为"
+        );
+
+        let passthrough: RelayProfile = serde_json::from_str(
+            r#"{ "id":"relay-a", "name":"A", "responsesWirePolicy":"passthrough" }"#,
+        )
+        .unwrap();
+        assert_eq!(passthrough.responses_wire_policy, ResponsesWirePolicy::Passthrough);
+
+        let saved = serde_json::to_value(passthrough).unwrap();
+        assert_eq!(saved["responsesWirePolicy"], "passthrough");
     }
 
     #[test]

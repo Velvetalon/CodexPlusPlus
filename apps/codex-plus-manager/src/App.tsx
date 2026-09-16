@@ -297,6 +297,7 @@ export type RelayProfile = {
   apiKey: string;
   protocol: RelayProtocol;
   responsesReasoningPolicy: ResponsesReasoningPolicy;
+  responsesWirePolicy: ResponsesWirePolicy;
   nativeAgentInterop: NativeAgentInterop;
   relayMode: RelayMode;
   sessionProvider?: RelaySessionProvider;
@@ -325,6 +326,7 @@ export type RelayProfile = {
 };
 
 type ResponsesReasoningPolicy = "passthrough" | "openAiOpaque" | "strip";
+type ResponsesWirePolicy = "compatible" | "passthrough";
 type NativeAgentInterop = "auto" | "on" | "off";
 
 type RelayAggregateStrategy =
@@ -1130,6 +1132,7 @@ const defaultSettings: BackendSettings = {
       apiKey: "",
       protocol: "responses",
       responsesReasoningPolicy: "passthrough",
+      responsesWirePolicy: "compatible",
       nativeAgentInterop: "auto",
       relayMode: "official",
       officialMixApiKey: false,
@@ -8966,13 +8969,32 @@ function RelayProfileEditor({
                     : t("仅 Responses API 生效。")}
                 </p>
               </Field>
+              <Field className="relay-field-wire-policy" label={t("Responses 结构透传")}>
+                <AppSelect
+                  value={profile.responsesWirePolicy}
+                  disabled={profile.protocol !== "responses"}
+                  onChange={(value) => updateDraft({ responsesWirePolicy: value })}
+                  options={[
+                    { value: "compatible", label: t("兼容改写") },
+                    { value: "passthrough", label: t("结构透传") },
+                  ]}
+                  title={profile.protocol !== "responses" ? t("仅 Responses API 生效") : undefined}
+                />
+                <p className="field-hint">
+                  {profile.protocol === "responses"
+                    ? profile.responsesWirePolicy === "passthrough"
+                      ? t("结构透传：跳过 namespace/ID/原生子任务等兼容改写，reasoning 兼容选项由该策略接管，按原样透传。")
+                      : t("兼容改写：保持既有兼容能力（namespace 扁平化、ID 规范化、原生子任务别名）。")
+                    : t("仅 Responses API 生效。")}
+                </p>
+              </Field>
               <Field className="relay-field-native-agent-interop" label={t("原生任务兼容")}>
                 <AppSelect
                   value={profile.nativeAgentInterop}
                   disabled={profile.protocol !== "responses"}
                   onChange={(value) => updateDraft({ nativeAgentInterop: value })}
                   options={[
-                    { value: "auto", label: t("自动识别") },
+                    { value: "auto", label: t("Responses 默认启用") },
                     { value: "on", label: t("始终启用") },
                     { value: "off", label: t("关闭") },
                   ]}
@@ -8980,7 +9002,7 @@ function RelayProfileEditor({
                 />
                 <p className="field-hint">
                   {profile.protocol === "responses"
-                    ? t("请求转发到该供应商时，用明文协议保留原生子任务消息与工具参数。")
+                    ? t("「Responses 默认启用」表示 Responses 协议下默认开启，不做远端能力探测；转发时用明文协议保留原生子任务消息与工具参数。")
                     : t("仅 Responses API 生效。")}
                 </p>
               </Field>
@@ -11519,6 +11541,7 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
             apiKey: settings.relayApiKey || "",
             protocol: "responses" as RelayProtocol,
             responsesReasoningPolicy: "passthrough" as ResponsesReasoningPolicy,
+            responsesWirePolicy: "compatible" as ResponsesWirePolicy,
             nativeAgentInterop: "auto" as NativeAgentInterop,
             relayMode: "official" as RelayMode,
             sessionProvider: "custom" as RelaySessionProvider,
@@ -11607,6 +11630,7 @@ function normalizeRelayProfile(profile: RelayProfile): RelayProfile {
         apiKey: "",
         protocol: "responses",
         responsesReasoningPolicy: normalizeResponsesReasoningPolicy(profile.responsesReasoningPolicy),
+        responsesWirePolicy: normalizeResponsesWirePolicy(profile.responsesWirePolicy),
         nativeAgentInterop: normalizeNativeAgentInterop(profile.nativeAgentInterop),
         relayMode: "aggregate",
         sessionProvider: normalizeRelaySessionProvider(profile.sessionProvider),
@@ -11641,6 +11665,7 @@ function normalizeRelayProfile(profile: RelayProfile): RelayProfile {
     apiKey: noAuth ? "" : profile.apiKey || "",
     protocol: profile.protocol === "chatCompletions" ? "chatCompletions" : "responses",
     responsesReasoningPolicy: normalizeResponsesReasoningPolicy(profile.responsesReasoningPolicy),
+    responsesWirePolicy: normalizeResponsesWirePolicy(profile.responsesWirePolicy),
     nativeAgentInterop: normalizeNativeAgentInterop(profile.nativeAgentInterop),
     relayMode,
     sessionProvider: relaySessionProvider(profile),
@@ -11711,6 +11736,10 @@ function normalizeRelayMode(mode: RelayMode | undefined): RelayMode {
 
 function normalizeResponsesReasoningPolicy(value: string | undefined): ResponsesReasoningPolicy {
   return value === "openAiOpaque" || value === "strip" ? value : "passthrough";
+}
+
+function normalizeResponsesWirePolicy(value: string | undefined): ResponsesWirePolicy {
+  return value === "passthrough" ? "passthrough" : "compatible";
 }
 
 function normalizeNativeAgentInterop(value: string | undefined): NativeAgentInterop {
@@ -12485,6 +12514,7 @@ function createRelayProfile(settings: BackendSettings): RelayProfile {
     apiKey: "",
     protocol: "responses" as RelayProtocol,
     responsesReasoningPolicy: "passthrough" as ResponsesReasoningPolicy,
+    responsesWirePolicy: "compatible" as ResponsesWirePolicy,
     nativeAgentInterop: "auto" as NativeAgentInterop,
     relayMode: "official" as RelayMode,
     sessionProvider: "custom" as RelaySessionProvider,
@@ -12525,6 +12555,7 @@ function createAggregateRelayProfile(settings: BackendSettings): RelayProfile {
       apiKey: "",
       protocol: "responses",
       responsesReasoningPolicy: "passthrough",
+      responsesWirePolicy: "compatible",
       nativeAgentInterop: "auto",
       relayMode: "aggregate",
       sessionProvider: "custom",
@@ -12675,6 +12706,7 @@ function normalizeAggregateRelayProfile(profile: RelayProfile, settings: Backend
     apiKey: "",
     protocol: "responses",
     responsesReasoningPolicy: normalizeResponsesReasoningPolicy(profile.responsesReasoningPolicy),
+    responsesWirePolicy: normalizeResponsesWirePolicy(profile.responsesWirePolicy),
     nativeAgentInterop: normalizeNativeAgentInterop(profile.nativeAgentInterop),
     relayMode: "aggregate",
     sessionProvider: normalizeRelaySessionProvider(profile.sessionProvider),

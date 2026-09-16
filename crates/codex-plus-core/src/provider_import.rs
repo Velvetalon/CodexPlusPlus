@@ -189,6 +189,7 @@ fn relay_profile_from_request(
         api_key: request.api_key.clone(),
         protocol: relay_protocol(&request.wire_api),
         responses_reasoning_policy: Default::default(),
+        responses_wire_policy: Default::default(),
         native_agent_interop: Default::default(),
         relay_mode: relay_mode(&request.relay_mode),
         official_mix_api_key: false,

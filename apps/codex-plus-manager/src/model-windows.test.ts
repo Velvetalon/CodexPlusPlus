@@ -20,6 +20,7 @@ const _profileTypeCheck: RelayProfile = {
   apiKey: "",
   protocol: "responses",
   responsesReasoningPolicy: "passthrough",
+  responsesWirePolicy: "compatible",
   nativeAgentInterop: "auto",
   relayMode: "official",
   officialMixApiKey: false,
