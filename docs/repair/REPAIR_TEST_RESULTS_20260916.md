@@ -61,6 +61,9 @@
 |------|------|--------|
 | `target/release/codex-plus-plus.exe`（launcher，18,185,728 字节，build commit `423546af78fa7efc99f4e54c9c98f47bcc28ba7f`） | 构建成功（BUILD_EXIT=0，release profile 47.48s） | `b9aad01cb35b32e7103efbac14e44c4ac0d8eedf2a9ac39b45cf8deb5894aa93` |
 | `apps/codex-plus-manager/dist`（manager 前端静态资源，`npm run vite:build`） | 成功（built in 2.97s） | 目录产物，未取单值 |
+| `target/release/codex-plus-plus-manager.exe`（manager 桌面应用，39,084,544 字节，`npm run build` = launcher release + tauri build，前端 dist 已随包嵌入） | 构建成功（BUILD_EXIT=0，release profile 1m58s） | `53c6f70ddd7e2b31959e9e89ee097ffd91f44b2e1de14d7cba5659bfd8c2b317` |
+
+注：tauri.conf.json 中 `bundle.active: false` 为上游既定配置（本项目不产出安装器，exe 直接分发），故 manager 产物为单 exe，属预期行为。
 
 产物保留在 repair worktree 内。**构建成功不代表已授权替换正在运行的应用**：未安装、未杀进程、未修改用户活跃 profile。
 回退：全部改动在独立分支 `fix/review-repair-20260916-234500`，不用即无影响；需要时可对 4 个修复提交逐条 revert。
