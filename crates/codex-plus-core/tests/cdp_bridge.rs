@@ -1995,6 +1995,547 @@ fn injection_script_applies_fast_service_tier_contract() {
     assert_eq!(cases["messageBusDiagnosticCount"], 0);
 }
 
+/// 2026-09-16 审查回归 harness（R01/R02）：加载真实生产注入脚本，
+/// 驱动 sendRequest 与 message bus 两条入口，断言"确认后才发 turn"契约。
+fn run_provider_refresh_contract_harness() -> serde_json::Value {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let script_path = temp.path().join("renderer-inject.js");
+    let harness_path = temp.path().join("provider-refresh-harness.cjs");
+    std::fs::write(&script_path, assets::injection_script(57321))
+        .expect("injection script should be written");
+    let mut harness = std::fs::File::create(&harness_path).expect("harness should be created");
+    write!(
+        harness,
+        r#"
+const scriptPath = {script_path};
+const store = new Map();
+function node() {{
+  return {{
+    appendChild() {{}}, prepend() {{}}, remove() {{}}, setAttribute() {{}}, removeAttribute() {{}},
+    addEventListener() {{}}, querySelector() {{ return null; }}, querySelectorAll() {{ return []; }},
+    closest() {{ return null; }},
+    classList: {{ add() {{}}, remove() {{}}, toggle() {{}}, contains() {{ return false; }} }},
+    dataset: {{}}, style: {{}}, children: [], isConnected: true, textContent: "", innerHTML: "",
+  }};
+}}
+globalThis.window = globalThis;
+window.__CODEX_PLUS_TEST_SERVICE_TIER__ = true;
+window.addEventListener = () => {{}};
+window.removeEventListener = () => {{}};
+window.dispatchEvent = () => true;
+globalThis.document = {{
+  scripts: [], documentElement: node(), body: node(), createElement: () => node(),
+  getElementById: () => null, querySelector: () => null, querySelectorAll: () => [],
+  addEventListener() {{}}, removeEventListener() {{}},
+}};
+globalThis.localStorage = {{
+  getItem: (key) => store.has(key) ? store.get(key) : null,
+  setItem: (key, value) => store.set(key, String(value)), removeItem: (key) => store.delete(key),
+}};
+globalThis.sessionStorage = globalThis.localStorage;
+globalThis.location = {{ href: "https://codex.test/index.html", pathname: "/index.html", search: "", hash: "" }};
+window.location = globalThis.location;
+globalThis.navigator = {{ userAgent: "node-test" }};
+globalThis.performance = {{ getEntriesByType: () => [] }};
+globalThis.fetch = async () => ({{ ok: true, json: async () => ({{}}) }});
+require(scriptPath);
+const api = window.__codexPlusServiceTierTest;
+
+const profile = (id, provider) => ({{
+  relayProfilesEnabled: true,
+  activeRelayId: id,
+  activeRelayCodexProvider: provider,
+  relayProfiles: [{{
+    id,
+    relayMode: "pureApi",
+    officialMixApiKey: true,
+    modelWindows: JSON.stringify({{ "same-model": "200000" }}),
+    modelAutoCompact: "{{}}",
+    modelMetadata: "{{}}",
+  }}],
+}});
+
+(async () => {{
+// --- F01: resume 抛错时原始 turn 不能发出，目标不能被缓存为成功，调用方收到错误 ---
+api.setBackendSettings(profile("provider-b", "provider_b"));
+const f01Calls = [];
+const failingResumeClient = {{
+  async sendRequest(method, params) {{
+    f01Calls.push({{ method, params }});
+    if (method === "thread/resume") throw new Error("mock resume failure");
+    return {{ ok: true, thread: {{ id: params.threadId, model: params.model }} }};
+  }},
+}};
+api.patchAppServerClient(failingResumeClient);
+let f01CallerError = "";
+try {{
+  await failingResumeClient.sendRequest("turn/start", {{
+    threadId: "thread-f01", model: "same-model", input: [],
+  }});
+}} catch (error) {{
+  f01CallerError = String(error?.message || error);
+}}
+const f01TurnCount = f01Calls.filter((call) => call.method === "turn/start").length;
+const f01CachedAfterFailedResume = window.__codexPlusThreadModelContexts?.has("thread-f01") === true;
+
+// --- F02: 失败后下一次发送必须重新尝试 resume，不能因上次失败被跳过 ---
+try {{
+  await failingResumeClient.sendRequest("turn/start", {{
+    threadId: "thread-f01", model: "same-model", input: [],
+  }});
+}} catch (error) {{}}
+const f02ResumeAttempts = f01Calls.filter((call) => call.method === "thread/resume").length;
+
+// --- F03: ACK 延迟时，ACK 到达前原始 turn 必须为 0 次，ACK 后恰好 1 次 ---
+const f03Calls = [];
+let releaseF03Resume;
+const delayedResumeClient = {{
+  async sendRequest(method, params) {{
+    f03Calls.push({{ method, params }});
+    if (method === "thread/resume") {{
+      await new Promise((resolve) => {{ releaseF03Resume = resolve; }});
+    }}
+    return {{ ok: true, thread: {{ id: params.threadId, model: params.model }} }};
+  }},
+}};
+api.patchAppServerClient(delayedResumeClient);
+const f03TurnPromise = delayedResumeClient.sendRequest("turn/start", {{
+  threadId: "thread-f03", model: "same-model", input: [],
+}});
+const f03TurnsBeforeAck = f03Calls.filter((call) => call.method === "turn/start").length;
+releaseF03Resume();
+await f03TurnPromise;
+const f03TurnsAfterAck = f03Calls.filter((call) => call.method === "turn/start").length;
+
+// --- F04: bus dispatch 已 resolve 但服务端没有任何回复时，不算成功，原始 turn 不能发出 ---
+window.__codexPlusThreadModelRefreshTimeoutMs = 50;
+api.setBackendSettings(profile("provider-a", "provider_a"));
+const f04BusCalls = [];
+const messageBus = {{
+  handlers: new Map(),
+  dispatchMessage(type, payload) {{
+    f04BusCalls.push({{ type, request: payload?.request, hostId: payload?.hostId }});
+    return Promise.resolve({{ ok: true }});
+  }},
+  subscribe(type, handler) {{
+    if (!this.handlers.has(type)) this.handlers.set(type, new Set());
+    this.handlers.get(type).add(handler);
+    return () => this.handlers.get(type)?.delete(handler);
+  }},
+}};
+api.patchAppServerMessageBus(messageBus);
+await messageBus.dispatchMessage("mcp-request", {{
+  request: {{ id: "bus-f04", method: "turn/start", params: {{ threadId: "thread-f04", model: "same-model" }} }},
+  hostId: "local",
+}});
+const f04ResumeDispatched = f04BusCalls.filter((call) => call.request?.method === "thread/resume").length;
+const f04TurnDispatched = f04BusCalls.filter((call) => call.request?.method === "turn/start").length;
+const f04CachedWithoutAck = window.__codexPlusThreadModelContexts?.has("thread-f04") === true;
+const f04RefreshedDiagnostic = api.diagnostics().some((item) =>
+  item.event === "thread_model_context_refreshed" && item.detail?.threadId === "thread-f04");
+
+// —— F05a: 错误 ACK —— bus 回复带 error 时按失败处理，turn 不发，pending/等待者清理干净。
+const f05aBusCalls = [];
+function makeRecordingBus(calls, autoAck = true) {{
+  return {{
+    handlers: new Map(),
+    dispatchMessage(type, payload) {{
+      calls.push({{ type, request: payload?.request, hostId: payload?.hostId, priority: payload?.priority, source: payload?.source }});
+      if (autoAck && type === "mcp-request" && payload?.request?.method === "thread/resume") {{
+        const resumeRequest = payload.request;
+        Promise.resolve().then(() => deliverBusResponse(this, {{ type: "mcp-response", hostId: payload?.hostId || "", message: {{ id: resumeRequest.id, result: {{ ok: true }} }} }}));
+      }}
+      return Promise.resolve({{ ok: true }});
+    }},
+    subscribe(type, handler) {{
+      if (!this.handlers.has(type)) this.handlers.set(type, new Set());
+      this.handlers.get(type).add(handler);
+      return () => this.handlers.get(type)?.delete(handler);
+    }},
+  }};
+}}
+function deliverBusResponse(bus, response) {{
+  const handlers = bus.handlers.get("mcp-response");
+  if (!handlers) return;
+  for (const handler of [...handlers]) handler(response);
+}}
+const f05aBus = makeRecordingBus(f05aBusCalls, false);
+api.patchAppServerMessageBus(f05aBus);
+const f05aTurnPromise = messageBusDispatch(f05aBus, "bus-f05a", "thread-f05a");
+await new Promise((resolve) => setTimeout(resolve, 5));
+const f05aResumeId = f05aBusCalls.find((call) => call.request?.method === "thread/resume")?.request?.id || "";
+deliverBusResponse(f05aBus, {{ type: "mcp-response", hostId: "local", message: {{ id: f05aResumeId, error: {{ code: -32000, message: "mock resume rejected" }} }} }});
+await f05aTurnPromise;
+const f05aTurnDispatched = f05aBusCalls.filter((call) => call.request?.method === "turn/start").length;
+const f05aPendingClean = (window.__codexPlusThreadRefreshPending?.size ?? 1) === 0;
+const f05aWaiterClean = (window.__codexPlusThreadRefreshWaiters?.size ?? 1) === 0;
+
+// —— F05b: 超时（sendRequest 路径）—— resume 永不 resolve，超时后调用方收到错误且状态被清理。
+const f05bCalls = [];
+const neverResumeClient = {{
+  async sendRequest(method, params) {{
+    f05bCalls.push({{ method, params }});
+    if (method === "thread/resume") return new Promise(() => {{}});
+    return {{ ok: true, thread: {{ id: params.threadId, model: params.model }} }};
+  }},
+}};
+api.patchAppServerClient(neverResumeClient);
+api.setBackendSettings(profile("provider-b", "provider_b"));
+let f05bCallerError = "";
+try {{
+  await neverResumeClient.sendRequest("turn/start", {{ threadId: "thread-f05b", model: "same-model", input: [] }});
+}} catch (error) {{
+  f05bCallerError = String(error?.message || error);
+}}
+const f05bTurnCount = f05bCalls.filter((call) => call.method === "turn/start").length;
+const f05bPendingClean = (window.__codexPlusThreadRefreshPending?.size ?? 1) === 0;
+
+// —— F06: 不同 request id / 不同 hostId 的回复不能解锁本次请求 ——
+const f06BusCalls = [];
+const f06Bus = makeRecordingBus(f06BusCalls, false);
+api.patchAppServerMessageBus(f06Bus);
+const f06TurnPromise = messageBusDispatch(f06Bus, "bus-f06", "thread-f06");
+// dispatch 已启动，等待微任务让 resume 发出
+await new Promise((resolve) => setTimeout(resolve, 5));
+const f06ResumeIdValue = f06BusCalls.find((call) => call.request?.method === "thread/resume")?.request?.id || "";
+deliverBusResponse(f06Bus, {{ type: "mcp-response", hostId: "local", message: {{ id: "unrelated-id", result: {{ ok: true }} }} }});
+await new Promise((resolve) => setTimeout(resolve, 5));
+const f06TurnsAfterForeignId = f06BusCalls.filter((call) => call.request?.method === "turn/start").length;
+deliverBusResponse(f06Bus, {{ type: "mcp-response", hostId: "remote-other", message: {{ id: f06ResumeIdValue, result: {{ ok: true }} }} }});
+await new Promise((resolve) => setTimeout(resolve, 5));
+const f06TurnsAfterForeignHost = f06BusCalls.filter((call) => call.request?.method === "turn/start").length;
+deliverBusResponse(f06Bus, {{ type: "mcp-response", hostId: "local", message: {{ id: f06ResumeIdValue, result: {{ ok: true }} }} }});
+await f06TurnPromise;
+const f06TurnsAfterMatchingAck = f06BusCalls.filter((call) => call.request?.method === "turn/start").length;
+
+// —— F07: 目标 B 未确认又切到 C —— 迟到 B ACK 不能确认 C、不能放行 B 的旧 turn；C 的 ACK 放行 C 的 turn。
+const f07BusCalls = [];
+const f07Bus = makeRecordingBus(f07BusCalls, false);
+api.patchAppServerMessageBus(f07Bus);
+api.setBackendSettings(profile("provider-b", "provider_b"));
+const f07TurnB = messageBusDispatch(f07Bus, "bus-f07-b", "thread-f07");
+await new Promise((resolve) => setTimeout(resolve, 5));
+const f07ResumeBId = f07BusCalls.find((call) => call.request?.method === "thread/resume")?.request?.id || "";
+api.setBackendSettings(profile("provider-c", "provider_c"));
+const f07TurnC = messageBusDispatch(f07Bus, "bus-f07-c", "thread-f07");
+await new Promise((resolve) => setTimeout(resolve, 5));
+const f07TurnsBeforeC = f07BusCalls.filter((call) => call.request?.method === "turn/start").length;
+const f07ResumeIds = f07BusCalls.filter((call) => call.request?.method === "thread/resume").map((call) => call.request.id);
+deliverBusResponse(f07Bus, {{ type: "mcp-response", hostId: "local", message: {{ id: f07ResumeBId, result: {{ ok: true }} }} }});
+await f07TurnB;
+await new Promise((resolve) => setTimeout(resolve, 5));
+const f07TurnsAfterLateB = f07BusCalls.filter((call) => call.request?.method === "turn/start").length;
+const f07CacheAfterLateB = window.__codexPlusThreadModelContexts?.get("local\u0000thread-f07") || "";
+const f07ResumeCId = f07ResumeIds.find((id) => id !== f07ResumeBId) || "";
+deliverBusResponse(f07Bus, {{ type: "mcp-response", hostId: "local", message: {{ id: f07ResumeCId, result: {{ ok: true }} }} }});
+await f07TurnC;
+const f07TurnsAfterC = f07BusCalls.filter((call) => call.request?.method === "turn/start").length;
+const f07CacheAfterC = window.__codexPlusThreadModelContexts?.get("local\u0000thread-f07") || "";
+
+// —— F08: 两入口同时安装 —— 各自一条 resume，无递归、无自等待死锁。
+const f08ClientCalls = [];
+const f08Client = {{
+  async sendRequest(method, params) {{
+    f08ClientCalls.push({{ method, params }});
+    return {{ ok: true, thread: {{ id: params.threadId, model: params.model }} }};
+  }},
+}};
+api.patchAppServerClient(f08Client);
+const f08BusCalls = [];
+const f08Bus = makeRecordingBus(f08BusCalls);
+api.patchAppServerMessageBus(f08Bus);
+api.setBackendSettings(profile("provider-a", "provider_a"));
+await f08Client.sendRequest("turn/start", {{ threadId: "thread-f08-client", model: "same-model", input: [] }});
+await messageBusDispatch(f08Bus, "bus-f08", "thread-f08-bus");
+const f08ClientResumes = f08ClientCalls.filter((call) => call.method === "thread/resume").length;
+const f08ClientTurns = f08ClientCalls.filter((call) => call.method === "turn/start").length;
+const f08BusResumes = f08BusCalls.filter((call) => call.request?.method === "thread/resume").length;
+const f08BusTurns = f08BusCalls.filter((call) => call.request?.method === "turn/start").length;
+
+// —— F09: 目标未变时不重复刷新，正常发送 turn ——
+const f09Calls = [];
+const f09Client = {{
+  async sendRequest(method, params) {{
+    f09Calls.push({{ method, params }});
+    return {{ ok: true, thread: {{ id: params.threadId, model: params.model }} }};
+  }},
+}};
+api.patchAppServerClient(f09Client);
+await f09Client.sendRequest("turn/start", {{ threadId: "thread-f09", model: "same-model", input: [] }});
+await f09Client.sendRequest("turn/start", {{ threadId: "thread-f09", model: "same-model", input: [] }});
+const f09ResumeCount = f09Calls.filter((call) => call.method === "thread/resume").length;
+const f09TurnCount = f09Calls.filter((call) => call.method === "turn/start").length;
+
+// —— F10: 官方(mix)→自定义 与 自定义→官方 的 resume 配置传递 ——
+const f10Calls = [];
+const f10Client = {{
+  async sendRequest(method, params) {{
+    f10Calls.push({{ method, params }});
+    return {{ ok: true, thread: {{ id: params.threadId, model: params.model }} }};
+  }},
+}};
+api.patchAppServerClient(f10Client);
+api.setBackendSettings({{
+  relayProfilesEnabled: true,
+  activeRelayId: "official-mix",
+  activeRelayCodexProvider: "vendor_official",
+  activeRelaySessionProvider: "custom",
+  relayProfiles: [{{ id: "official-mix", relayMode: "official", officialMixApiKey: true }}],
+}});
+await f10Client.sendRequest("turn/start", {{ threadId: "thread-f10", model: "same-model", input: [] }});
+const f10OfficialToCustomProvider = f10Calls.filter((call) => call.method === "thread/resume").at(-1)?.params?.modelProvider || "";
+api.setBackendSettings({{
+  relayProfilesEnabled: true,
+  activeRelayId: "pure-openai",
+  activeRelayCodexProvider: "openai",
+  relayProfiles: [{{ id: "pure-openai", relayMode: "pureApi", officialMixApiKey: false }}],
+}});
+await f10Client.sendRequest("turn/start", {{ threadId: "thread-f10", model: "same-model", input: [] }});
+const f10CustomToOpenAiProvider = f10Calls.filter((call) => call.method === "thread/resume").at(-1)?.params?.modelProvider || "";
+
+// —— F11/F11b: wrapper 方法 send-cli-request-for-host —— 刷新用规范化 method/内层 params；
+// 外层封装不被破坏；不同 hostId 的同 id 线程不共享绑定状态。
+const f11Calls = [];
+const f11Client = {{
+  async sendRequest(method, params) {{
+    f11Calls.push({{ method, params }});
+    return {{ ok: true, thread: {{ id: params.params?.threadId || params.threadId, model: params.params?.model || params.model }} }};
+  }},
+}};
+api.patchAppServerClient(f11Client);
+await f11Client.sendRequest("send-cli-request-for-host", {{
+  hostId: "host-r1",
+  method: "turn/start",
+  params: {{ threadId: "thread-f11", model: "same-model", cwd: "C:/work" }},
+}});
+const f11ResumeCount = f11Calls.filter((call) => call.method === "thread/resume").length;
+const f11WrappedForwarded = f11Calls.some((call) =>
+  call.method === "send-cli-request-for-host"
+  && call.params?.hostId === "host-r1"
+  && call.params?.method === "turn/start"
+  && call.params?.params?.threadId === "thread-f11"
+  && call.params?.params?.cwd === "C:/work");
+await f11Client.sendRequest("send-cli-request-for-host", {{
+  hostId: "host-r2",
+  method: "turn/start",
+  params: {{ threadId: "thread-f11", model: "same-model" }},
+}});
+const f11bResumeCount = f11Calls.filter((call) => call.method === "thread/resume").length;
+
+// —— F12: 原始请求的特殊参数不被顺手抹掉 ——
+const f12Calls = [];
+const f12Client = {{
+  async sendRequest(method, params) {{
+    f12Calls.push({{ method, params }});
+    return {{ ok: true, thread: {{ id: params.threadId, model: params.model }} }};
+  }},
+}};
+api.patchAppServerClient(f12Client);
+const f12Params = {{ threadId: "thread-f12", model: "same-model", cwd: "C:/keep", approval_policy: "never", "service_tier": "standard" }};
+await f12Client.sendRequest("turn/start", f12Params, {{ signal: "keep" }});
+const f12Forwarded = f12Calls.find((call) => call.method === "turn/start")?.params || {{}};
+const f12Kept = f12Forwarded.cwd === "C:/keep"
+  && f12Forwarded.approval_policy === "never"
+  && f12Forwarded["service_tier"] === "standard";
+const f12OptionsKept = f12Calls.find((call) => call.method === "turn/start") ? true : false;
+
+// —— F13: 注入重装/断连（重置绑定状态）后 —— 已阻断的 turn 不发送，迟到 ACK 被忽略。
+const f13BusCalls = [];
+const f13Bus = makeRecordingBus(f13BusCalls, false);
+api.patchAppServerMessageBus(f13Bus);
+const f13Turn = messageBusDispatch(f13Bus, "bus-f13", "thread-f13");
+await new Promise((resolve) => setTimeout(resolve, 5));
+const f13ResumeId = f13BusCalls.find((call) => call.request?.method === "thread/resume")?.request?.id || "";
+// 模拟注入重装：换新 bus 实例触发绑定状态重置
+const f13Bus2Calls = [];
+const f13Bus2 = makeRecordingBus(f13Bus2Calls);
+api.patchAppServerMessageBus(f13Bus2);
+await f13Turn;
+const f13TurnDispatched = f13BusCalls.filter((call) => call.request?.method === "turn/start").length;
+deliverBusResponse(f13Bus, {{ type: "mcp-response", hostId: "local", message: {{ id: f13ResumeId, result: {{ ok: true }} }} }});
+await new Promise((resolve) => setTimeout(resolve, 5));
+const f13TurnsAfterLateAck = f13BusCalls.filter((call) => call.request?.method === "turn/start").length;
+const f13CacheWritten = window.__codexPlusThreadModelContexts?.has("local\u0000thread-f13") === true;
+
+// —— F14: bus 延迟 ACK（setTimeout 30ms）也可靠 —— 确认后恰好发送一次 turn。
+const f14BusCalls = [];
+const f14Bus = makeRecordingBus(f14BusCalls, false);
+const originalF14Dispatch = f14Bus.dispatchMessage;
+f14Bus.dispatchMessage = function (type, payload) {{
+  if (type === "mcp-request" && payload?.request?.method === "thread/resume") {{
+    const resumeRequest = payload.request;
+    setTimeout(() => deliverBusResponse(f14Bus, {{ type: "mcp-response", hostId: payload?.hostId || "", message: {{ id: resumeRequest.id, result: {{ ok: true }} }} }}), 30);
+  }}
+  return originalF14Dispatch.call(this, type, payload);
+}};
+api.patchAppServerMessageBus(f14Bus);
+await messageBusDispatch(f14Bus, "bus-f14", "thread-f14");
+const f14ResumeCount = f14BusCalls.filter((call) => call.request?.method === "thread/resume").length;
+const f14TurnCount = f14BusCalls.filter((call) => call.request?.method === "turn/start").length;
+
+function messageBusDispatch(bus, requestId, threadId) {{
+  return bus.dispatchMessage("mcp-request", {{
+    request: {{ id: requestId, method: "turn/start", params: {{ threadId, model: "same-model" }} }},
+    hostId: "local",
+  }});
+}}
+
+process.stdout.write(JSON.stringify({{
+  f01TurnCount,
+  f01CachedAfterFailedResume,
+  f01CallerError,
+  f02ResumeAttempts,
+  f03TurnsBeforeAck,
+  f03TurnsAfterAck,
+  f04ResumeDispatched,
+  f04TurnDispatched,
+  f04CachedWithoutAck,
+  f04RefreshedDiagnostic,
+  f05aTurnDispatched,
+  f05aPendingClean,
+  f05aWaiterClean,
+  f05bTurnCount,
+  f05bCallerError,
+  f05bPendingClean,
+  f06TurnsAfterForeignId,
+  f06TurnsAfterForeignHost,
+  f06TurnsAfterMatchingAck,
+  f07TurnsBeforeC,
+  f07TurnsAfterLateB,
+  f07CacheAfterLateB,
+  f07TurnsAfterC,
+  f07CacheAfterC,
+  f08ClientResumes,
+  f08ClientTurns,
+  f08BusResumes,
+  f08BusTurns,
+  f09ResumeCount,
+  f09TurnCount,
+  f10OfficialToCustomProvider,
+  f10CustomToOpenAiProvider,
+  f11ResumeCount,
+  f11WrappedForwarded,
+  f11bResumeCount,
+  f12Kept,
+  f13TurnDispatched,
+  f13TurnsAfterLateAck,
+  f13CacheWritten,
+  f14ResumeCount,
+  f14TurnCount,
+}}));
+}})().catch((error) => {{
+  console.error(error);
+  process.exit(1);
+}});
+"#,
+        script_path = serde_json::to_string(&script_path.to_string_lossy().to_string())
+            .expect("script path should serialize")
+    )
+    .expect("harness should be written");
+    drop(harness);
+
+    let output = Command::new("node")
+        .arg(&harness_path)
+        .output()
+        .expect("node should run provider refresh harness");
+    assert!(
+        output.status.success(),
+        "node harness failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("harness stdout should be JSON")
+}
+
+/// 2026-09-16 审查回归断言（R01/R02）：确认后才发 turn 的契约。
+/// 修复前应为红（F01/F02/F04），F03 为 ACK 时序守卫（红绿都需人工核对语义）。
+#[test]
+fn injection_script_blocks_turn_until_thread_binding_confirmed() {
+    let cases = run_provider_refresh_contract_harness();
+
+    // F01: resume 失败后原始 turn 0 次、目标未确认、调用方收到错误。
+    assert_eq!(cases["f01TurnCount"], json!(0), "resume 失败时不能发送 turn/start");
+    assert_eq!(
+        cases["f01CachedAfterFailedResume"], json!(false),
+        "resume 失败不能把目标上下文缓存为成功"
+    );
+    assert!(
+        cases["f01CallerError"].as_str().is_some_and(|value| !value.is_empty()),
+        "调用方必须收到刷新失败的错误反馈"
+    );
+    // F02: 失败后下一次发送重新尝试 resume（共 2 次）。
+    assert_eq!(cases["f02ResumeAttempts"], json!(2), "失败后下一次 turn 必须重试 resume");
+    // F03: ACK 延迟时 turn 只能在 ACK 后发送恰好一次。
+    assert_eq!(cases["f03TurnsBeforeAck"], json!(0));
+    assert_eq!(cases["f03TurnsAfterAck"], json!(1));
+    // F04: bus dispatch 返回 resolved 不算 ACK；未收到服务端回复时不发 turn、不缓存、不发成功事件。
+    assert_eq!(cases["f04ResumeDispatched"], json!(1));
+    assert_eq!(cases["f04TurnDispatched"], json!(0), "未收到 ACK 前不能投递原始 turn");
+    assert_eq!(
+        cases["f04CachedWithoutAck"], json!(false),
+        "未收到 ACK 前不能缓存刷新成功"
+    );
+    assert_eq!(
+        cases["f04RefreshedDiagnostic"], json!(false),
+        "未收到 ACK 前不能发出 thread_model_context_refreshed"
+    );
+    // F05a: 错误 ACK 按失败处理，不发 turn，pending 与等待者清理干净。
+    assert_eq!(cases["f05aTurnDispatched"], json!(0), "错误 ACK 不能放行 turn");
+    assert_eq!(cases["f05aPendingClean"], json!(true), "失败后 pending 必须清理");
+    assert_eq!(cases["f05aWaiterClean"], json!(true), "失败后 ACK 等待者必须清理");
+    // F05b: sendRequest 路径超时后调用方收到错误、turn 未发、pending 清理。
+    assert_eq!(cases["f05bTurnCount"], json!(0));
+    assert!(
+        cases["f05bCallerError"].as_str().is_some_and(|value| !value.is_empty()),
+        "超时必须反馈给调用方"
+    );
+    assert_eq!(cases["f05bPendingClean"], json!(true), "超时后 pending 必须清理");
+    // F06: 不同 request id / 不同 hostId 的回复都不解锁；匹配 ACK 到达后恰好发一次。
+    assert_eq!(cases["f06TurnsAfterForeignId"], json!(0));
+    assert_eq!(cases["f06TurnsAfterForeignHost"], json!(0));
+    assert_eq!(cases["f06TurnsAfterMatchingAck"], json!(1));
+    // F07: 迟到 B ACK 不能确认 C 或放行旧 turn；C 的 ACK 放行 C 的 turn。
+    assert_eq!(cases["f07TurnsBeforeC"], json!(0));
+    assert_eq!(
+        cases["f07TurnsAfterLateB"], json!(0),
+        "过期目标被取代后，迟到 ACK 不能放行旧 turn"
+    );
+    assert_eq!(
+        cases["f07CacheAfterLateB"], json!(""),
+        "迟到 B ACK 不能把缓存写成 B 的绑定"
+    );
+    assert_eq!(cases["f07TurnsAfterC"], json!(1), "只有 C 自己的 ACK 能放行 C 的 turn");
+    assert!(
+        cases["f07CacheAfterC"].as_str().is_some_and(|value| value.contains("provider-c")),
+        "C 的 ACK 确认后缓存必须是 C 的绑定"
+    );
+    // F08: 两入口同时安装：各自恰好一条 resume + 一次 turn，无递归无死锁。
+    assert_eq!(cases["f08ClientResumes"], json!(1));
+    assert_eq!(cases["f08ClientTurns"], json!(1));
+    assert_eq!(cases["f08BusResumes"], json!(1));
+    assert_eq!(cases["f08BusTurns"], json!(1));
+    // F09: 目标未变时不重复刷新，turn 正常各发一次。
+    assert_eq!(cases["f09ResumeCount"], json!(1));
+    assert_eq!(cases["f09TurnCount"], json!(2));
+    // F10: 官方(mix)→自定义携带显式 provider；自定义→官方(openai)时不臆造 provider。
+    assert_eq!(cases["f10OfficialToCustomProvider"], json!("vendor_official"));
+    assert_eq!(cases["f10CustomToOpenAiProvider"], json!("openai"));
+    // F11: wrapper 方法用规范化 method/内层 params 刷新，外层封装与业务参数保持原样。
+    assert_eq!(cases["f11ResumeCount"], json!(1));
+    assert_eq!(cases["f11WrappedForwarded"], json!(true));
+    // F11b: 不同 hostId 的同 id 线程不共享绑定状态，需要再次刷新。
+    assert_eq!(cases["f11bResumeCount"], json!(2));
+    // F12: cwd/审批/服务档位等特殊参数不被顺手抹掉。
+    assert_eq!(cases["f12Kept"], json!(true));
+    // F13: 重置绑定状态后旧 turn 不发送，迟到 ACK 被忽略，不写缓存。
+    assert_eq!(cases["f13TurnDispatched"], json!(0));
+    assert_eq!(cases["f13TurnsAfterLateAck"], json!(0));
+    assert_eq!(cases["f13CacheWritten"], json!(false));
+    // F14: 延迟 ACK 与立即 ACK 都可靠，确认后恰好发送一次 turn。
+    assert_eq!(cases["f14ResumeCount"], json!(1));
+    assert_eq!(cases["f14TurnCount"], json!(1));
+}
+
 fn run_service_tier_contract_harness() -> serde_json::Value {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let script_path = temp.path().join("renderer-inject.js");
@@ -2618,11 +3159,23 @@ const messageBus = {{
   handlers: new Map(),
   dispatchMessage(type, payload) {{
     messageBusCalls.push({{ type, method: payload?.request?.method, params: payload?.request?.params }});
+    if (type === "mcp-request" && payload?.request?.method === "thread/resume") {{
+      // 真实 host 会按 requestId 回 mcp-response；mock 在微任务里模拟这一行为，
+      // 与"确认后才发 turn"的新契约保持一致。
+      const resumeRequest = payload.request;
+      Promise.resolve().then(() => {{
+        const handlers = this.handlers.get("mcp-response");
+        if (!handlers) return;
+        const response = {{ type: "mcp-response", hostId: payload?.hostId || "", message: {{ id: resumeRequest.id, result: {{ ok: true }} }} }};
+        for (const handler of [...handlers]) handler(response);
+      }});
+    }}
     return Promise.resolve({{ ok: true }});
   }},
-  subscribe(type) {{
-    this.handlers.set(type, new Set());
-    return () => this.handlers.delete(type);
+  subscribe(type, handler) {{
+    if (!this.handlers.has(type)) this.handlers.set(type, new Set());
+    this.handlers.get(type).add(handler);
+    return () => this.handlers.get(type)?.delete(handler);
   }},
 }};
 const messageBusPatched = api.patchAppServerMessageBus(messageBus);
