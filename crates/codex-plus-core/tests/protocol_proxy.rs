@@ -15,7 +15,7 @@ use codex_plus_core::relay_config::test_relay_profile;
 use codex_plus_core::relay_rotation::priority_fallback_cooldown_status;
 use codex_plus_core::settings::{
     AggregateRelayMember, AggregateRelayProfile, AggregateRelayStrategy, BackendSettings,
-    RelayMode, RelayModelRoute, RelayProfile, RelayProtocol, RelaySessionProvider,
+    NativeAgentInterop, RelayMode, RelayModelRoute, RelayProfile, RelayProtocol, RelaySessionProvider,
     ResponsesReasoningPolicy,
 };
 use serde_json::json;
@@ -3285,4 +3285,317 @@ fn empty_image_url_is_dropped_rather_than_forwarded() {
     let messages = converted["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 3);
     assert_eq!(messages[2]["role"], "tool");
+}
+
+// ---------------------------------------------------------------------------
+// 2026-09-16 审查回归测试（R03/R05）。先在未修复代码上跑红，作为修复前证据。
+// ---------------------------------------------------------------------------
+
+// T04 / R05：顶层扁平名与 namespace 展开名冲突时必须 fail closed，
+// 在请求发往上游之前报错；mock 上游请求数必须为 0。
+#[tokio::test]
+async fn namespace_flatten_conflict_with_top_level_tool_fails_closed_before_upstream() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut received = 0usize;
+        while let Ok((mut stream, _)) = listener.accept().await {
+            received += 1;
+            let mut buffer = [0; 4096];
+            let _ = stream.read(&mut buffer).await.unwrap();
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 35\r\ncontent-type: application/json\r\n\r\n{\"id\":\"resp_1\",\"object\":\"response\"}",
+                )
+                .await;
+        }
+        received
+    });
+    let mut settings = aggregate_proxy_settings(
+        "conflict-fail-closed",
+        format!("http://{addr}/v1"),
+        format!("http://{addr}/v1"),
+    );
+    for relay in settings.relay_profiles.iter_mut().take(2) {
+        relay.relay_mode = RelayMode::PureApi;
+        relay.no_auth = true;
+        relay.api_key.clear();
+    }
+
+    let request = json!({
+        "model": "gpt-5-mini",
+        "stream": false,
+        "tools": [
+            {"type": "function", "name": "fs__read", "parameters": {"type": "object"}},
+            {"type": "namespace", "name": "fs", "tools": [
+                {"type": "function", "name": "read", "parameters": {"type": "object"}}
+            ]}
+        ],
+        "input": "hi"
+    });
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings).await;
+    assert!(
+        result.is_err(),
+        "扁平名冲突必须在发送上游前报错，而不是静默覆盖工具身份"
+    );
+    server.abort();
+    let received = server.await.unwrap_or(0);
+    assert_eq!(received, 0, "冲突请求不能发往上游（实际收到 {received} 个请求）");
+}
+
+// A01 / R03：候选 A（native interop on）429 后失败转移到候选 B（interop off）时，
+// B 收到的请求不能继承 A 的原生子任务别名/明文标记改写。
+#[tokio::test]
+async fn aggregate_fallback_does_not_inherit_first_candidate_native_agent_rewrites() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let first = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let first_addr = first.local_addr().unwrap();
+    let second = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let second_addr = second.local_addr().unwrap();
+    let first_server = tokio::spawn(capture_request_and_respond_once(
+        first,
+        "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 13\r\ncontent-type: application/json\r\n\r\n{\"error\":429}",
+    ));
+    let second_server = tokio::spawn(capture_json_request_once(second));
+    let mut settings = aggregate_proxy_settings(
+        "native-isolation-off",
+        format!("http://{first_addr}/v1"),
+        format!("http://{second_addr}/v1"),
+    );
+    settings.relay_profiles[0].native_agent_interop = NativeAgentInterop::On;
+    settings.relay_profiles[1].native_agent_interop = NativeAgentInterop::Off;
+    for relay in settings.relay_profiles.iter_mut().take(2) {
+        relay.relay_mode = RelayMode::PureApi;
+        relay.no_auth = true;
+        relay.api_key.clear();
+    }
+
+    let request = json!({
+        "model": "gpt-5-mini",
+        "stream": false,
+        "tools": [{
+            "type": "namespace", "name": "collaboration", "tools": [
+                {"type": "function", "name": "spawn_agent", "parameters": {
+                    "type": "object",
+                    "properties": {"message": {"type": "string"}}
+                }}
+            ]
+        }],
+        "input": [
+            {"type": "message", "role": "user", "content": "fixture-task"},
+            {"type": "agent_message", "content": [
+                {"type": "input_text", "text": "plaintext task"}
+            ]}
+        ]
+    });
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+    let _ = result.response.bytes().await.unwrap();
+
+    let (_, second_body) = second_server.await.unwrap();
+    let tools = second_body["tools"].as_array().unwrap();
+    // 通用 namespace 扁平化仍会按 B 自己的策略展开工具，但展开名不能带 A 的原生别名前缀。
+    assert!(
+        tools.iter().all(|tool| !tool
+            .get("name")
+            .and_then(|name| name.as_str())
+            .is_some_and(|name| name.starts_with("codexpp_native_collaboration"))),
+        "候选 B（interop off）不能继承候选 A 的 collaboration 别名改写，实际 tools: {tools:?}"
+    );
+    assert_eq!(
+        tools[0]["name"], json!("collaboration__spawn_agent"),
+        "候选 B 按自己的策略执行通用扁平化（无原生别名）"
+    );
+    let message_property = tools
+        .iter()
+        .flat_map(|tool| tool["parameters"]["properties"]["message"].as_object())
+        .next();
+    assert!(
+        !message_property.is_some_and(|property| property.get("encrypted") == Some(&json!(false))),
+        "候选 B 不能继承候选 A 的 encrypted:false 明文标记"
+    );
+    assert_eq!(
+        second_body["input"][1]["type"], "agent_message",
+        "候选 B（interop off）不能继承候选 A 的 agent_message 重建行为"
+    );
+}
+
+// A02 / R03：候选 A（interop off）429 后转移到候选 B（interop on）时，
+// B 必须完整执行自己的预处理，且响应恢复使用 B 自己的上下文。
+#[tokio::test]
+async fn aggregate_fallback_second_candidate_applies_its_own_native_prep_and_restore() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let first = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let first_addr = first.local_addr().unwrap();
+    let second = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let second_addr = second.local_addr().unwrap();
+    let first_server = tokio::spawn(capture_request_and_respond_once(
+        first,
+        "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 13\r\ncontent-type: application/json\r\n\r\n{\"error\":429}",
+    ));
+    let second_server = tokio::spawn(capture_json_request_once(second));
+    let mut settings = aggregate_proxy_settings(
+        "native-isolation-on",
+        format!("http://{first_addr}/v1"),
+        format!("http://{second_addr}/v1"),
+    );
+    settings.relay_profiles[0].native_agent_interop = NativeAgentInterop::Off;
+    settings.relay_profiles[1].native_agent_interop = NativeAgentInterop::On;
+    for relay in settings.relay_profiles.iter_mut().take(2) {
+        relay.relay_mode = RelayMode::PureApi;
+        relay.no_auth = true;
+        relay.api_key.clear();
+    }
+
+    let request = json!({
+        "model": "gpt-5-mini",
+        "stream": false,
+        "tools": [{
+            "type": "namespace", "name": "collaboration", "tools": [
+                {"type": "function", "name": "spawn_agent", "parameters": {
+                    "type": "object",
+                    "properties": {"message": {"type": "string"}}
+                }}
+            ]
+        }],
+        "input": [{"type": "message", "role": "user", "content": "fixture-task"}]
+    });
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+
+    let (_, second_body) = second_server.await.unwrap();
+    // B 的预处理先生效（collaboration -> codexpp_native_collaboration），
+    // 随后通用扁平化把 namespace 展开成子工具扁平名。
+    assert_eq!(
+        second_body["tools"][0]["name"],
+        json!("codexpp_native_collaboration__spawn_agent"),
+        "候选 B（interop on）必须执行自己的 collaboration 别名预处理"
+    );
+    assert_eq!(
+        second_body["tools"][0]["parameters"]["properties"]["message"]["encrypted"],
+        json!(false),
+        "候选 B 必须执行自己的明文标记预处理"
+    );
+}
+
+// A04 / R03+R12：两候选配置不同模型别名时，B 的物理模型必须来自 B 自己的配置，
+// 不能继承 A 的别名改写结果。
+#[tokio::test]
+async fn aggregate_fallback_resolves_each_candidate_model_alias_independently() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let first = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let first_addr = first.local_addr().unwrap();
+    let second = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let second_addr = second.local_addr().unwrap();
+    let first_server = tokio::spawn(capture_request_and_respond_once(
+        first,
+        "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 13\r\ncontent-type: application/json\r\n\r\n{\"error\":429}",
+    ));
+    let second_server = tokio::spawn(capture_json_request_once(second));
+    let mut settings = aggregate_proxy_settings(
+        "alias-isolation",
+        format!("http://{first_addr}/v1"),
+        format!("http://{second_addr}/v1"),
+    );
+    settings.relay_profiles[0].model_aliases = vec![codex_plus_core::settings::RelayModelAlias {
+        alias: "logical-model".to_string(),
+        model: "physical-a".to_string(),
+    }];
+    settings.relay_profiles[1].model_aliases = vec![codex_plus_core::settings::RelayModelAlias {
+        alias: "logical-model".to_string(),
+        model: "physical-b".to_string(),
+    }];
+    for relay in settings.relay_profiles.iter_mut().take(2) {
+        relay.relay_mode = RelayMode::PureApi;
+        relay.no_auth = true;
+        relay.api_key.clear();
+    }
+
+    let result = open_responses_proxy_request_with_settings(
+        r#"{"model":"logical-model","input":"hi","stream":false}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.status_code, 200);
+    let _ = result.response.bytes().await.unwrap();
+
+    let first_request = first_server.await.unwrap();
+    let first_body = first_request
+        .split_once("\r\n\r\n")
+        .and_then(|(_, body)| serde_json::from_str::<serde_json::Value>(body).ok())
+        .unwrap();
+    assert_eq!(first_body["model"], json!("physical-a"));
+    let (_, second_body) = second_server.await.unwrap();
+    assert_eq!(
+        second_body["model"],
+        json!("physical-b"),
+        "候选 B 的物理模型必须来自 B 自己的别名配置，而不是 A 的改写结果"
+    );
+}
+
+// A08 / R03：整个 fallback 过程结束后，调用方传入的原始请求体不能被原地修改。
+#[tokio::test]
+async fn aggregate_fallback_leaves_original_request_json_unmodified() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let first = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let first_addr = first.local_addr().unwrap();
+    let second = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let second_addr = second.local_addr().unwrap();
+    let first_server = tokio::spawn(capture_request_and_respond_once(
+        first,
+        "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 13\r\ncontent-type: application/json\r\n\r\n{\"error\":429}",
+    ));
+    let second_server = tokio::spawn(capture_json_request_once(second));
+    let mut settings = aggregate_proxy_settings(
+        "original-unmodified",
+        format!("http://{first_addr}/v1"),
+        format!("http://{second_addr}/v1"),
+    );
+    settings.relay_profiles[0].native_agent_interop = NativeAgentInterop::On;
+    settings.relay_profiles[0].model_aliases = vec![codex_plus_core::settings::RelayModelAlias {
+        alias: "gpt-5-mini".to_string(),
+        model: "physical-a".to_string(),
+    }];
+    for relay in settings.relay_profiles.iter_mut().take(2) {
+        relay.relay_mode = RelayMode::PureApi;
+        relay.no_auth = true;
+        relay.api_key.clear();
+    }
+
+    let original = json!({
+        "model": "gpt-5-mini",
+        "stream": false,
+        "tools": [{
+            "type": "namespace", "name": "collaboration", "tools": [
+                {"type": "function", "name": "spawn_agent", "parameters": {
+                    "type": "object",
+                    "properties": {"message": {"type": "string"}}
+                }}
+            ]
+        }],
+        "input": [{"type": "message", "role": "user", "content": "fixture-task"}]
+    });
+    let original_snapshot = original.clone();
+    let result = open_responses_proxy_request_with_settings(&original.to_string(), settings)
+        .await
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+    let _ = result.response.bytes().await.unwrap();
+    first_server.await.unwrap();
+    second_server.await.unwrap();
+
+    // 原始 JSON 字符串本身不含任何候选改写痕迹（别名/别名扁平名/明文标记）。
+    let serialized = original_snapshot.to_string();
+    assert!(
+        !serialized.contains("physical-a")
+            && !serialized.contains("codexpp_native_collaboration")
+            && !serialized.contains("encrypted"),
+        "原始请求不能被候选改写污染：{serialized}"
+    );
 }

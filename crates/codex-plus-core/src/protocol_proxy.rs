@@ -600,14 +600,20 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         relays.first().map(|item| item.id.as_str()),
         Some(relay.id.as_str())
     );
-    let native_agent_plaintext =
-        crate::native_agents::interop_enabled(relays.first().unwrap_or(&relay))
-            && crate::native_agents::prepare_request(&mut request_json);
     let relay_count = relays.len();
     for (attempt, relay) in relays.into_iter().enumerate() {
         validate_upstream(&relay)?;
+        // 每个候选从原始请求克隆后独立编码（R03）：native-agent 预处理、模型映射、
+        // 工具/ID 转换都只作用于本候选的副本，失败转移后不把上一家的改写带给下一家。
+        let mut attempt_body = request_json.clone();
+        // R08：passthrough 策略下不执行原生子任务别名等结构改写，
+        // 即使 nativeAgentInterop 处于 auto/on。
+        let native_agent_plaintext = relay.responses_wire_policy
+            == crate::settings::ResponsesWirePolicy::Compatible
+            && crate::native_agents::interop_enabled(&relay)
+            && crate::native_agents::prepare_request(&mut attempt_body);
         let (endpoint, upstream_body, wire_api, namespace_tools) =
-            upstream_request_parts(&relay, request_json.clone(), request_path).await?;
+            upstream_request_parts(&relay, attempt_body, request_path).await?;
         let has_more_candidates = attempt + 1 < relay_count;
         let header_timeout = response_header_timeout(is_stream);
         let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -974,16 +980,22 @@ async fn upstream_request_parts(
         RelayProtocol::ChatCompletions => responses_to_chat_completions(request_json)?,
     };
     let mut namespace_tools = BTreeMap::new();
-    if relay.protocol == RelayProtocol::Responses {
-        if let Some(model) = body.get("model").and_then(Value::as_str).map(str::trim) {
-            if let Some(alias) = relay
-                .model_aliases
-                .iter()
-                .find(|alias| alias.alias.eq_ignore_ascii_case(model))
-            {
-                body["model"] = Value::String(alias.model.trim().to_string());
-            }
+    // R12：模型别名按候选 profile 解析，协议无关——Responses 与 ChatCompletions
+    // 上游都按同一规则把逻辑名换成物理名，不允许界面可填但某条协议默默不生效。
+    if let Some(model) = body.get("model").and_then(Value::as_str).map(str::trim) {
+        if let Some(alias) = relay
+            .model_aliases
+            .iter()
+            .find(|alias| alias.alias.eq_ignore_ascii_case(model))
+        {
+            body["model"] = Value::String(alias.model.trim().to_string());
         }
+    }
+    // R08：passthrough = 结构透传边界。跳过 reasoning/ID/原生子任务/additional_tools/
+    // namespace 扁平化等全部 Codex 扩展改写；模型路由与认证仍按显式配置执行。
+    let responses_compat = relay.protocol == RelayProtocol::Responses
+        && relay.responses_wire_policy == crate::settings::ResponsesWirePolicy::Compatible;
+    if responses_compat {
         normalize_responses_reasoning_policy(
             &mut body,
             relay.responses_reasoning_policy,
@@ -994,7 +1006,7 @@ async fn upstream_request_parts(
             crate::native_agents::prepare_glm_messages(&mut body);
         }
         normalize_responses_additional_tools(&mut body);
-        namespace_tools = flatten_responses_tool_namespaces(&mut body);
+        namespace_tools = flatten_responses_tool_namespaces(&mut body)?;
         normalize_responses_custom_tool_call_ids(&mut body);
     }
 
@@ -1190,7 +1202,8 @@ fn normalize_responses_item_id(item: &mut Value) {
         Some("message") => "msg_",
         Some("reasoning") => "rs_",
         Some("function_call") => "fc_",
-        Some("custom_tool_call") => "ct_",
+        // custom_tool_call 由 normalize_responses_custom_tool_call_ids 一处权威
+        // 规范化，这里跳过以免两套规则叠加出 ctc_ct_（R07）。
         _ => return,
     };
     item["id"] = json!(format!("{prefix}{suffix}"));
@@ -1245,13 +1258,57 @@ fn normalize_responses_additional_tools(body: &mut Value) {
     }
 }
 
+/// R05：扁平名占用检查。不同身份（命名空间, 原名）争用同一 wire name → 显式报错；
+/// 同一身份且定义完全一致 → 去重（返回 false 跳过重复推送）；
+/// 同一身份但定义不同 → 显式报错，绝不静默覆盖或任选其一。
+fn check_flattened_tool_name(
+    occupied: &mut BTreeMap<String, ((String, String), Option<Value>)>,
+    wire_name: &str,
+    identity: (String, String),
+    definition: Option<Value>,
+) -> anyhow::Result<bool> {
+    match occupied.get(wire_name) {
+        Some((existing_identity, _)) if *existing_identity != identity => {
+            anyhow::bail!(
+                "工具名称冲突：扁平名「{}」同时来自命名空间「{}」的工具「{}」和命名空间「{}」的工具「{}」，已拒绝发送以免误派工具",
+                wire_name,
+                existing_identity.0,
+                existing_identity.1,
+                identity.0,
+                identity.1
+            );
+        }
+        Some((_, existing_definition)) => {
+            let same_definition = match (existing_definition, &definition) {
+                (Some(existing), Some(new)) => existing == new,
+                _ => false,
+            };
+            if same_definition {
+                return Ok(false);
+            }
+            anyhow::bail!(
+                "工具名称冲突：命名空间「{}」的工具「{}」存在多个不同定义（扁平名「{}」），已拒绝发送",
+                identity.0,
+                identity.1,
+                wire_name
+            );
+        }
+        None => {
+            occupied.insert(wire_name.to_string(), (identity, definition));
+            Ok(true)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn flatten_responses_namespace_children(
     namespace_tool: &Value,
     parent_namespace: &str,
     parent_description: &str,
     wire_tools: &mut Vec<Value>,
     namespace_tools: &mut BTreeMap<String, (String, String)>,
-) {
+    occupied: &mut BTreeMap<String, ((String, String), Option<Value>)>,
+) -> anyhow::Result<()> {
     let child_namespace = namespace_tool
         .get("name")
         .and_then(Value::as_str)
@@ -1269,7 +1326,7 @@ fn flatten_responses_namespace_children(
         .and_then(Value::as_array)
         .or_else(|| namespace_tool.get("children").and_then(Value::as_array));
     let Some(children) = children else {
-        return;
+        return Ok(());
     };
     for child in children {
         if child.get("type").and_then(Value::as_str) == Some("namespace") {
@@ -1279,7 +1336,8 @@ fn flatten_responses_namespace_children(
                 &namespace_description,
                 wire_tools,
                 namespace_tools,
-            );
+                occupied,
+            )?;
             continue;
         }
         let Some(name) = child
@@ -1290,11 +1348,18 @@ fn flatten_responses_namespace_children(
             continue;
         };
         let flat = flatten_namespace_tool_name(&namespace, name);
-        namespace_tools.insert(flat.clone(), (namespace.clone(), name.to_string()));
         if child.get("type").and_then(Value::as_str) != Some("function") {
             let mut wire_tool = child.clone();
             wire_tool["name"] = json!(flat);
-            wire_tools.push(wire_tool);
+            if check_flattened_tool_name(
+                occupied,
+                &flat,
+                (namespace.clone(), name.to_string()),
+                Some(wire_tool.clone()),
+            )? {
+                namespace_tools.insert(flat.clone(), (namespace.clone(), name.to_string()));
+                wire_tools.push(wire_tool);
+            }
             continue;
         }
         let description = combine_namespace_description(
@@ -1304,113 +1369,180 @@ fn flatten_responses_namespace_children(
                 .and_then(Value::as_str)
                 .unwrap_or(""),
         );
-        let mut wire_tool = json!({
-            "type": "function",
-            "name": flat,
-            "parameters": child
-                .get("parameters")
-                .cloned()
-                .unwrap_or_else(|| json!({})),
-        });
+        // R04：从子工具完整 clone 开始，只改 wire name/type 并按既有策略合并描述；
+        // strict、defer_loading、allowed_callers、async、output_schema 等显式字段
+        // 与未知字段全部保留，显式 false/null 不会被默认值覆盖。
+        let mut wire_tool = child.clone();
         if let Some(function) = child.get("function").and_then(Value::as_object) {
-            if let Some(parameters) = function.get("parameters") {
+            // 兼容嵌套 function 形状：仅回填顶层缺失的 parameters/strict（顶层显式值优先）。
+            if wire_tool.get("parameters").is_none()
+                && let Some(parameters) = function.get("parameters")
+            {
                 wire_tool["parameters"] = parameters.clone();
             }
-            if let Some(strict) = function.get("strict") {
+            if wire_tool.get("strict").is_none()
+                && let Some(strict) = function.get("strict")
+            {
                 wire_tool["strict"] = strict.clone();
             }
         }
+        wire_tool["type"] = json!("function");
+        wire_tool["name"] = json!(flat);
         if !description.is_empty() {
             wire_tool["description"] = json!(description);
         }
-        wire_tools.push(wire_tool);
-    }
-}
-
-fn flatten_responses_tool_namespaces(body: &mut Value) -> BTreeMap<String, (String, String)> {
-    let mut namespace_tools = BTreeMap::new();
-    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
-        flatten_responses_tool_namespace_value(body);
-        return namespace_tools;
-    };
-    let source_tools = std::mem::take(tools);
-    let mut wire_tools = Vec::with_capacity(source_tools.len());
-    for tool in source_tools {
-        if tool.get("type").and_then(Value::as_str) != Some("namespace") {
-            wire_tools.push(tool);
-            continue;
+        if check_flattened_tool_name(
+            occupied,
+            &flat,
+            (namespace.clone(), name.to_string()),
+            Some(wire_tool.clone()),
+        )? {
+            namespace_tools.insert(flat.clone(), (namespace.clone(), name.to_string()));
+            wire_tools.push(wire_tool);
         }
-        flatten_responses_namespace_children(&tool, "", "", &mut wire_tools, &mut namespace_tools);
     }
-    body["tools"] = Value::Array(wire_tools);
-    flatten_responses_tool_namespace_value(body);
-    namespace_tools
+    Ok(())
 }
 
-fn flatten_responses_tool_namespace_value(value: &mut Value) {
-    match value {
-        Value::Array(items) => items
-            .iter_mut()
-            .for_each(flatten_responses_tool_namespace_value),
-        Value::Object(object) => {
-            if matches!(
-                object.get("type").and_then(Value::as_str),
-                Some("function_call") | Some("custom_tool_call")
-            ) && object
-                .get("namespace")
-                .and_then(Value::as_str)
-                .is_some_and(|namespace| !namespace.trim().is_empty())
-            {
-                let namespace = object
-                    .get("namespace")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                let name = object
+fn flatten_responses_tool_namespaces(
+    body: &mut Value,
+) -> anyhow::Result<BTreeMap<String, (String, String)>> {
+    let mut namespace_tools = BTreeMap::new();
+    let mut occupied: BTreeMap<String, ((String, String), Option<Value>)> = BTreeMap::new();
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+        let source_tools = std::mem::take(tools);
+        let mut wire_tools = Vec::with_capacity(source_tools.len());
+        for mut tool in source_tools {
+            if tool.get("type").and_then(Value::as_str) != Some("namespace") {
+                // 顶层工具占用自身名字：完全重复的定义去重，同名不同义显式冲突。
+                let Some(name) = tool
                     .get("name")
                     .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                object.insert(
-                    "name".to_string(),
-                    json!(flatten_namespace_tool_name(&namespace, &name)),
-                );
-                object.remove("namespace");
+                    .filter(|value| !value.is_empty())
+                else {
+                    wire_tools.push(tool);
+                    continue;
+                };
+                let wire_name = name.to_string();
+                let identity = (String::new(), wire_name.clone());
+                if check_flattened_tool_name(
+                    &mut occupied,
+                    &wire_name,
+                    identity,
+                    Some(tool.clone()),
+                )? {
+                    wire_tools.push(tool);
+                }
+                continue;
             }
-            for (_, child) in object.iter_mut() {
-                flatten_responses_tool_namespace_value(child);
+            flatten_responses_namespace_children(
+                &tool,
+                "",
+                "",
+                &mut wire_tools,
+                &mut namespace_tools,
+                &mut occupied,
+            )?;
+        }
+        body["tools"] = Value::Array(wire_tools);
+    }
+    flatten_responses_input_item_namespaces(body);
+    Ok(namespace_tools)
+}
+
+/// R06：只对 input 中真实的调用 item 做扁平化。schema 示例、metadata、
+/// arguments/输出文本等业务 JSON 不是协议 item，不按 type 全树扫描。
+fn flatten_responses_input_item_namespaces(body: &mut Value) {
+    match body.get_mut("input") {
+        Some(Value::Array(items)) => {
+            for item in items.iter_mut() {
+                flatten_responses_tool_namespace_item(item);
             }
         }
+        Some(input) if input.is_object() => flatten_responses_tool_namespace_item(input),
         _ => {}
     }
 }
 
+fn flatten_responses_tool_namespace_item(item: &mut Value) {
+    if !matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("function_call") | Some("custom_tool_call")
+    ) {
+        return;
+    }
+    let Some(namespace) = item.get("namespace").and_then(Value::as_str) else {
+        return;
+    };
+    if namespace.trim().is_empty() {
+        return;
+    }
+    let name = item
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    item["name"] = json!(flatten_namespace_tool_name(namespace, &name));
+    if let Some(object) = item.as_object_mut() {
+        object.remove("namespace");
+    }
+}
+
+/// R06：恢复只作用于已识别的响应形状——根级调用 item（SSE output_item 事件）、
+/// 事件的 `item` 字段、`output` 数组、`response.completed` 的 `response.output`。
+/// 不再对任意 JSON 树递归，metadata/示例等业务数据保持原样。
 fn restore_responses_tool_namespaces(
     value: &mut Value,
     namespace_tools: &BTreeMap<String, (String, String)>,
 ) {
-    match value {
-        Value::Array(items) => items
-            .iter_mut()
-            .for_each(|item| restore_responses_tool_namespaces(item, namespace_tools)),
-        Value::Object(object) => {
-            if matches!(
-                object.get("type").and_then(Value::as_str),
-                Some("function_call") | Some("custom_tool_call")
-            ) && object.get("namespace").is_none()
-            {
-                if let Some(name) = object.get("name").and_then(Value::as_str) {
-                    if let Some((namespace, original_name)) = namespace_tools.get(name) {
-                        object.insert("namespace".to_string(), json!(namespace));
-                        object.insert("name".to_string(), json!(original_name));
+    let Value::Object(object) = value else {
+        return;
+    };
+    restore_responses_tool_namespace_item(object, namespace_tools);
+    if let Some(Value::Object(item)) = object.get_mut("item") {
+        restore_responses_tool_namespace_item(item, namespace_tools);
+    }
+    for container in ["output", "response"] {
+        match object.get_mut(container) {
+            Some(Value::Array(output)) => {
+                for item in output.iter_mut() {
+                    if let Some(item_object) = item.as_object_mut() {
+                        restore_responses_tool_namespace_item(item_object, namespace_tools);
                     }
                 }
             }
-            for (_, child) in object.iter_mut() {
-                restore_responses_tool_namespaces(child, namespace_tools);
+            Some(Value::Object(response)) => {
+                if let Some(Value::Array(output)) = response.get_mut("output") {
+                    for item in output.iter_mut() {
+                        if let Some(item_object) = item.as_object_mut() {
+                            restore_responses_tool_namespace_item(item_object, namespace_tools);
+                        }
+                    }
+                }
             }
+            _ => {}
         }
-        _ => {}
+    }
+}
+
+fn restore_responses_tool_namespace_item(
+    object: &mut serde_json::Map<String, Value>,
+    namespace_tools: &BTreeMap<String, (String, String)>,
+) {
+    if !matches!(
+        object.get("type").and_then(Value::as_str),
+        Some("function_call") | Some("custom_tool_call")
+    ) {
+        return;
+    }
+    if object.get("namespace").is_some() {
+        return;
+    }
+    if let Some(name) = object.get("name").and_then(Value::as_str) {
+        if let Some((namespace, original_name)) = namespace_tools.get(name) {
+            object.insert("namespace".to_string(), json!(namespace));
+            object.insert("name".to_string(), json!(original_name));
+        }
     }
 }
 
@@ -1418,6 +1550,10 @@ pub fn restore_responses_tool_namespace_json(
     bytes: &[u8],
     namespace_tools: &BTreeMap<String, (String, String)>,
 ) -> Vec<u8> {
+    // R10：没有映射时按原样透传，不做无谓的解析重排。
+    if namespace_tools.is_empty() {
+        return bytes.to_vec();
+    }
     let Ok(mut value) = serde_json::from_slice::<Value>(bytes) else {
         return bytes.to_vec();
     };
@@ -1462,10 +1598,44 @@ impl ResponsesNamespaceSseRewriter {
     }
 
     pub fn finish(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.buffer)
+        self.finish_with_truncation().0
+    }
+
+    /// R10 收尾：完整但缺少结尾空行的最后一帧按正常帧恢复；无法解析成完整
+    /// data JSON 的半帧丢弃并返回截断标记，避免未恢复的扁平名泄露给客户端。
+    pub fn finish_with_truncation(&mut self) -> (Vec<u8>, bool) {
+        let buffer = std::mem::take(&mut self.buffer);
+        if buffer.is_empty() {
+            return (Vec::new(), false);
+        }
+        let text = match std::str::from_utf8(&buffer) {
+            Ok(text) => text,
+            Err(_) => return (Vec::new(), true),
+        };
+        let data = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(|line| line.strip_prefix(' ').unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("
+");
+        if data.trim().is_empty() {
+            return (Vec::new(), true);
+        }
+        match serde_json::from_str::<Value>(&data) {
+            // 完整但未终止的帧：照常恢复后输出。
+            Ok(_) => (self.rewrite_frame(&buffer), false),
+            // 半帧：丢弃，明确报告截断。
+            Err(_) => (Vec::new(), true),
+        }
     }
 
     fn rewrite_frame(&self, frame: &[u8]) -> Vec<u8> {
+        // R10：没有 namespace 映射时不做任何改写，按原样透传，
+        // 不把每个 JSON frame 解析重排一遍。
+        if self.namespace_tools.is_empty() {
+            return frame.to_vec();
+        }
         let Ok(text) = std::str::from_utf8(frame) else {
             return frame.to_vec();
         };
@@ -2629,10 +2799,14 @@ fn normalize_custom_tool_call_item_id(item: &mut Value) {
     if id.starts_with("ctc_") {
         return;
     }
-    let suffix = id
+    // 只规范化已知跨适配器生成的 fc_/item_ 前缀；原生 ct_ 等其它 id 保持原样，
+    // 不被"统一风格"二次改写（R07）。
+    let Some(suffix) = id
         .strip_prefix("fc_")
         .or_else(|| id.strip_prefix("item_"))
-        .unwrap_or(id);
+    else {
+        return;
+    };
     item["id"] = json!(format!("ctc_{suffix}"));
 }
 
@@ -5332,7 +5506,7 @@ mod glm_additional_tools_tests {
                 {"type": "function_call", "namespace": "outer__inner", "name": "run", "call_id": "call", "arguments": "{}"}
             ]
         });
-        let map = flatten_responses_tool_namespaces(&mut body);
+        let map = flatten_responses_tool_namespaces(&mut body).unwrap();
         assert!(map.is_empty());
         assert_eq!(body["input"][0]["name"], "outer__inner__run");
         assert_eq!(body["input"][0].get("namespace"), None);
@@ -5346,7 +5520,7 @@ mod glm_additional_tools_tests {
                 }]
             }]
         });
-        let map = flatten_responses_tool_namespaces(&mut body);
+        let map = flatten_responses_tool_namespaces(&mut body).unwrap();
         assert_eq!(
             body["tools"],
             json!([{"type": "function", "name": "outer__inner__run", "parameters": {"type": "object"}}])
@@ -5558,13 +5732,16 @@ mod responses_reasoning_policy_tests {
                 {"type": "custom_tool_call", "id": "item_custom", "call_id": "call-2", "name": "exec", "input": "pwd"}
             ]
         });
+        // R07 统一规则：按生产管线顺序调用；custom_tool_call 只由专用规范化处理，
+        // item_ 前缀得到 ctc_，不再出现两套规则叠加的 ctc_ct_。
         normalize_responses_item_ids(&mut actual);
+        normalize_responses_custom_tool_call_ids(&mut actual);
         assert_eq!(
             actual["input"],
             json!([
                 {"type": "message", "id": "msg_message", "role": "user", "content": "before"},
                 {"type": "function_call", "id": "fc_function", "call_id": "call-1", "name": "lookup"},
-                {"type": "custom_tool_call", "id": "ct_custom", "call_id": "call-2", "name": "exec", "input": "pwd"}
+                {"type": "custom_tool_call", "id": "ctc_custom", "call_id": "call-2", "name": "exec", "input": "pwd"}
             ])
         );
     }
@@ -5803,3 +5980,207 @@ mod responses_reasoning_policy_tests {
         assert!(!serialized.contains("sk-"));
     }
 }
+
+/// 2026-09-16 审查回归测试（R04/R06/R07）。
+/// 这些测试断言修复后的契约；加入时先在未修复代码上跑红，作为修复前证据。
+#[cfg(test)]
+mod review_20260916_regression {
+    use super::*;
+
+    // T01 / R04：namespace 子工具重组时必须保留显式行为字段。
+    #[test]
+    fn review_namespace_function_preserves_explicit_fields() {
+        let mut body = json!({"tools": [{
+            "type": "namespace", "name": "fs", "description": "File operations", "tools": [{
+                "type": "function", "name": "inspect", "strict": false,
+                "defer_loading": true, "allowed_callers": ["direct"],
+                "async": false,
+                "output_schema": {"type": "object"},
+                "parameters": {"type": "object", "properties": {}},
+                "x_fixture_extension": {"keep": true}
+            }]
+        }]});
+        let map = flatten_responses_tool_namespaces(&mut body).unwrap();
+        let tool = &body["tools"][0];
+        assert_eq!(tool["name"], json!("fs__inspect"));
+        assert_eq!(tool["type"], json!("function"));
+        assert_eq!(tool.get("strict"), Some(&json!(false)), "顶层 strict 不能丢");
+        assert_eq!(tool.get("defer_loading"), Some(&json!(true)));
+        assert_eq!(tool["allowed_callers"], json!(["direct"]));
+        assert_eq!(tool.get("async"), Some(&json!(false)));
+        assert_eq!(tool["output_schema"], json!({"type": "object"}));
+        assert_eq!(
+            tool["x_fixture_extension"],
+            json!({"keep": true}),
+            "未知字段不能因转换器不认识就删除"
+        );
+        assert_eq!(
+            map.get("fs__inspect"),
+            Some(&("fs".to_string(), "inspect".to_string()))
+        );
+    }
+
+    // T06a / R06：schema 示例里的"调用样子"是业务数据，不能按 type 全树改写。
+    #[test]
+    fn review_schema_examples_are_not_protocol_items() {
+        let example = json!({
+            "type": "function_call", "namespace": "business",
+            "name": "record", "arguments": "{}"
+        });
+        let mut body = json!({"tools": [{
+            "type": "function", "name": "validate_document", "strict": false,
+            "parameters": {"type": "object", "examples": [example.clone()]}
+        }]});
+        let _map = flatten_responses_tool_namespaces(&mut body).unwrap();
+        assert_eq!(
+            body["tools"][0]["parameters"]["examples"][0],
+            example,
+            "parameters 中的示例数据必须逐字段保持原样"
+        );
+    }
+
+    // T06b / R06：JSON 响应里的 metadata 不是真实调用，恢复器不能改写。
+    #[test]
+    fn review_response_metadata_is_not_a_tool_call() {
+        let metadata = json!({
+            "fixture": {"type": "function_call", "name": "fs__inspect", "note": "data"}
+        });
+        let response = json!({
+            "metadata": metadata.clone(),
+            "output": [{
+                "type": "function_call", "name": "fs__inspect",
+                "call_id": "call_keep", "arguments": "{}"
+            }]
+        });
+        let map = BTreeMap::from([
+            ("fs__inspect".to_string(), ("fs".to_string(), "inspect".to_string()))
+        ]);
+        let restored: Value = serde_json::from_slice(&restore_responses_tool_namespace_json(
+            &serde_json::to_vec(&response).unwrap(),
+            &map,
+        ))
+        .unwrap();
+        assert_eq!(restored["output"][0]["namespace"], json!("fs"));
+        assert_eq!(restored["output"][0]["name"], json!("inspect"));
+        assert_eq!(restored["output"][0]["call_id"], json!("call_keep"));
+        assert_eq!(
+            restored["metadata"], metadata,
+            "metadata 里的同名 JSON 是数据，不能被恢复器改写"
+        );
+    }
+
+    // I01 / R07：custom_tool_call 的 item_ ID 只允许一条权威规范化规则，不能叠加出 ctc_ct_。
+    #[test]
+    fn review_custom_item_normalization_has_one_canonical_rule() {
+        let original = json!({"input": [{
+            "type": "custom_tool_call", "id": "item_demo",
+            "name": "exec", "call_id": "call_keep", "input": "echo fixture"
+        }]});
+        let mut body = original.clone();
+        normalize_responses_item_ids(&mut body);
+        normalize_responses_custom_tool_call_ids(&mut body);
+        assert_eq!(
+            body["input"][0]["id"],
+            json!("ctc_demo"),
+            "与既有专用规则保持一致：item_demo -> ctc_demo，不能变成 ctc_ct_demo"
+        );
+        assert_eq!(body["input"][0]["call_id"], json!("call_keep"));
+        let once = body.clone();
+        normalize_responses_item_ids(&mut body);
+        normalize_responses_custom_tool_call_ids(&mut body);
+        assert_eq!(body, once, "规范化必须幂等");
+        assert_eq!(
+            original["input"][0]["id"],
+            json!("item_demo"),
+            "原始输入不能被原地修改"
+        );
+    }
+
+    // I02 / R07：原生 ct_ id 与既有 ctc_ id 不被统一风格二次改写。
+    #[test]
+    fn review_native_and_canonical_custom_ids_stay_untouched() {
+        let mut body = json!({"input": [
+            {"type": "custom_tool_call", "id": "ct_native", "name": "exec", "input": "a"},
+            {"type": "custom_tool_call", "id": "ctc_canonical", "name": "exec", "input": "b"}
+        ]});
+        normalize_responses_item_ids(&mut body);
+        normalize_responses_custom_tool_call_ids(&mut body);
+        assert_eq!(body["input"][0]["id"], json!("ct_native"));
+        assert_eq!(body["input"][1]["id"], json!("ctc_canonical"));
+    }
+
+    // R08：passthrough 策略跳过全部结构改写，但模型别名仍按显式配置执行。
+    #[tokio::test]
+    async fn review_passthrough_policy_skips_structural_rewrites_but_keeps_alias() {
+        use crate::settings::{RelayModelAlias, ResponsesWirePolicy};
+        let request = json!({
+            "model": "logical-model",
+            "tools": [{
+                "type": "namespace", "name": "fs", "tools": [
+                    {"type": "function", "name": "inspect", "strict": false, "parameters": {"type": "object"}}
+                ]
+            }],
+            "input": [
+                {"type": "custom_tool_call", "id": "item_demo", "name": "exec", "call_id": "call_keep", "input": "pwd"},
+                {"type": "reasoning", "content": [{"type": "summary_text", "text": "keep-me"}]}
+            ]
+        });
+        let relay = crate::settings::RelayProfile {
+            base_url: "https://example.invalid/v1".to_string(),
+            model_aliases: vec![RelayModelAlias {
+                alias: "logical-model".to_string(),
+                model: "physical-model".to_string(),
+            }],
+            responses_wire_policy: ResponsesWirePolicy::Passthrough,
+            responses_reasoning_policy: ResponsesReasoningPolicy::Strip,
+            ..Default::default()
+        };
+        let (endpoint, wire, wire_api, namespace_tools) =
+            upstream_request_parts(&relay, request, "/responses").await.unwrap();
+        assert!(matches!(wire_api, UpstreamWireApi::Responses));
+        assert_eq!(
+            endpoint, "https://example.invalid/v1/responses",
+            "别名解析与 URL 组装不受透传策略影响"
+        );
+        assert!(
+            namespace_tools.is_empty(),
+            "透传策略下不执行 namespace 扁平化"
+        );
+        assert_eq!(
+            wire["tools"][0]["type"], json!("namespace"),
+            "namespace 声明按原样透传"
+        );
+        assert_eq!(wire["tools"][0]["tools"][0]["name"], json!("inspect"));
+        assert_eq!(
+            wire["input"][0]["id"], json!("item_demo"),
+            "透传策略下不做 item ID 规范化"
+        );
+        assert_eq!(
+            wire["model"], json!("physical-model"),
+            "模型别名仍按显式配置执行"
+        );
+        let reasoning = &wire["input"][1];
+        assert_eq!(
+            reasoning["content"][0]["text"], json!("keep-me"),
+            "透传策略下 reasoning 不做有损清理"
+        );
+    }
+
+    // T12 / R04+R05：同一转换执行两次必须幂等：不重复加前缀、不重复追加工具。
+    #[test]
+    fn review_tool_flattening_is_idempotent() {
+        let mut body = json!({"tools": [{
+            "type": "namespace", "name": "fs", "tools": [
+                {"type": "function", "name": "inspect", "strict": false, "parameters": {"type": "object"}}
+            ]
+        }]});
+        let map_once = flatten_responses_tool_namespaces(&mut body).unwrap();
+        let once = body.clone();
+        let map_twice = flatten_responses_tool_namespaces(&mut body).unwrap();
+        assert_eq!(body, once, "重复扁平化不能改变结果（无重复前缀/重复工具）");
+        // 已扁平化的请求里不再有 namespace 声明，恢复映射为空是正确语义：
+        // 恢复关系只对同一次编码生成的扁平名成立。
+        assert!(map_twice.is_empty());
+    }
+}
+
