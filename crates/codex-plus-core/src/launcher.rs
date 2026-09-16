@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -1632,27 +1632,85 @@ async fn handle_protocol_proxy_connection(
                 upstream.namespace_tools.clone(),
             );
             let mut bytes_stream = upstream.response.bytes_stream();
+            // R10：上游读取错误必须区分于正常完成；不再"出错就 break，随后记 stream_ok"。
+            let mut stream_error: Option<String> = None;
             while let Some(chunk) = bytes_stream.next().await {
-                if let Ok(bytes) = chunk {
-                    let bytes = namespace_agents.push_bytes(&bytes);
-                    let bytes = if let Some(rewriter) = &mut native_agents {
-                        rewriter.push_bytes(&bytes)
-                    } else {
-                        bytes
-                    };
-                    stream.write_all(&bytes).await?;
-                } else {
-                    break;
+                match chunk {
+                    Ok(bytes) => {
+                        let bytes = namespace_agents.push_bytes(&bytes);
+                        let bytes = if let Some(rewriter) = &mut native_agents {
+                            rewriter.push_bytes(&bytes)
+                        } else {
+                            bytes
+                        };
+                        if !bytes.is_empty() {
+                            stream.write_all(&bytes).await?;
+                        }
+                    }
+                    Err(error) => {
+                        stream_error = Some(error.to_string());
+                        break;
+                    }
                 }
             }
-            let namespace_tail = namespace_agents.finish();
-            let tail = if let Some(rewriter) = &mut native_agents {
+            let (namespace_tail, namespace_truncated) = namespace_agents.finish_with_truncation();
+            let (tail, native_truncated) = if let Some(rewriter) = &mut native_agents {
                 let mut tail = rewriter.push_bytes(&namespace_tail);
-                tail.extend(rewriter.finish());
-                tail
+                let (native_tail, truncated) = rewriter.finish_with_truncation();
+                tail.extend(native_tail);
+                (tail, truncated)
             } else {
-                namespace_tail
+                (namespace_tail, false)
             };
+            if let Some(error) = stream_error {
+                // 上游错误：不发伪造的成功结束，不记 stream_ok，丢弃不完整的半帧。
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "helper.protocol_proxy_stream_failed",
+                    json!({
+                        "method": method,
+                        "path": path,
+                        "streamState": "upstream_error",
+                        "error": error
+                    }),
+                );
+                stream
+                    .write_all(b": codex-plus proxy: upstream stream error\r\n\r\n")
+                    .await?;
+                stream.flush().await?;
+                log_helper_response(
+                    "helper.protocol_proxy_stream_failed",
+                    method,
+                    path,
+                    "200 OK (upstream error)",
+                    remote_addr_text,
+                );
+                stream.shutdown().await?;
+                return Ok(());
+            }
+            if native_truncated || namespace_truncated {
+                // EOF 处半帧：丢弃并明确报告截断，不把截断当成正常完成。
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "helper.protocol_proxy_stream_failed",
+                    json!({
+                        "method": method,
+                        "path": path,
+                        "streamState": "truncated"
+                    }),
+                );
+                stream
+                    .write_all(b": codex-plus proxy: upstream stream truncated\r\n\r\n")
+                    .await?;
+                stream.flush().await?;
+                log_helper_response(
+                    "helper.protocol_proxy_stream_failed",
+                    method,
+                    path,
+                    "200 OK (truncated)",
+                    remote_addr_text,
+                );
+                stream.shutdown().await?;
+                return Ok(());
+            }
             stream.write_all(&tail).await?;
             log_helper_response(
                 "helper.protocol_proxy_stream_ok",

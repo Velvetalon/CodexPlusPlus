@@ -171,7 +171,33 @@ impl NativeAgentSseRewriter {
     }
 
     pub(crate) fn finish(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.buffer)
+        self.finish_with_truncation().0
+    }
+
+    /// R10 收尾：完整但缺少结尾空行的最后一帧照常恢复；无法解析的半帧丢弃
+    /// 并返回截断标记，避免未恢复的 wire 命名泄露给客户端。
+    pub(crate) fn finish_with_truncation(&mut self) -> (Vec<u8>, bool) {
+        let buffer = std::mem::take(&mut self.buffer);
+        if buffer.is_empty() {
+            return (Vec::new(), false);
+        }
+        let text = match std::str::from_utf8(&buffer) {
+            Ok(text) => text,
+            Err(_) => return (Vec::new(), true),
+        };
+        let data = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(|line| line.strip_prefix(' ').unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if data.trim().is_empty() {
+            return (Vec::new(), true);
+        }
+        match serde_json::from_str::<Value>(&data) {
+            Ok(_) => (rewrite_frame(&buffer), false),
+            Err(_) => (Vec::new(), true),
+        }
     }
 }
 
