@@ -4535,3 +4535,550 @@ content-type: text/event-stream
     assert_eq!(wire_tools[0]["type"], "function");
     assert_eq!(wire_tools[0]["parameters"]["properties"]["input"]["type"], "string");
 }
+
+// ===========================================================================
+// 受控 live A/B（默认 #[ignore]；CI 保持 mock）。显式提供隔离设置后手工运行：
+//   cargo test -p codex-plus-core --test protocol_proxy live_ab_ -- --ignored --nocapture
+// 环境变量：
+//   CODEXPLUS_AB_SETTINGS   隔离 settings 模板路径（含唯一候选与凭据引用）
+//   CODEXPLUS_AB_OUTPUT     脱敏报告输出目录
+//   CODEXPLUS_AB_MODELS     逗号分隔的最终模型 ID（默认 coding-glm-5.3-flash）
+//   CODEXPLUS_AB_TRIALS     每模型每组配对试验数（默认 3：1 非流式 + 2 流式）
+//   CODEXPLUS_AB_MAX_REQUESTS 总请求预算上限（默认 32，触顶即停）
+// 固定同一上游入口、同一凭据引用、同一模型 ID，只改变 customToolsAsFunctions。
+// ===========================================================================
+
+struct AbRecord {
+    run_id: String,
+    model: String,
+    arm: &'static str,
+    custom_tools_as_functions: bool,
+    stream: bool,
+    stage: &'static str,
+    http_status: Option<u16>,
+    upstream_call_type: Option<String>,
+    client_call_type: Option<String>,
+    input_exact_match: Option<bool>,
+    call_id: String,
+    tool_executed: bool,
+    result_nonce: Option<String>,
+    nonce_returned: Option<bool>,
+    latency_ms: u128,
+    usage: Option<serde_json::Value>,
+    result: &'static str,
+    note: String,
+}
+
+impl AbRecord {
+    fn to_json(&self) -> serde_json::Value {
+        json!({
+            "runId": self.run_id,
+            "model": self.model,
+            "arm": self.arm,
+            "customToolsAsFunctions": self.custom_tools_as_functions,
+            "stream": self.stream,
+            "stage": self.stage,
+            "httpStatus": self.http_status,
+            "upstreamCallType": self.upstream_call_type,
+            "clientCallType": self.client_call_type,
+            "inputExactMatch": self.input_exact_match,
+            "callId": self.call_id,
+            "toolExecuted": self.tool_executed,
+            "resultNonce": self.result_nonce,
+            "resultNonceReturned": self.nonce_returned,
+            "latencyMs": self.latency_ms,
+            "usage": self.usage,
+            "result": self.result,
+            "note": self.note,
+        })
+    }
+}
+
+fn ab_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.trim().is_empty())
+}
+
+fn ab_parse_sse_calls(text: &str) -> (Option<serde_json::Value>, Option<serde_json::Value>, Option<serde_json::Value>) {
+    // 返回（最后一个 custom_tool_call done item、function_call done item、usage）
+    let mut custom_item = None;
+    let mut function_item = None;
+    let mut usage = None;
+    for frame in text.split("\n\n") {
+        let Some(data_line) = frame.lines().find_map(|l| l.strip_prefix("data: ")) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(data_line) else {
+            continue;
+        };
+        if value.get("type").and_then(serde_json::Value::as_str) == Some("response.completed") {
+            usage = value.pointer("/response/usage").cloned();
+        }
+        if value.get("type").and_then(serde_json::Value::as_str) == Some("response.output_item.done") {
+            let item = value.get("item").cloned().unwrap_or(serde_json::Value::Null);
+            match item.get("type").and_then(serde_json::Value::as_str) {
+                Some("custom_tool_call") => custom_item = Some(item),
+                Some("function_call") => function_item = Some(item),
+                _ => {}
+            }
+        }
+    }
+    (custom_item, function_item, usage)
+}
+
+fn ab_json_calls(body: &serde_json::Value) -> (Option<serde_json::Value>, Option<serde_json::Value>, Option<serde_json::Value>) {
+    let mut custom_item = None;
+    let mut function_item = None;
+    if let Some(items) = body.get("output").and_then(serde_json::Value::as_array) {
+        for item in items {
+            match item.get("type").and_then(serde_json::Value::as_str) {
+                Some("custom_tool_call") => custom_item = Some(item.clone()),
+                Some("function_call") => function_item = Some(item.clone()),
+                _ => {}
+            }
+        }
+    }
+    (custom_item, function_item, body.get("usage").cloned())
+}
+
+#[tokio::test]
+#[ignore = "live A/B：消耗真实上游额度，需显式提供 CODEXPLUS_AB_SETTINGS"]
+async fn live_ab_custom_tools_as_functions_via_production_proxy() {
+    let Some(settings_template) = ab_env("CODEXPLUS_AB_SETTINGS") else {
+        panic!("缺少 CODEXPLUS_AB_SETTINGS（隔离设置模板路径）");
+    };
+    let output_dir = ab_env("CODEXPLUS_AB_OUTPUT")
+        .unwrap_or_else(|| ".review-local/ab/results".to_string());
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let models: Vec<String> = ab_env("CODEXPLUS_AB_MODELS")
+        .unwrap_or_else(|| "coding-glm-5.3-flash".to_string())
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .collect();
+    let trials: usize = ab_env("CODEXPLUS_AB_TRIALS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3)
+        .clamp(1, 3);
+    let max_requests: usize = ab_env("CODEXPLUS_AB_MAX_REQUESTS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32);
+
+    let template: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings_template).unwrap()).unwrap();
+    let vectors = [
+        "echo round-trip-ok".to_string(),
+        "line1\nline2 中文 🧪 保留原样".to_string(),
+        "C:\\temp\\a b.txt \"引号\"".to_string(),
+    ];
+
+    let mut records: Vec<AbRecord> = Vec::new();
+    let mut budget = 0usize;
+    let run_id = format!(
+        "ab-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
+
+    'models: for (model_index, model) in models.iter().enumerate() {
+        let trial_count = if model_index == 0 { trials } else { 1 };
+        for trial in 0..trial_count {
+            let stream = trial != 0; // 1 非流式 + 其余流式
+            let vector = &vectors[trial % vectors.len()];
+            // AB / BA 交替，减少时间顺序偏差。
+            let arms: &[(&str, bool)] = if trial % 2 == 0 {
+                &[("A", false), ("B", true)]
+            } else {
+                &[("B", true), ("A", false)]
+            };
+
+            let mut nonce = String::new();
+            let mut round1_items: Vec<serde_json::Value> = Vec::new();
+            let mut replay_done = true;
+
+            for (arm_name, flag) in arms {
+                if budget + 2 > max_requests {
+                    records.push(AbRecord {
+                        run_id: run_id.clone(),
+                        model: model.clone(),
+                        arm: arm_name,
+                        custom_tools_as_functions: *flag,
+                        stream,
+                        stage: "budget",
+                        http_status: None,
+                        upstream_call_type: None,
+                        client_call_type: None,
+                        input_exact_match: None,
+                        call_id: String::new(),
+                        tool_executed: false,
+                        result_nonce: None,
+                        nonce_returned: None,
+                        latency_ms: 0,
+                        usage: None,
+                        result: "BLOCKED",
+                        note: format!("触达请求预算上限 {max_requests}"),
+                    });
+                    break 'models;
+                }
+
+                // Round 1：首次请求。
+                let mut settings: BackendSettings =
+                    serde_json::from_value(template.clone()).unwrap();
+                settings.active_relay_id = settings.relay_profiles[0].id.clone();
+                settings.relay_profiles[0].custom_tools_as_functions = *flag;
+                settings.relay_profiles[0].base_url = settings.relay_profiles[0]
+                    .upstream_base_url
+                    .clone();
+                settings.relay_profiles[0].model = model.clone();
+                let arm_file = std::env::temp_dir().join(format!(
+                    "codexplus-ab-{}-{}-{}.json",
+                    run_id, model_index, arm_name
+                ));
+                std::fs::write(&arm_file, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+                let _guard = SettingsPathGuard::set(arm_file.clone());
+
+                let request = json!({
+                    "model": model,
+                    "stream": stream,
+                    "tool_choice": "auto",
+                    "max_output_tokens": 4096,
+                    "tools": [
+                        {
+                            "type": "custom", "name": "review_echo",
+                            "description": "Echo exact input; this is a safe transport test tool, not a shell.",
+                            "format": { "type": "text" }
+                        },
+                        {
+                            "type": "function", "name": "review_wait",
+                            "description": "A normal function control tool. Always returns ok.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": { "token": { "type": "string" } },
+                                "required": ["token"],
+                                "additionalProperties": false
+                            },
+                            "strict": false
+                        }
+                    ],
+                    "input": [
+                        {
+                            "role": "user",
+                            "content": format!(
+                                "This is a transport compatibility test. Call review_echo exactly once using this exact input string:\n{vector}\nDo not answer with a tool list or imitate a tool result in plain text."
+                            )
+                        }
+                    ]
+                });
+
+                budget += 1;
+                let started = std::time::Instant::now();
+                let response = tokio::time::timeout(
+                    Duration::from_secs(90),
+                    codex_plus_core::protocol_proxy::handle_responses_proxy_request(
+                        &request.to_string(),
+                    ),
+                )
+                .await;
+                let latency = started.elapsed().as_millis();
+                let response = match response {
+                    Ok(Ok(response)) => response,
+                    Ok(Err(error)) => {
+                        let message = error.to_string();
+                        let result = if message.contains("401")
+                            || message.contains("403")
+                            || message.contains("402")
+                        {
+                            "BLOCKED"
+                        } else {
+                            "FAIL"
+                        };
+                        records.push(AbRecord {
+                            run_id: run_id.clone(),
+                            model: model.clone(),
+                            arm: arm_name,
+                            custom_tools_as_functions: *flag,
+                            stream,
+                            stage: "round1",
+                            http_status: None,
+                            upstream_call_type: None,
+                            client_call_type: None,
+                            input_exact_match: None,
+                            call_id: String::new(),
+                            tool_executed: false,
+                            result_nonce: None,
+                            nonce_returned: None,
+                            latency_ms: latency,
+                            usage: None,
+                            result,
+                            note: format!("round1 error: {message}"),
+                        });
+                        replay_done = false;
+                        continue;
+                    }
+                    Err(_) => {
+                        records.push(AbRecord {
+                            run_id: run_id.clone(),
+                            model: model.clone(),
+                            arm: arm_name,
+                            custom_tools_as_functions: *flag,
+                            stream,
+                            stage: "round1",
+                            http_status: None,
+                            upstream_call_type: None,
+                            client_call_type: None,
+                            input_exact_match: None,
+                            call_id: String::new(),
+                            tool_executed: false,
+                            result_nonce: None,
+                            nonce_returned: None,
+                            latency_ms: latency,
+                            usage: None,
+                            result: "FAIL",
+                            note: "round1 超时（90s）".to_string(),
+                        });
+                        replay_done = false;
+                        continue;
+                    }
+                };
+                if !response.status.starts_with("2") {
+                    records.push(AbRecord {
+                        run_id: run_id.clone(),
+                        model: model.clone(),
+                        arm: arm_name,
+                        custom_tools_as_functions: *flag,
+                        stream,
+                        stage: "round1",
+                        http_status: None,
+                        upstream_call_type: None,
+                        client_call_type: None,
+                        input_exact_match: None,
+                        call_id: String::new(),
+                        tool_executed: false,
+                        result_nonce: None,
+                        nonce_returned: None,
+                        latency_ms: latency,
+                        usage: None,
+                        result: "FAIL",
+                        note: format!("round1 http {}", response.status),
+                    });
+                    replay_done = false;
+                    continue;
+                }
+
+                let (call_item, function_item, usage) = if stream {
+                    let text = String::from_utf8_lossy(&response.body);
+                    let (custom, function, usage) = ab_parse_sse_calls(&text);
+                    (custom, function, usage)
+                } else {
+                    let body: serde_json::Value = serde_json::from_slice(&response.body)
+                        .unwrap_or(serde_json::Value::Null);
+                    ab_json_calls(&body)
+                };
+
+                let Some(item) = call_item.clone().or(function_item.clone()) else {
+                    records.push(AbRecord {
+                        run_id: run_id.clone(),
+                        model: model.clone(),
+                        arm: arm_name,
+                        custom_tools_as_functions: *flag,
+                        stream,
+                        stage: "round1",
+                        http_status: Some(200),
+                        upstream_call_type: None,
+                        client_call_type: None,
+                        input_exact_match: None,
+                        call_id: String::new(),
+                        tool_executed: false,
+                        result_nonce: None,
+                        nonce_returned: None,
+                        latency_ms: latency,
+                        usage,
+                        result: "FAIL",
+                        note: "上游没有产生任何工具调用（可能只回了文本）".to_string(),
+                    });
+                    replay_done = false;
+                    continue;
+                };
+
+                let call_type = item.get("type").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+                let call_id = item
+                    .get("call_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let input = item.get("input").and_then(serde_json::Value::as_str).unwrap_or_default();
+                let exact = call_type == "custom_tool_call" && input == vector.as_str();
+
+                // synthetic 执行器：只做字符串验收，不触 shell。
+                nonce = format!(
+                    "nonce-{:08x}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .subsec_nanos()
+                );
+                let result_payload = json!({
+                    "runId": run_id,
+                    "inputSha256": format!("{:x}", {
+                        use std::hash::{{Hash, Hasher}};
+                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                        input.hash(&mut hasher);
+                        hasher.finish()
+                    }),
+                    "resultNonce": nonce,
+                });
+
+                records.push(AbRecord {
+                    run_id: run_id.clone(),
+                    model: model.clone(),
+                    arm: arm_name,
+                    custom_tools_as_functions: *flag,
+                    stream,
+                    stage: "round1",
+                    http_status: Some(200),
+                    upstream_call_type: Some(call_type.clone()),
+                    client_call_type: Some(call_type.clone()),
+                    input_exact_match: Some(exact),
+                    call_id: call_id.clone(),
+                    tool_executed: true,
+                    result_nonce: Some(nonce.clone()),
+                    nonce_returned: None,
+                    latency_ms: latency,
+                    usage,
+                    result: if exact { "PASS" } else { "FAIL" },
+                    note: if exact {
+                        String::new()
+                    } else {
+                        format!("input 不匹配（期待 {vector} 字符数 {}，实际 {}）", vector.chars().count(), input.chars().count())
+                    },
+                });
+
+                round1_items = request["input"].as_array().cloned().unwrap_or_default();
+                round1_items.push(if call_type == "custom_tool_call" {
+                    json!({
+                        "type": "custom_tool_call", "id": item.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                        "call_id": call_id, "name": item.get("name").cloned().unwrap_or(serde_json::Value::Null),
+                        "input": input, "status": "completed"
+                    })
+                } else {
+                    json!({
+                        "type": "function_call", "id": item.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                        "call_id": call_id, "name": item.get("name").cloned().unwrap_or(serde_json::Value::Null),
+                        "arguments": item.get("arguments").cloned().unwrap_or(serde_json::Value::Null),
+                        "status": "completed"
+                    })
+                });
+                round1_items.push(json!({
+                    "type": "custom_tool_call_output", "call_id": call_id,
+                    "output": result_payload.to_string()
+                }));
+
+                if budget >= max_requests {
+                    replay_done = false;
+                    continue;
+                }
+
+                // Round 2：工具结果回放（固定非流式， canonical 历史）。
+                let replay = json!({
+                    "model": model,
+                    "stream": false,
+                    "tool_choice": "auto",
+                    "max_output_tokens": 4096,
+                    "tools": request["tools"].clone(),
+                    "input": {
+                        "array": round1_items,
+                    }
+                });
+                let mut replay_input = replay.clone();
+                replay_input["input"] = json!(round1_items.clone());
+                replay_input["input"].as_array_mut().unwrap().push(json!({
+                    "role": "user",
+                    "content": "The tool result is available now. Reply with exactly the resultNonce value and nothing else."
+                }));
+
+                budget += 1;
+                let started = std::time::Instant::now();
+                let replay_response = tokio::time::timeout(
+                    Duration::from_secs(90),
+                    codex_plus_core::protocol_proxy::handle_responses_proxy_request(
+                        &replay_input.to_string(),
+                    ),
+                )
+                .await;
+                let latency = started.elapsed().as_millis();
+                let nonce_returned = match replay_response {
+                    Ok(Ok(response)) => {
+                        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap_or(serde_json::Value::Null);
+                        let text = body["output"]
+                            .as_array()
+                            .unwrap_or(&Vec::new())
+                            .iter()
+                            .filter_map(|item| {
+                                item.pointer("/content/0/text").and_then(serde_json::Value::as_str)
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        text.contains(&nonce)
+                    }
+                    _ => false,
+                };
+                records.push(AbRecord {
+                    run_id: run_id.clone(),
+                    model: model.clone(),
+                    arm: arm_name,
+                    custom_tools_as_functions: *flag,
+                    stream: false,
+                    stage: "round2_replay",
+                    http_status: Some(200),
+                    upstream_call_type: None,
+                    client_call_type: None,
+                    input_exact_match: None,
+                    call_id,
+                    tool_executed: true,
+                    result_nonce: Some(nonce.clone()),
+                    nonce_returned: Some(nonce_returned),
+                    latency_ms: latency,
+                    usage: None,
+                    result: if nonce_returned { "PASS" } else { "FAIL" },
+                    note: if nonce_returned {
+                        String::new()
+                    } else {
+                        "模型未能消费工具结果中的 resultNonce".to_string()
+                    },
+                });
+            }
+            let _ = replay_done;
+        }
+    }
+
+    // 输出 JSONL 与汇总。
+    let jsonl_path = std::env::temp_dir().join(format!("codexplus-ab-{run_id}.jsonl"));
+    let mut jsonl = String::new();
+    let mut summary = json!({
+        "runId": run_id,
+        "budgetUsed": budget,
+        "budgetCap": max_requests,
+        "trialsPerModel": trials,
+        "models": models,
+        "records": []
+    });
+    for record in &records {
+        jsonl.push_str(&record.to_json().to_string());
+        jsonl.push('\n');
+    }
+    summary["records"] = json!(records.iter().map(|r| r.to_json()).collect::<Vec<_>>());
+    std::fs::write(&jsonl_path, jsonl).unwrap();
+    let summary_path = std::path::Path::new(&output_dir).join("ab-summary.json");
+    std::fs::write(&summary_path, serde_json::to_vec_pretty(&summary).unwrap()).unwrap();
+    println!("AB summary -> {}", summary_path.display());
+    println!("AB jsonl -> {}", jsonl_path.display());
+    for record in &records {
+        println!(
+            "[AB] {} model={} arm={} stream={} stage={} result={} note={}",
+            record.run_id, record.model, record.arm, record.stream, record.stage, record.result, record.note
+        );
+    }
+    // 测试本身不因业务失败而失败：证据以报告为准（§14.9 允许多种结论）。
+}
