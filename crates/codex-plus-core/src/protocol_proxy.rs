@@ -60,6 +60,9 @@ struct CodexCustomToolSpec {
     openai_name: String,
     kind: CodexCustomToolKind,
     proxy_action: Option<CodexPatchProxyAction>,
+    /// 客户端 namespace（顶层 custom 为空）。Custom-as-Function 适配合并的
+    /// namespace 工具用它把 custom_tool_call 还原回带 namespace 的客户端视图。
+    namespace: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -112,6 +115,34 @@ impl CodexToolContext {
             .get(upstream_name)
             .map(|spec| spec.openai_name.clone())
             .unwrap_or_else(|| upstream_name.to_string())
+    }
+
+    /// 受管 custom 工具的客户端身份（原名, namespace）。仅供
+    /// Custom-as-Function 适配合并进来的 namespace custom 使用。
+    fn custom_tool_namespace(&self, upstream_name: &str) -> String {
+        self.custom_tools
+            .get(upstream_name)
+            .map(|spec| spec.namespace.clone())
+            .unwrap_or_default()
+    }
+
+    /// 把 Custom-as-Function 适配计划的 wire 名登记进上下文。
+    /// 已存在的条目（例如 apply_patch 代理名）不被覆盖，保持既有行为。
+    fn merge_custom_adapter_plan(
+        &mut self,
+        plan: &crate::custom_tool_adapter::CustomToolAdapterPlan,
+    ) {
+        for (wire_name, identity) in plan.entries() {
+            self.custom_tools.entry(wire_name.clone()).or_insert_with(|| CodexCustomToolSpec {
+                openai_name: identity.client_name.clone(),
+                kind: CodexCustomToolKind::Raw,
+                proxy_action: None,
+                namespace: identity.namespace.clone(),
+            });
+        }
+        if !plan.is_empty() {
+            self.has_custom_tools = true;
+        }
     }
 
     fn openai_name_for_function_tool(&self, upstream_name: &str) -> (String, String) {
@@ -231,7 +262,18 @@ pub fn chat_completion_to_response_with_request(
     body: Value,
     original_request: &Value,
 ) -> anyhow::Result<Value> {
-    let context = build_codex_tool_context(original_request.get("tools"));
+    chat_completion_to_response_with_request_plan(body, original_request, None)
+}
+
+pub fn chat_completion_to_response_with_request_plan(
+    body: Value,
+    original_request: &Value,
+    custom_adapter: Option<&crate::custom_tool_adapter::CustomToolAdapterPlan>,
+) -> anyhow::Result<Value> {
+    let mut context = build_codex_tool_context(original_request.get("tools"));
+    if let Some(plan) = custom_adapter {
+        context.merge_custom_adapter_plan(plan);
+    }
     chat_completion_to_response_with_context(body, &context, Some(original_request))
 }
 
@@ -282,6 +324,7 @@ fn chat_completion_to_response_with_context(
     Ok(response)
 }
 
+#[derive(Debug)]
 pub struct ProxyHttpResponse {
     pub status: String,
     pub content_type: String,
@@ -295,6 +338,8 @@ pub struct UpstreamProxyResponse {
     pub wire_api: UpstreamWireApi,
     pub native_agent_plaintext: bool,
     pub namespace_tools: BTreeMap<String, (String, String)>,
+    /// 请求级 Custom-as-Function 适配计划；开关关闭时为 None，所有响应路径退回既有行为。
+    pub custom_adapter: Option<crate::custom_tool_adapter::CustomToolAdapterPlan>,
     pub response: reqwest::Response,
 }
 
@@ -383,8 +428,15 @@ impl Default for ChatSseToResponsesConverter {
 
 impl ChatSseToResponsesConverter {
     pub fn with_request(original_request: &Value) -> Self {
+        Self::with_request_plan(original_request, None)
+    }
+
+    pub fn with_request_plan(
+        original_request: &Value,
+        custom_adapter: Option<&crate::custom_tool_adapter::CustomToolAdapterPlan>,
+    ) -> Self {
         Self {
-            state: ChatSseState::with_request(original_request),
+            state: ChatSseState::with_request_plan(original_request, custom_adapter),
             ..Self::default()
         }
     }
@@ -612,7 +664,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             == crate::settings::ResponsesWirePolicy::Compatible
             && crate::native_agents::interop_enabled(&relay)
             && crate::native_agents::prepare_request(&mut attempt_body);
-        let (endpoint, upstream_body, wire_api, namespace_tools) =
+        let (endpoint, upstream_body, wire_api, namespace_tools, custom_adapter) =
             upstream_request_parts(&relay, attempt_body, request_path).await?;
         let has_more_candidates = attempt + 1 < relay_count;
         let header_timeout = response_header_timeout(is_stream);
@@ -725,6 +777,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 wire_api,
                 native_agent_plaintext,
                 namespace_tools,
+                custom_adapter,
                 response: upstream,
             });
         }
@@ -850,6 +903,7 @@ pub async fn open_models_proxy_request(
         wire_api: UpstreamWireApi::Responses,
         native_agent_plaintext: false,
         namespace_tools: BTreeMap::new(),
+        custom_adapter: None,
         response: upstream,
     })
 }
@@ -901,6 +955,7 @@ pub async fn open_audio_transcriptions_proxy_request(
         wire_api: UpstreamWireApi::AudioTranscriptions,
         native_agent_plaintext: false,
         namespace_tools: BTreeMap::new(),
+        custom_adapter: None,
         response: upstream,
     })
 }
@@ -957,24 +1012,62 @@ pub async fn open_chat_completions_proxy_request(
         wire_api: UpstreamWireApi::ChatCompletions,
         native_agent_plaintext: false,
         namespace_tools: BTreeMap::new(),
+        custom_adapter: None,
         response: upstream,
     })
 }
 
 async fn upstream_request_parts(
     relay: &crate::settings::RelayProfile,
-    request_json: Value,
+    mut request_json: Value,
     request_path: &str,
 ) -> anyhow::Result<(
     String,
     Value,
     UpstreamWireApi,
     BTreeMap<String, (String, String)>,
+    Option<crate::custom_tool_adapter::CustomToolAdapterPlan>,
 )> {
     let compact = is_responses_compact_proxy_path(request_path);
     if compact && relay.protocol == RelayProtocol::ChatCompletions {
         anyhow::bail!("Chat Completions 协议暂不支持 Responses compact 请求");
     }
+
+    // Custom-as-Function 开关（默认关闭）：按候选 profile 冻结适配计划。
+    // passthrough 组合是显式配置冲突，发送前报错而不是静默忽略。
+    let mut custom_adapter = None;
+    if relay.custom_tools_as_functions {
+        if relay.protocol == RelayProtocol::Responses
+            && relay.responses_wire_policy == crate::settings::ResponsesWirePolicy::Passthrough
+        {
+            return Err(crate::custom_tool_adapter::AdapterError::new(
+                crate::custom_tool_adapter::AdapterErrorCode::PolicyConflict,
+                "「Custom 工具转 Function」与 Responses 结构透传（passthrough）互斥；请关闭其中一项",
+            )
+            .into());
+        }
+        match relay.protocol {
+            RelayProtocol::ChatCompletions => {
+                let plan = crate::custom_tool_adapter::chat_plan_for_namespace_customs(
+                    request_json.get("tools"),
+                );
+                if !plan.is_empty() {
+                    hoist_namespace_custom_tools_for_chat(&mut request_json, &plan);
+                    custom_adapter = Some(plan);
+                }
+            }
+            RelayProtocol::Responses => {
+                if crate::custom_tool_adapter::has_unsupported_state_reference(&request_json) {
+                    return Err(crate::custom_tool_adapter::AdapterError::new(
+                        crate::custom_tool_adapter::AdapterErrorCode::StateReferenceUnsupported,
+                        "请求依赖服务端保存的会话状态（previous_response_id/conversation/item_reference），Custom-as-Function 适配要求完整内联历史",
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+
     let mut body = match relay.protocol {
         RelayProtocol::Responses => request_json,
         RelayProtocol::ChatCompletions => responses_to_chat_completions(request_json)?,
@@ -1008,6 +1101,12 @@ async fn upstream_request_parts(
         normalize_responses_additional_tools(&mut body);
         namespace_tools = flatten_responses_tool_namespaces(&mut body)?;
         normalize_responses_custom_tool_call_ids(&mut body);
+        if relay.custom_tools_as_functions {
+            let plan = crate::custom_tool_adapter::encode_request(&mut body, &namespace_tools)?;
+            if !plan.is_empty() {
+                custom_adapter = Some(plan);
+            }
+        }
     }
 
     // Image handling (per-model): send-as-is / strip / VLM analysis
@@ -1077,6 +1176,7 @@ async fn upstream_request_parts(
         body,
         wire_api,
         namespace_tools,
+        custom_adapter,
     ))
 }
 
@@ -1464,6 +1564,75 @@ fn flatten_responses_input_item_namespaces(body: &mut Value) {
     }
 }
 
+/// Chat 上游 + 开关开启时：把 namespace 容器内的 custom 子工具提升为顶层
+/// 扁平名 custom，使既有 Chat 转换器的 custom→function 包装能覆盖它们；
+/// 历史 item 与 tool_choice 的 namespace 引用同步扁平化。开关关闭不执行。
+fn hoist_namespace_custom_tools_for_chat(
+    body: &mut Value,
+    plan: &crate::custom_tool_adapter::CustomToolAdapterPlan,
+) {
+    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut hoisted: Vec<Value> = Vec::new();
+    for tool in tools.iter_mut() {
+        if tool.get("type").and_then(Value::as_str) != Some("namespace") {
+            continue;
+        }
+        let namespace = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let Some(children) = tool.get_mut("tools").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let mut retained = Vec::new();
+        for child in children.drain(..) {
+            let name = child.get("name").and_then(Value::as_str).unwrap_or_default();
+            let flat = flatten_namespace_tool_name(&namespace, name);
+            if plan.identity(&flat).is_some() {
+                let mut custom = child;
+                custom["name"] = json!(flat);
+                hoisted.push(custom);
+            } else {
+                retained.push(child);
+            }
+        }
+        *children = retained;
+    }
+    tools.retain(|tool| {
+        !(tool.get("type").and_then(Value::as_str) == Some("namespace")
+            && tool
+                .get("tools")
+                .and_then(Value::as_array)
+                .is_some_and(|children| children.is_empty()))
+    });
+    tools.extend(hoisted);
+
+    if let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) {
+        for item in items.iter_mut() {
+            flatten_responses_tool_namespace_item(item);
+        }
+    }
+    if let Some(choice) = body.get_mut("tool_choice") {
+        if choice.get("type").and_then(Value::as_str) == Some("custom") {
+            let namespace = choice
+                .get("namespace")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if let Some(name) = choice.get("name").and_then(Value::as_str) {
+                let flat = flatten_namespace_tool_name(&namespace, name);
+                choice["name"] = json!(flat);
+                if let Some(object) = choice.as_object_mut() {
+                    object.remove("namespace");
+                }
+            }
+        }
+    }
+}
+
 fn flatten_responses_tool_namespace_item(item: &mut Value) {
     if !matches!(
         item.get("type").and_then(Value::as_str),
@@ -1753,11 +1922,25 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
 
     if wire_api == UpstreamWireApi::Responses {
         let body = if is_stream {
+            // Custom-as-Function（开关开启时）最先处理：吸收受管 function 事件，
+            // 校验后交付 custom 事件组；普通事件原样流经后续 rewriter。
+            let mut custom_rewriter = crate::custom_tool_adapter::CustomToolSseRewriter::new(
+                upstream.custom_adapter.clone().unwrap_or_default(),
+            );
+            let mut custom_output = custom_rewriter.push_bytes(&upstream_body);
+            let (custom_tail, custom_truncated) = custom_rewriter.finish_with_truncation();
+            custom_output.extend(custom_tail);
+            if custom_truncated {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "helper.protocol_proxy_stream_failed",
+                    json!({ "streamState": "custom_adapter_truncated" }),
+                );
+            }
             let mut native_rewriter =
                 native_agent_plaintext.then(crate::native_agents::NativeAgentSseRewriter::default);
             let mut namespace_rewriter =
                 ResponsesNamespaceSseRewriter::new(upstream.namespace_tools.clone());
-            let mut namespace_output = namespace_rewriter.push_bytes(&upstream_body);
+            let mut namespace_output = namespace_rewriter.push_bytes(&custom_output);
             namespace_output.extend(namespace_rewriter.finish());
             let body = if let Some(rewriter) = &mut native_rewriter {
                 let mut output = rewriter.push_bytes(&namespace_output);
@@ -1768,8 +1951,11 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
             };
             body
         } else {
-            let body =
-                restore_responses_tool_namespace_json(&upstream_body, &upstream.namespace_tools);
+            let body = restore_responses_json_with_custom_adapter(
+                &upstream_body,
+                upstream.custom_adapter.as_ref(),
+                &upstream.namespace_tools,
+            )?;
             if native_agent_plaintext {
                 crate::native_agents::restore_json(&body)
             } else {
@@ -1792,12 +1978,21 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
         return Ok(ProxyHttpResponse {
             status: "200 OK".to_string(),
             content_type: "text/event-stream; charset=utf-8".to_string(),
-            body: chat_sse_to_responses_sse_with_request(&text, &request_json).into_bytes(),
+            body: chat_sse_to_responses_sse_with_request_plan(
+                &text,
+                &request_json,
+                upstream.custom_adapter.as_ref(),
+            )
+            .into_bytes(),
         });
     }
 
     let chat_json: Value = serde_json::from_slice(&upstream_body)?;
-    let response_json = chat_completion_to_response_with_request(chat_json, &request_json)?;
+    let response_json = chat_completion_to_response_with_request_plan(
+        chat_json,
+        &request_json,
+        upstream.custom_adapter.as_ref(),
+    )?;
     Ok(ProxyHttpResponse {
         status: "200 OK".to_string(),
         content_type: "application/json; charset=utf-8".to_string(),
@@ -1916,10 +2111,37 @@ pub fn chat_sse_to_responses_sse(input: &str) -> String {
 }
 
 pub fn chat_sse_to_responses_sse_with_request(input: &str, original_request: &Value) -> String {
-    let mut converter = ChatSseToResponsesConverter::with_request(original_request);
+    chat_sse_to_responses_sse_with_request_plan(input, original_request, None)
+}
+
+pub fn chat_sse_to_responses_sse_with_request_plan(
+    input: &str,
+    original_request: &Value,
+    custom_adapter: Option<&crate::custom_tool_adapter::CustomToolAdapterPlan>,
+) -> String {
+    let mut converter = ChatSseToResponsesConverter::with_request_plan(original_request, custom_adapter);
     let mut output = converter.push_bytes(input.as_bytes());
     output.extend(converter.finish());
     String::from_utf8(output).unwrap_or_default()
+}
+
+/// 非流式 Responses 响应的还原顺序（§7.3 逆序）：先解开本适配器的 function
+/// 包装，再走既有 namespace 恢复；计划为空时保持原有字节级行为。
+pub(crate) fn restore_responses_json_with_custom_adapter(
+    bytes: &[u8],
+    custom_adapter: Option<&crate::custom_tool_adapter::CustomToolAdapterPlan>,
+    namespace_tools: &BTreeMap<String, (String, String)>,
+) -> anyhow::Result<Vec<u8>> {
+    let Some(plan) = custom_adapter.filter(|plan| !plan.is_empty()) else {
+        return Ok(restore_responses_tool_namespace_json(bytes, namespace_tools));
+    };
+    let Ok(mut value) = serde_json::from_slice::<Value>(bytes) else {
+        // 不可解析的响应体按既有约定原样返回，由上层按上游错误处理。
+        return Ok(bytes.to_vec());
+    };
+    crate::custom_tool_adapter::restore_custom_tool_calls_json(&mut value, plan)?;
+    restore_responses_tool_namespaces(&mut value, namespace_tools);
+    Ok(serde_json::to_vec(&value).unwrap_or_else(|_| bytes.to_vec()))
 }
 
 pub fn response_id_from_chat_id(id: Option<&str>) -> String {
@@ -2025,8 +2247,19 @@ impl Default for ChatSseState {
 
 impl ChatSseState {
     fn with_request(original_request: &Value) -> Self {
+        Self::with_request_plan(original_request, None)
+    }
+
+    fn with_request_plan(
+        original_request: &Value,
+        custom_adapter: Option<&crate::custom_tool_adapter::CustomToolAdapterPlan>,
+    ) -> Self {
+        let mut tool_context = build_codex_tool_context(original_request.get("tools"));
+        if let Some(plan) = custom_adapter {
+            tool_context.merge_custom_adapter_plan(plan);
+        }
         Self {
-            tool_context: build_codex_tool_context(original_request.get("tools")),
+            tool_context,
             original_request: Some(original_request.clone()),
             ..Self::default()
         }
@@ -3514,6 +3747,7 @@ fn build_codex_tool_context(tools: Option<&Value>) -> CodexToolContext {
                         openai_name: "apply_patch".to_string(),
                         kind: CodexCustomToolKind::ApplyPatch,
                         proxy_action: Some(action),
+                        namespace: String::new(),
                     },
                 );
                 context.has_custom_tools = true;
@@ -3525,6 +3759,7 @@ fn build_codex_tool_context(tools: Option<&Value>) -> CodexToolContext {
                     openai_name: name.to_string(),
                     kind: CodexCustomToolKind::Raw,
                     proxy_action: None,
+                    namespace: String::new(),
                 },
             );
             context.has_custom_tools = true;
@@ -3547,6 +3782,7 @@ fn build_codex_tool_context(tools: Option<&Value>) -> CodexToolContext {
                         openai_name: name.to_string(),
                         kind,
                         proxy_action: None,
+                        namespace: String::new(),
                     },
                 );
                 if kind == CodexCustomToolKind::ApplyPatch {
@@ -3564,6 +3800,7 @@ fn build_codex_tool_context(tools: Option<&Value>) -> CodexToolContext {
                                 openai_name: name.to_string(),
                                 kind: CodexCustomToolKind::ApplyPatch,
                                 proxy_action: Some(action),
+                                namespace: String::new(),
                             },
                         );
                     }
@@ -3598,6 +3835,7 @@ fn build_codex_tool_context(tools: Option<&Value>) -> CodexToolContext {
                         openai_name: name.to_string(),
                         kind: CodexCustomToolKind::BuiltIn,
                         proxy_action: None,
+                        namespace: String::new(),
                     },
                 );
                 context.has_custom_tools = true;
@@ -4050,7 +4288,7 @@ fn combine_namespace_description(namespace_description: &str, child_description:
     }
 }
 
-fn flatten_namespace_tool_name(namespace: &str, name: &str) -> String {
+pub(crate) fn flatten_namespace_tool_name(namespace: &str, name: &str) -> String {
     if namespace.is_empty() {
         return name.to_string();
     }
@@ -4254,7 +4492,7 @@ fn tool_call_added_item(
     tool_context: &CodexToolContext,
 ) -> Value {
     if tool_context.is_custom_tool_proxy(&state.name) {
-        return json!({
+        let mut added = json!({
             "type": "response.output_item.added",
             "output_index": output_index,
             "item": {
@@ -4266,6 +4504,11 @@ fn tool_call_added_item(
                 "input": ""
             }
         });
+        let namespace = tool_context.custom_tool_namespace(&state.name);
+        if !namespace.is_empty() {
+            added["item"]["namespace"] = json!(namespace);
+        }
+        return added;
     }
     let (display_name, namespace) = tool_context.openai_name_for_function_tool(&state.name);
     let mut item = json!({
@@ -4356,7 +4599,7 @@ fn response_tool_call_item(
     tool_context: &CodexToolContext,
 ) -> Value {
     if tool_context.is_custom_tool_proxy(name) {
-        return json!({
+        let mut item = json!({
             "id": tool_call_item_id(call_id, name, tool_context),
             "type": "custom_tool_call",
             "status": "completed",
@@ -4364,6 +4607,11 @@ fn response_tool_call_item(
             "name": tool_context.original_custom_tool_name(name),
             "input": reconstruct_custom_tool_call_input_with_context(tool_context, name, arguments)
         });
+        let namespace = tool_context.custom_tool_namespace(name);
+        if !namespace.is_empty() {
+            item["namespace"] = json!(namespace);
+        }
+        return item;
     }
     let (display_name, namespace) = tool_context.openai_name_for_function_tool(name);
     let mut item = json!({
@@ -5417,7 +5665,7 @@ mod glm_additional_tools_tests {
             base_url: "https://open.bigmodel.cn/api/v1".to_string(),
             ..Default::default()
         };
-        let (endpoint, actual, _, _) =
+        let (endpoint, actual, _, _, _) =
             upstream_request_parts(&relay, request.clone(), "/responses")
                 .await
                 .unwrap();
@@ -5449,7 +5697,7 @@ mod glm_additional_tools_tests {
             ]
         });
         let relay = crate::settings::RelayProfile::default();
-        let (_, wire, _, namespace_tools) = upstream_request_parts(&relay, request, "/responses")
+        let (_, wire, _, namespace_tools, _) = upstream_request_parts(&relay, request, "/responses")
             .await
             .unwrap();
         assert_eq!(
@@ -5542,7 +5790,7 @@ mod glm_additional_tools_tests {
         });
         assert!(crate::native_agents::prepare_request(&mut request));
         let relay = crate::settings::RelayProfile::default();
-        let (_, wire, _, namespace_tools) = upstream_request_parts(&relay, request, "/responses")
+        let (_, wire, _, namespace_tools, _) = upstream_request_parts(&relay, request, "/responses")
             .await
             .unwrap();
         assert_eq!(
@@ -5631,7 +5879,7 @@ mod glm_additional_tools_tests {
                 {"type": "additional_tools", "tools": [{"type": "function", "name": "inspect"}]}
             ]
         });
-        let (_, actual, _, _) = upstream_request_parts(&relay, request, "/responses")
+        let (_, actual, _, _, _) = upstream_request_parts(&relay, request, "/responses")
             .await
             .unwrap();
         assert_eq!(
@@ -5658,7 +5906,7 @@ mod glm_additional_tools_tests {
             "model": "GPT-5.6-LUNA",
             "input": [{"type": "message", "role": "user", "content": "hello"}]
         });
-        let (_, actual, _, _) = upstream_request_parts(&relay, request, "/responses")
+        let (_, actual, _, _, _) = upstream_request_parts(&relay, request, "/responses")
             .await
             .unwrap();
         assert_eq!(actual["model"], "provider-canonical");
@@ -5915,7 +6163,7 @@ mod responses_reasoning_policy_tests {
             base_url: "https://relay.example/v1".to_string(),
             ..Default::default()
         };
-        let (_, actual, wire_api, _) = upstream_request_parts(&relay, request(), "/responses")
+        let (_, actual, wire_api, _, _) = upstream_request_parts(&relay, request(), "/responses")
             .await
             .unwrap();
         assert!(matches!(wire_api, UpstreamWireApi::ChatCompletions));
@@ -6135,7 +6383,7 @@ mod review_20260916_regression {
             responses_reasoning_policy: ResponsesReasoningPolicy::Strip,
             ..Default::default()
         };
-        let (endpoint, wire, wire_api, namespace_tools) =
+        let (endpoint, wire, wire_api, namespace_tools, _) =
             upstream_request_parts(&relay, request, "/responses").await.unwrap();
         assert!(matches!(wire_api, UpstreamWireApi::Responses));
         assert_eq!(

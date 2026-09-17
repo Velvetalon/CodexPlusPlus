@@ -1625,6 +1625,11 @@ async fn handle_protocol_proxy_connection(
     if upstream.is_stream {
         write_http_stream_headers(stream, "200 OK", "text/event-stream; charset=utf-8").await?;
         if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
+            // Custom-as-Function（开关开启时）最先处理：吸收受管 function 事件，
+            // 完整校验后交付 custom 事件组；计划为空时逐字节透传。
+            let mut custom_agents = crate::custom_tool_adapter::CustomToolSseRewriter::new(
+                upstream.custom_adapter.clone().unwrap_or_default(),
+            );
             let mut native_agents = upstream
                 .native_agent_plaintext
                 .then(crate::native_agents::NativeAgentSseRewriter::default);
@@ -1637,6 +1642,7 @@ async fn handle_protocol_proxy_connection(
             while let Some(chunk) = bytes_stream.next().await {
                 match chunk {
                     Ok(bytes) => {
+                        let bytes = custom_agents.push_bytes(&bytes);
                         let bytes = namespace_agents.push_bytes(&bytes);
                         let bytes = if let Some(rewriter) = &mut native_agents {
                             rewriter.push_bytes(&bytes)
@@ -1653,7 +1659,10 @@ async fn handle_protocol_proxy_connection(
                     }
                 }
             }
+            let (custom_tail, custom_truncated) = custom_agents.finish_with_truncation();
+            let pushed_custom_tail = namespace_agents.push_bytes(&custom_tail);
             let (namespace_tail, namespace_truncated) = namespace_agents.finish_with_truncation();
+            let namespace_tail = [pushed_custom_tail, namespace_tail].concat();
             let (tail, native_truncated) = if let Some(rewriter) = &mut native_agents {
                 let mut tail = rewriter.push_bytes(&namespace_tail);
                 let (native_tail, truncated) = rewriter.finish_with_truncation();
@@ -1687,7 +1696,7 @@ async fn handle_protocol_proxy_connection(
                 stream.shutdown().await?;
                 return Ok(());
             }
-            if native_truncated || namespace_truncated {
+            if native_truncated || namespace_truncated || custom_truncated {
                 // EOF 处半帧：丢弃并明确报告截断，不把截断当成正常完成。
                 let _ = crate::diagnostic_log::append_diagnostic_log(
                     "helper.protocol_proxy_stream_failed",
@@ -1724,7 +1733,12 @@ async fn handle_protocol_proxy_connection(
         }
         let mut converter = request_json
             .as_ref()
-            .map(crate::protocol_proxy::ChatSseToResponsesConverter::with_request)
+            .map(|request| {
+                crate::protocol_proxy::ChatSseToResponsesConverter::with_request_plan(
+                    request,
+                    upstream.custom_adapter.as_ref(),
+                )
+            })
             .unwrap_or_default();
         let mut bytes_stream = upstream.response.bytes_stream();
         let mut stream_failed = false;
@@ -1766,10 +1780,11 @@ async fn handle_protocol_proxy_connection(
         return Ok(());
     }
     let upstream_body = upstream.response.bytes().await?;
-    let upstream_body = crate::protocol_proxy::restore_responses_tool_namespace_json(
+    let upstream_body = crate::protocol_proxy::restore_responses_json_with_custom_adapter(
         &upstream_body,
+        upstream.custom_adapter.as_ref(),
         &upstream.namespace_tools,
-    );
+    )?;
     if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
         let body = if upstream.native_agent_plaintext {
             crate::native_agents::restore_json(&upstream_body)
@@ -1799,7 +1814,11 @@ async fn handle_protocol_proxy_connection(
     }
     let chat_json: serde_json::Value = serde_json::from_slice(&upstream_body)?;
     let response_json = if let Some(request_json) = request_json.as_ref() {
-        crate::protocol_proxy::chat_completion_to_response_with_request(chat_json, request_json)?
+        crate::protocol_proxy::chat_completion_to_response_with_request_plan(
+            chat_json,
+            request_json,
+            upstream.custom_adapter.as_ref(),
+        )?
     } else {
         crate::protocol_proxy::chat_completion_to_response(chat_json)?
     };
