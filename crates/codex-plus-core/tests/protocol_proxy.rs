@@ -4664,8 +4664,15 @@ async fn live_ab_custom_tools_as_functions_via_production_proxy() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(32);
 
-    let template: serde_json::Value =
+    let mut template: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&settings_template).unwrap()).unwrap();
+    // base_url 是 skip_serializing 字段，必须直接在 JSON 上补齐，
+    // 否则结构体往返会把 baseUrl 丢掉导致上游地址为空。
+    if let Some(profiles) = template["relayProfiles"].as_array_mut() {
+        for profile in profiles {
+            profile["baseUrl"] = profile["upstreamBaseUrl"].clone();
+        }
+    }
     let vectors = [
         "echo round-trip-ok".to_string(),
         "line1\nline2 中文 🧪 保留原样".to_string(),
@@ -4723,20 +4730,21 @@ async fn live_ab_custom_tools_as_functions_via_production_proxy() {
                     break 'models;
                 }
 
-                // Round 1：首次请求。
-                let mut settings: BackendSettings =
-                    serde_json::from_value(template.clone()).unwrap();
-                settings.active_relay_id = settings.relay_profiles[0].id.clone();
-                settings.relay_profiles[0].custom_tools_as_functions = *flag;
-                settings.relay_profiles[0].base_url = settings.relay_profiles[0]
-                    .upstream_base_url
-                    .clone();
-                settings.relay_profiles[0].model = model.clone();
+                // Round 1：首次请求。直接在 JSON Value 上切换开关，避免
+                // 结构体序列化丢掉 skip_serializing 字段。
+                let mut arm_settings = template.clone();
+                arm_settings["relayProfiles"][0]["customToolsAsFunctions"] = json!(flag);
+                arm_settings["activeRelayId"] =
+                    arm_settings["relayProfiles"][0]["id"].clone();
                 let arm_file = std::env::temp_dir().join(format!(
                     "codexplus-ab-{}-{}-{}.json",
                     run_id, model_index, arm_name
                 ));
-                std::fs::write(&arm_file, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+                std::fs::write(
+                    &arm_file,
+                    serde_json::to_vec_pretty(&arm_settings).unwrap(),
+                )
+                .unwrap();
                 let _guard = SettingsPathGuard::set(arm_file.clone());
 
                 let request = json!({
