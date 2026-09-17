@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::de::{MapAccess, Visitor};
+use serde::de::Visitor;
 use serde::Deserializer;
 use serde_json::Value;
 
@@ -282,12 +282,6 @@ fn wrap_custom_tool_declaration(tool: &Value, wire_name: &str) -> Result<Value, 
                 ));
             }
         },
-        _ => {
-            return Err(AdapterError::new(
-                AdapterErrorCode::UnsupportedFormat,
-                format!("custom 工具「{wire_name}」的 format 字段形状不受支持"),
-            ));
-        }
     }
 
     let mut wrapper_description = if description.is_empty() {
@@ -791,17 +785,6 @@ struct PendingCall {
     delivered_input: Option<String>,
 }
 
-impl PendingCall {
-    fn authoritative_arguments(&self) -> &str {
-        if !self.done_arguments.as_deref().unwrap_or_default().is_empty() {
-            self.done_arguments.as_deref().unwrap_or_default()
-        } else if !self.arguments.is_empty() {
-            &self.arguments
-        } else {
-            self.done_arguments.as_deref().unwrap_or_default()
-        }
-    }
-}
 
 #[derive(Debug)]
 struct StreamFailure {

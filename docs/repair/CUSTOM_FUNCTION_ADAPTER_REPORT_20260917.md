@@ -12,9 +12,13 @@
 实际工作区：
   E:\Code\CodexPlusPlus-repair-20260916-234500（worktree，工作分支
   fix/custom-tool-function-adapter-20260917；主仓库 E:\Code\CodexPlusPlus 的 main 未动）
-实际构建产物与 SHA256：
-  本轮未产出发布级产物；离线回归与 A/B 均以 debug 测试进程内驱动生产函数链。
-  前端 vite build 成功（apps/codex-plus-manager/dist，构建于 worktree，未部署）。
+实际构建产物与 SHA256（build commit 4a57ba05 之后追加警告清理，
+产物对应清理后源码；tari.conf.json bundle.active=false，单 exe 直接分发，未部署）：
+  target/release/codex-plus-plus.exe         18,370,560 字节
+    SHA256 76369c197b6a0605ae69d3a5ef52359f063480ff0205bda4178c4889c680f030
+  target/release/codex-plus-plus-manager.exe 39,110,144 字节（含前端 dist）
+    SHA256 d75a410319a581548d2b52d9b9cb8434bf3d8633d60e214e27885887b0cc452e
+  离线回归与 A/B 均以测试进程内驱动生产函数链，与产物构建同源。
 真实运行的是哪份程序：
   live A/B 由 cargo 测试进程内调用生产函数（open_responses_proxy_request /
   handle_responses_proxy_request / custom_tool_adapter），非桌面端安装版。

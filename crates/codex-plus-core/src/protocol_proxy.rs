@@ -2246,10 +2246,6 @@ impl Default for ChatSseState {
 }
 
 impl ChatSseState {
-    fn with_request(original_request: &Value) -> Self {
-        Self::with_request_plan(original_request, None)
-    }
-
     fn with_request_plan(
         original_request: &Value,
         custom_adapter: Option<&crate::custom_tool_adapter::CustomToolAdapterPlan>,
