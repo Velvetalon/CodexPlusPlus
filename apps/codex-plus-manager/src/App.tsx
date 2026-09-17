@@ -100,8 +100,16 @@ import {
   serializeModelWindowRows,
   type ImageHandling,
   type ModelWindowRow,
+  type RelayModelAlias,
 } from "./model-windows";
 import { relayAuthForLiveDraft, shouldBackfillRelayProfileBeforeSwitch } from "./relay-live-files";
+import { orderAggregateMembersByCandidates } from "./relay-aggregate-order";
+import {
+  formatCooldownDuration,
+  relayCooldownReasonLabel,
+  relayPriorityHighlights,
+  type RelayCooldownMemberStatus,
+} from "./relay-cooldown";
 import { resolveProviderName } from "./provider-name";
 import { resolveProviderSyncCompletion } from "./provider-sync-flow";
 import { resolveLaunchStatus } from "./launch-status";
@@ -288,6 +296,10 @@ export type RelayProfile = {
   upstreamBaseUrl: string;
   apiKey: string;
   protocol: RelayProtocol;
+  responsesReasoningPolicy: ResponsesReasoningPolicy;
+  responsesWirePolicy: ResponsesWirePolicy;
+  customToolsAsFunctions?: boolean;
+  nativeAgentInterop: NativeAgentInterop;
   relayMode: RelayMode;
   sessionProvider?: RelaySessionProvider;
   officialMixApiKey: boolean;
@@ -299,6 +311,7 @@ export type RelayProfile = {
   useCommonConfig: boolean;
   contextWindow: string;
   autoCompactLimit: string;
+  newContextManagement?: boolean;
   modelList: string;
   modelWindows: string;
   modelVlm: string;
@@ -309,10 +322,48 @@ export type RelayProfile = {
   sub2apiEnabled: boolean;
   sub2apiMultiplier: string;
   modelRoutes?: RelayModelRoute[];
+  modelAliases?: RelayModelAlias[];
   aggregate?: RelayAggregateConfig | null;
 };
 
-type RelayAggregateStrategy = "failover" | "conversationRoundRobin" | "requestRoundRobin" | "weightedRoundRobin";
+type ResponsesReasoningPolicy = "passthrough" | "openAiOpaque" | "strip";
+type ResponsesWirePolicy = "compatible" | "passthrough";
+type NativeAgentInterop = "auto" | "on" | "off";
+
+type RelayAggregateStrategy =
+  | "failover"
+  | "priorityFallback"
+  | "conversationRoundRobin"
+  | "requestRoundRobin"
+  | "weightedRoundRobin";
+
+type RelayModelRouteStatus = {
+  model: string;
+  targetRelayId: string;
+  targetRelayName: string;
+  targetModel: string;
+  enabled: boolean;
+  restoreAt: number | null;
+  permanent: boolean;
+  remainingSeconds: number;
+};
+
+type RelayModelRoutesResult = {
+  status: string;
+  providerId: string;
+  providerName: string;
+  observedAt: number;
+  routes: RelayModelRouteStatus[];
+};
+
+type SetRelayModelRouteRequest = {
+  id: string;
+  model: string;
+  enabled: boolean;
+  restoreAt?: number;
+  durationSeconds?: number;
+  permanent?: boolean;
+};
 type RelayAggregateMember = {
   profileId: string;
   weight: number;
@@ -320,6 +371,7 @@ type RelayAggregateMember = {
 type RelayAggregateConfig = {
   strategy: RelayAggregateStrategy;
   members: RelayAggregateMember[];
+  codeModeHost: boolean;
 };
 type AggregateRelayMember = {
   relayId: string;
@@ -329,6 +381,7 @@ type AggregateRelayProfile = {
   id: string;
   name: string;
   sessionProvider?: RelaySessionProvider;
+  codeModeHost?: boolean;
   strategy: RelayAggregateStrategy;
   members: AggregateRelayMember[];
 };
@@ -502,6 +555,11 @@ type RelayResult = CommandResult<{
 }>;
 
 type RelayPayload = Omit<RelayResult, "status" | "message">;
+
+type RelayCooldownStatusResult = CommandResult<{
+  aggregateId: string | null;
+  members: RelayCooldownMemberStatus[];
+}>;
 
 type RelayFilesResult = CommandResult<{
   configPath: string;
@@ -1074,6 +1132,9 @@ const defaultSettings: BackendSettings = {
       upstreamBaseUrl: "",
       apiKey: "",
       protocol: "responses",
+      responsesReasoningPolicy: "passthrough",
+      responsesWirePolicy: "compatible",
+      nativeAgentInterop: "auto",
       relayMode: "official",
       officialMixApiKey: false,
       noAuth: false,
@@ -1087,6 +1148,7 @@ const defaultSettings: BackendSettings = {
       modelList: "",
       modelWindows: "",
       modelVlm: "",
+      modelAliases: [],
       vlmApiKey: "",
       vlmModel: "",
       vlmBaseUrl: "",
@@ -1402,6 +1464,23 @@ export function App() {
       if (!silent) showResultNotice(t("登录状态"), result, { silentSuccess: true });
     }
   };
+  const requestRelayCooldownStatus = async (
+    reset: boolean,
+    silent: boolean,
+  ): Promise<RelayCooldownStatusResult | null> => {
+    const helperPort = overview?.latest_launch?.helper_port ?? parsePort(launchForm.helperPort, 57321);
+    const result = await run(() => call<RelayCooldownStatusResult>("relay_cooldown_status", {
+      helperPort,
+      reset,
+    }));
+    if (!result) return null;
+    if (!silent) {
+      showResultNotice(reset ? t("重置冷却") : t("冷却状态"), result, { silentSuccess: true });
+    }
+    return result;
+  };
+  const refreshRelayCooldownStatus = (silent = true) => requestRelayCooldownStatus(false, silent);
+  const resetRelayCooldowns = () => requestRelayCooldownStatus(true, false);
   const refreshRelayFiles = async (silent = false) => {
     const result = await run(() => call<RelayFilesResult>("read_relay_files"));
     if (result) {
@@ -2910,6 +2989,26 @@ export function App() {
     return result && isSuccessStatus(result.status) ? result : null;
   };
 
+  const modelRoutesList = async (id: string) => {
+    try {
+      return await call<RelayModelRoutesResult>("model_routes_list", { id });
+    } catch {
+      return null;
+    }
+  };
+
+  const modelRouteSet = async (request: SetRelayModelRouteRequest) => {
+    const result = await run(() => call<{ status: string; route: RelayModelRouteStatus }>("model_route_set", { request }));
+    if (result) {
+      showNotice(
+        t("单模型路由"),
+        request.enabled ? t("已启用该模型转发。") : t("已禁用该模型转发。"),
+        result.status,
+      );
+    }
+    return result?.route ?? null;
+  };
+
   const switchOfficialMode = async () => {
     const switched = await clearRelayInjection(true);
     if (!switched) return;
@@ -3368,6 +3467,8 @@ export function App() {
         await saveLaunchMode(launchMode);
       },
       refreshRelay,
+      refreshRelayCooldownStatus,
+      resetRelayCooldowns,
       refreshRelayFiles,
       refreshEnvConflicts,
       refreshRelayEnvironment,
@@ -3422,6 +3523,8 @@ export function App() {
       testStepwiseSettings,
       fetchRelayProfileModels,
       fetchSub2ApiBilling,
+      modelRoutesList,
+      modelRouteSet,
       switchRelayProfile,
       relaySwitching,
       switchOfficialMode,
@@ -3787,6 +3890,8 @@ type Actions = {
   setProviderSyncTarget: (provider: string) => void;
   setLaunchMode: (launchMode: LaunchMode) => Promise<void>;
   refreshRelay: () => Promise<void>;
+  refreshRelayCooldownStatus: (silent?: boolean) => Promise<RelayCooldownStatusResult | null>;
+  resetRelayCooldowns: () => Promise<RelayCooldownStatusResult | null>;
   refreshRelayFiles: () => Promise<RelayFilesResult | null>;
   refreshEnvConflicts: (silent?: boolean) => Promise<EnvConflictsResult | null>;
   refreshRelayEnvironment: (silent?: boolean) => Promise<RelayEnvironmentResult | null>;
@@ -3847,6 +3952,8 @@ type Actions = {
   testStepwiseSettings: (settings: BackendSettings) => Promise<void>;
   fetchRelayProfileModels: (profile: RelayProfile) => Promise<string[] | null>;
   fetchSub2ApiBilling: (profile: RelayProfile) => Promise<Sub2ApiBillingResult | null>;
+  modelRoutesList: (id: string) => Promise<RelayModelRoutesResult | null>;
+  modelRouteSet: (request: SetRelayModelRouteRequest) => Promise<RelayModelRouteStatus | null>;
   switchRelayProfile: (settings: BackendSettings, previousActiveRelayId?: string) => Promise<void>;
   relaySwitching: boolean;
   switchOfficialMode: () => Promise<void>;
@@ -7860,7 +7967,12 @@ function RelayProfileDetail({
 }) {
   const [draft, setDraft] = useState<RelayProfile>(profile);
   const [modelWindowRows, setModelWindowRows] = useState<ModelWindowRow[]>(
-    modelWindowRowsFromProfile(profile.modelList, profile.modelWindows || "", profile.modelVlm),
+    modelWindowRowsFromProfile(
+      profile.modelList,
+      profile.modelWindows || "",
+      profile.modelVlm,
+      profile.modelAliases || "",
+    ),
   );
   const [doctorResult, setDoctorResult] = useState<ProviderDoctorResult | null>(null);
   const [doctorOpen, setDoctorOpen] = useState(false);
@@ -7888,16 +8000,28 @@ function RelayProfileDetail({
       ? applyRelayProfilePatchToFiles(liveDraft, { apiKey: storedApiKey })
       : liveDraft;
     setDraft(nextDraft);
-    setModelWindowRows(modelWindowRowsFromProfile(nextDraft.modelList, nextDraft.modelWindows || "", nextDraft.modelVlm));
-  }, [profile.id, profile.modelList, profile.modelWindows, profileUsesLiveFiles, isActive, isNew, relayFiles?.configContents, relayFiles?.authContents]);
+    setModelWindowRows(modelWindowRowsFromProfile(
+      nextDraft.modelList,
+      nextDraft.modelWindows || "",
+      nextDraft.modelVlm,
+      nextDraft.modelAliases || "",
+    ));
+  }, [profile.id, profile.modelList, profile.modelWindows, profile.modelAliases, profileUsesLiveFiles, isActive, isNew, relayFiles?.configContents, relayFiles?.authContents]);
   const validationSettings = relaySettingsWithDraft(form, profile.id, draft, isNew);
   const validationError = relaySessionProviderValidation(draft)
     ?? (isAggregateRelayProfile(draft)
       ? aggregateRelayProfileValidation(draft)
-      : relayModelRoutesSettingsValidation(validationSettings));
+      : relayModelRoutesSettingsValidation(validationSettings))
+    ?? customAdapterPolicyConflict(draft);
   const draftWithModelRows = () => {
     const serializedRows = serializeModelWindowRows(modelWindowRows);
-    return { ...draft, modelList: serializedRows.modelList, modelWindows: serializedRows.modelWindows, modelVlm: serializedRows.modelVlm };
+    return {
+      ...draft,
+      modelList: serializedRows.modelList,
+      modelWindows: serializedRows.modelWindows,
+      modelVlm: serializedRows.modelVlm,
+      modelAliases: serializedRows.modelAliases,
+    };
   };
   const saveDraft = async () => {
     if (validationError) return;
@@ -8228,19 +8352,11 @@ function RelayProfileEditor({
   setModelWindowRows: (value: ModelWindowRow[]) => void;
 }) {
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [modelRouteStatuses, setModelRouteStatuses] = useState<Record<string, RelayModelRouteStatus>>({});
+  const [modelRouteRestoreDrafts, setModelRouteRestoreDrafts] = useState<Record<string, string>>({});
   const useCommonConfig = profile.useCommonConfig !== false;
   // VLM/Strip 对 Chat Completions 与 Responses 协议均可用(注入块类型已按协议适配)。
   const vlmUnsupportedProtocol = false;
-  if (isAggregateRelayProfile(profile)) {
-    return (
-      <AggregateRelayProfileEditor
-        profile={profile}
-        form={form}
-        onProfileChange={onProfileChange}
-      />
-    );
-  }
-
   const showApiFields = profile.relayMode !== "official" || profile.officialMixApiKey;
   const sessionProvider = relaySessionProvider(profile);
   const canUseOpenAiSessionProvider = profile.relayMode !== "official" || profile.officialMixApiKey;
@@ -8263,6 +8379,27 @@ function RelayProfileEditor({
       modelRoutes: modelRoutes.map((route, routeIndex) => (routeIndex === index ? { ...route, ...patch } : route)),
     });
   };
+  const refreshModelRouteStatuses = async () => {
+    if (isNew || !profile.id) return;
+    const result = await actions.modelRoutesList(profile.id);
+    if (!result || !isSuccessStatus(result.status)) return;
+    setModelRouteStatuses(Object.fromEntries(result.routes.map((route) => [route.model, route])));
+  };
+  useEffect(() => {
+    if (isNew || !profile.id || isAggregateRelayProfile(profile)) return undefined;
+    void refreshModelRouteStatuses();
+    const timer = window.setInterval(() => void refreshModelRouteStatuses(), 1000);
+    return () => window.clearInterval(timer);
+  }, [isNew, profile.id]);
+  const setModelRouteEnabled = async (route: RelayModelRoute, request: Omit<SetRelayModelRouteRequest, "id" | "model">) => {
+    const model = route.model.trim();
+    if (!model || !modelRouteStatuses[model]) {
+      await actions.showMessage(t("单模型路由"), t("请先保存该模型路由，再修改启用状态。"), "failed");
+      return;
+    }
+    const status = await actions.modelRouteSet({ id: profile.id, model, ...request });
+    if (status) setModelRouteStatuses((current) => ({ ...current, [model]: status }));
+  };
   const updateModelWindowRow = (index: number, patch: Partial<ModelWindowRow>) => {
     setModelWindowRows(
       modelWindowRows.map((row, rowIndex) => (rowIndex === index ? { ...row, ...patch } : row)),
@@ -8270,7 +8407,7 @@ function RelayProfileEditor({
   };
   const removeModelWindowRow = (index: number) => {
     const nextRows = modelWindowRows.filter((_, rowIndex) => rowIndex !== index);
-    setModelWindowRows(nextRows.length ? nextRows : [{ model: "", window: "", imageHandling: "" }]);
+    setModelWindowRows(nextRows.length ? nextRows : [{ model: "", aliases: "", window: "", imageHandling: "" }]);
   };
   const addModelWindowRows = (rows: ModelWindowRow[]) => {
     setModelWindowRows(mergeModelWindowRows(modelWindowRows, rows));
@@ -8283,6 +8420,16 @@ function RelayProfileEditor({
       sub2apiMultiplier: formatMultiplierValue(result.effectiveRateMultiplier),
     });
   };
+  if (isAggregateRelayProfile(profile)) {
+    return (
+      <AggregateRelayProfileEditor
+        profile={profile}
+        form={form}
+        onProfileChange={onProfileChange}
+        actions={actions}
+      />
+    );
+  }
   return (
     <div className="relay-profile-editor">
       {isNew ? (
@@ -8446,7 +8593,7 @@ function RelayProfileEditor({
             </div>
             <div className="relay-model-list-tools">
               <Button
-                onClick={() => setModelWindowRows([...modelWindowRows, { model: "", window: "", imageHandling: "" }])}
+                onClick={() => setModelWindowRows([...modelWindowRows, { model: "", aliases: "", window: "", imageHandling: "" }])}
                 size="sm"
                 type="button"
                 variant="secondary"
@@ -8463,7 +8610,7 @@ function RelayProfileEditor({
                     modelWindows: serializedRows.modelWindows,
                   });
                   if (models?.length) {
-                    addModelWindowRows(models.map((model) => ({ model, window: "", imageHandling: "" })));
+                    addModelWindowRows(models.map((model) => ({ model, aliases: "", window: "", imageHandling: "" })));
                   }
                 }}
                 size="sm"
@@ -8475,7 +8622,7 @@ function RelayProfileEditor({
               </Button>
               <Button
                 disabled={!modelWindowRows.some((row) => row.model.trim())}
-                onClick={() => setModelWindowRows([{ model: "", window: "", imageHandling: "send-as-is" }])}
+                onClick={() => setModelWindowRows([{ model: "", aliases: "", window: "", imageHandling: "send-as-is" }])}
                 size="sm"
                 title={t("清空模型")}
                 type="button"
@@ -8489,6 +8636,7 @@ function RelayProfileEditor({
           <div className="relay-model-row-editor">
             <div className="relay-model-row relay-model-row-head">
               <span>{t("模型名称")}</span>
+              <span>{t("模型别名")}</span>
               <span>{t("上下文窗口")}</span>
               <span>{t("图片处理方式")}</span>
             </div>
@@ -8498,6 +8646,11 @@ function RelayProfileEditor({
                   value={row.model}
                   onChange={(event) => updateModelWindowRow(index, { model: event.currentTarget.value })}
                   placeholder="deepseek/deepseek-v4-flash"
+                />
+                <Input
+                  value={row.aliases}
+                  onChange={(event) => updateModelWindowRow(index, { aliases: event.currentTarget.value })}
+                  placeholder="luna, glm-flash"
                 />
                 <Input
                   value={row.window}
@@ -8622,6 +8775,7 @@ function RelayProfileEditor({
                   <span>{t("匹配模型")}</span>
                   <span>{t("目标供应商")}</span>
                   <span>{t("目标模型（可选）")}</span>
+                  <span>{t("转发状态")}</span>
                 </div>
               ) : null}
               {modelRoutes.map((route, index) => (
@@ -8644,6 +8798,75 @@ function RelayProfileEditor({
                     onChange={(event) => updateModelRoute(index, { targetModel: event.currentTarget.value })}
                     placeholder={t("留空保持原模型名")}
                   />
+                  <div className="relay-model-route-state">
+                    {modelRouteStatuses[route.model.trim()] ? (
+                      <>
+                        <label className="relay-bare-switch" title={t("启用单模型转发")}>
+                          <input
+                            checked={modelRouteStatuses[route.model.trim()].enabled}
+                            onChange={(event) => void setModelRouteEnabled(route, { enabled: event.currentTarget.checked })}
+                            type="checkbox"
+                          />
+                          <ToggleVisual />
+                        </label>
+                        <span className={modelRouteStatuses[route.model.trim()].enabled ? "route-state-enabled" : "route-state-disabled"}>
+                          {formatModelRouteStatus(modelRouteStatuses[route.model.trim()])}
+                        </span>
+                        {!modelRouteStatuses[route.model.trim()].enabled ? (
+                          <Button
+                            onClick={() => void setModelRouteEnabled(route, { enabled: true })}
+                            size="sm"
+                            type="button"
+                            variant="outline"
+                          >
+                            {t("立即启用")}
+                          </Button>
+                        ) : (
+                          <>
+                            <Button
+                              onClick={() => void setModelRouteEnabled(route, { enabled: false })}
+                              size="sm"
+                              type="button"
+                              variant="outline"
+                            >
+                              {t("禁用 5 小时")}
+                            </Button>
+                            <Button
+                              onClick={() => void setModelRouteEnabled(route, { enabled: false, permanent: true })}
+                              size="sm"
+                              type="button"
+                              variant="outline"
+                            >
+                              {t("永久禁用")}
+                            </Button>
+                          </>
+                        )}
+                        <div className="relay-model-route-restore">
+                          <input
+                            aria-label={t("恢复时间")}
+                            min={modelRouteMinDateTime()}
+                            onChange={(event) => setModelRouteRestoreDrafts((current) => ({ ...current, [route.model]: event.currentTarget.value }))}
+                            type="datetime-local"
+                            value={modelRouteRestoreDrafts[route.model] ?? ""}
+                          />
+                          <Button
+                            disabled={!modelRouteRestoreDrafts[route.model]}
+                            onClick={() => {
+                              const restoreAt = Date.parse(modelRouteRestoreDrafts[route.model]);
+                              if (Number.isFinite(restoreAt)) void setModelRouteEnabled(route, { enabled: false, restoreAt });
+                            }}
+                            size="sm"
+                            type="button"
+                            variant="secondary"
+                          >
+                            {t("禁用至此时间")}
+                          </Button>
+                        </div>
+                      </>
+                    ) : (
+                      <span className="route-state-unsaved">{t("保存后可控制")}</span>
+                    )}
+                  </div>
                   <Button
                     aria-label={t("删除模型路由")}
                     onClick={() => updateDraft({ modelRoutes: modelRoutes.filter((_, routeIndex) => routeIndex !== index) })}
@@ -8730,6 +8953,91 @@ function RelayProfileEditor({
                   placeholder={tf("留空使用默认：{0}", [form.relayTestModel || defaultSettings.relayTestModel])}
                 />
               </Field>
+              <Field className="relay-field-reasoning-policy" label={t("Responses reasoning 兼容")}>
+                <AppSelect
+                  value={profile.responsesReasoningPolicy}
+                  disabled={profile.protocol !== "responses"}
+                  onChange={(value) => updateDraft({ responsesReasoningPolicy: value })}
+                  options={[
+                    { value: "passthrough", label: t("原样透传") },
+                    { value: "openAiOpaque", label: t("OpenAI opaque 兼容") },
+                    { value: "strip", label: t("移除 reasoning") },
+                  ]}
+                  title={profile.protocol !== "responses" ? t("仅 Responses API 生效") : undefined}
+                />
+                <p className="field-hint">
+                  {profile.protocol === "responses"
+                    ? t("仅处理 Responses 顶层 input 的 reasoning 条目；Chat Completions 不受影响。")
+                    : t("仅 Responses API 生效。")}
+                </p>
+              </Field>
+              <Field className="relay-field-wire-policy" label={t("Responses 结构透传")}>
+                <AppSelect
+                  value={profile.responsesWirePolicy}
+                  disabled={profile.protocol !== "responses"}
+                  onChange={(value) => updateDraft({ responsesWirePolicy: value })}
+                  options={[
+                    { value: "compatible", label: t("兼容改写") },
+                    { value: "passthrough", label: t("结构透传") },
+                  ]}
+                  title={profile.protocol !== "responses" ? t("仅 Responses API 生效") : undefined}
+                />
+                <p className="field-hint">
+                  {profile.protocol === "responses"
+                    ? profile.responsesWirePolicy === "passthrough"
+                      ? t("结构透传：跳过 namespace/ID/原生子任务等兼容改写，reasoning 兼容选项由该策略接管，按原样透传。")
+                      : t("兼容改写：保持既有兼容能力（namespace 扁平化、ID 规范化、原生子任务别名）。")
+                    : t("仅 Responses API 生效。")}
+                </p>
+              </Field>
+              <Field className="relay-field-native-agent-interop" label={t("原生任务兼容")}>
+                <AppSelect
+                  value={profile.nativeAgentInterop}
+                  disabled={profile.protocol !== "responses"}
+                  onChange={(value) => updateDraft({ nativeAgentInterop: value })}
+                  options={[
+                    { value: "auto", label: t("Responses 默认启用") },
+                    { value: "on", label: t("始终启用") },
+                    { value: "off", label: t("关闭") },
+                  ]}
+                  title={profile.protocol !== "responses" ? t("仅 Responses API 生效") : undefined}
+                />
+                <p className="field-hint">
+                  {profile.protocol === "responses"
+                    ? t("「Responses 默认启用」表示 Responses 协议下默认开启，不做远端能力探测；转发时用明文协议保留原生子任务消息与工具参数。")
+                    : t("仅 Responses API 生效。")}
+                </p>
+              </Field>
+              <label className="switch-row compact relay-switch-row relay-field-custom-tools-as-functions">
+                <input
+                  checked={profile.customToolsAsFunctions === true}
+                  disabled={profile.protocol !== "responses"}
+                  onChange={(event) =>
+                    updateDraft({ customToolsAsFunctions: event.currentTarget.checked })
+                  }
+                  type="checkbox"
+                />
+                <span className="relay-switch-copy">
+                  <strong>{t("Custom 工具转 Function")}</strong>
+                  <small>
+                    {profile.protocol !== "responses"
+                      ? t("仅 Responses API 生效。")
+                      : t("适用于不完整支持 custom 工具的上游。将 custom 工具包装为包含 input 字符串的 function，返回时还原为 custom 调用；不会更换供应商或模型。")}
+                  </small>
+                </span>
+                <ToggleVisual />
+              </label>
+              {profile.protocol === "responses" && profile.customToolsAsFunctions === true ? (
+                profile.responsesWirePolicy === "passthrough" ? (
+                  <p className="field-hint warn">
+                    {t("配置冲突：Custom 工具转 Function 与结构透传互斥，保存后请求会被拒绝。请关闭其中一项。")}
+                  </p>
+                ) : (
+                  <p className="field-hint">
+                    {t("启用后工具输入字符串可往返保留，但原 custom 语法约束可能退化为文字指导和本地校验；流式工具参数将在完整校验后交付，可能略晚显示。")}
+                  </p>
+                )
+              ) : null}
               <Field className="relay-field-context-window" label={t("上下文大小")}>
                 <Input
                   inputMode="numeric"
@@ -8798,15 +9106,28 @@ function AggregateRelayProfileEditor({
   profile,
   form,
   onProfileChange,
+  actions,
 }: {
   profile: RelayProfile;
   form: BackendSettings;
   onProfileChange: (value: RelayProfile) => void;
+  actions: Actions;
 }) {
+  const [cooldownStatus, setCooldownStatus] = useState<RelayCooldownStatusResult | null>(null);
+  const [resettingCooldowns, setResettingCooldowns] = useState(false);
   const candidates = aggregateMemberCandidates(form, profile.id);
   const aggregate = normalizeAggregateConfig(profile.aggregate, candidates);
+  const priorityFallback = aggregate.strategy === "priorityFallback";
   const memberIds = new Set(aggregate.members.map((member) => member.profileId));
   const sessionProvider = normalizeRelaySessionProvider(profile.sessionProvider);
+  const inheritedContextProfile = candidates
+    .filter((candidate) => memberIds.has(candidate.id))
+    .reduce<RelayProfile | null>((selected, candidate) => {
+      const candidateWindow = Number.parseInt(candidate.contextWindow, 10);
+      if (!Number.isFinite(candidateWindow) || candidateWindow <= 0) return selected;
+      const selectedWindow = selected ? Number.parseInt(selected.contextWindow, 10) : 0;
+      return candidateWindow > selectedWindow ? candidate : selected;
+    }, null);
   const updateAggregate = (nextAggregate: RelayAggregateConfig) => {
     onProfileChange(normalizeAggregateRelayProfile({ ...profile, aggregate: nextAggregate }, form));
   };
@@ -8825,6 +9146,39 @@ function AggregateRelayProfileEditor({
     });
   };
   const totalWeight = aggregate.members.reduce((total, member) => total + clampAggregateWeight(member.weight), 0);
+  useEffect(() => {
+    if (!priorityFallback) {
+      setCooldownStatus(null);
+      return undefined;
+    }
+    let active = true;
+    const refresh = async () => {
+      const result = await actions.refreshRelayCooldownStatus(true);
+      if (active && result) setCooldownStatus(result);
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 1_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [actions, priorityFallback, profile.id]);
+  const resetCooldowns = async () => {
+    setResettingCooldowns(true);
+    try {
+      const result = await actions.resetRelayCooldowns();
+      if (result) setCooldownStatus(result);
+    } finally {
+      setResettingCooldowns(false);
+    }
+  };
+  const cooldownStatusActive = priorityFallback && cooldownStatus?.aggregateId === profile.id;
+  const priorityHighlights = cooldownStatusActive
+    ? relayPriorityHighlights(
+        aggregate.members.map((member) => member.profileId),
+        cooldownStatus.members,
+      )
+    : { currentRelayId: null, nextRelayId: null };
 
   return (
     <div className="relay-profile-editor aggregate-editor">
@@ -8863,6 +9217,61 @@ function AggregateRelayProfileEditor({
             {t("聚合请求仍由本地 Responses 代理轮转成员；OpenAI 身份用于让 ChatGPT Remote 识别会话。")}
           </p>
         </Field>
+        <Field className="relay-field-context-window" label={t("上下文大小")}>
+          <Input
+            inputMode="numeric"
+            value={profile.contextWindow}
+            onChange={(event) => onProfileChange({
+              ...profile,
+              contextWindow: event.currentTarget.value.replace(/[^\d]/g, ""),
+            })}
+            placeholder={inheritedContextProfile
+              ? tf("留空继承成员：{0}", [inheritedContextProfile.contextWindow])
+              : t("留空不改写，例如 1000000")}
+          />
+          <p className="field-hint">
+            {t("显式设置会写入 model_context_window；留空时继承已选成员中最大的明确窗口。")}
+          </p>
+        </Field>
+        <Field className="relay-field-auto-compact" label={t("压缩上下文大小")}>
+          <Input
+            inputMode="numeric"
+            value={profile.autoCompactLimit}
+            onChange={(event) => onProfileChange({
+              ...profile,
+              autoCompactLimit: event.currentTarget.value.replace(/[^\d]/g, ""),
+            })}
+            placeholder={inheritedContextProfile?.autoCompactLimit
+              ? tf("留空继承成员：{0}", [inheritedContextProfile.autoCompactLimit])
+              : t("留空不改写，例如 900000")}
+          />
+          <p className="field-hint">
+            {t("显式设置会写入 model_auto_compact_token_limit；继承窗口时会同时继承该成员的阈值。")}
+          </p>
+        </Field>
+        <label className="switch-row compact relay-switch-row relay-field-code-mode-host">
+          <input
+            checked={aggregate.codeModeHost}
+            onChange={(event) => updateAggregate({ ...aggregate, codeModeHost: event.currentTarget.checked })}
+            type="checkbox"
+          />
+          <span>
+            <strong>{t("code_mode_host 兼容")}</strong>
+            <small>{t("仅向聚合上游转发函数工具；保留终端工具，过滤自定义语法与托管工具。")}</small>
+          </span>
+          <ToggleVisual />
+        </label>
+        <label className="switch-row compact relay-switch-row relay-field-context-management">
+          <input
+            checked={profile.newContextManagement === true}
+            onChange={(event) => onProfileChange({ ...profile, newContextManagement: event.currentTarget.checked })}
+            type="checkbox"
+          />
+          <span>
+            <strong>{t("新版上下文管理模式")}</strong>
+          </span>
+          <ToggleVisual />
+        </label>
       </div>
       <div className="aggregate-strategy-grid">
         {aggregateStrategyOptions.map((option) => (
@@ -8883,15 +9292,37 @@ function AggregateRelayProfileEditor({
             <strong>{t("成员供应商")}</strong>
             <span>{t("只能勾选已填写 Base URL / Key 的 API 供应商，聚合供应商不会作为成员。")}</span>
           </div>
-          <UiBadge variant="outline">{aggregate.members.length} / {candidates.length}</UiBadge>
+          <div className="aggregate-members-head-actions">
+            <UiBadge variant="outline">{aggregate.members.length} / {candidates.length}</UiBadge>
+            {priorityFallback ? (
+              <Button
+                disabled={resettingCooldowns}
+                onClick={() => void resetCooldowns()}
+                size="sm"
+                type="button"
+                variant="outline"
+              >
+                <RotateCcw className="h-4 w-4" />
+                {resettingCooldowns ? t("重置中") : t("重置")}
+              </Button>
+            ) : null}
+          </div>
         </div>
         {candidates.length ? (
           <div className="aggregate-member-list">
             {candidates.map((candidate) => {
               const member = aggregate.members.find((item) => item.profileId === candidate.id);
               const checked = memberIds.has(candidate.id);
+              const priorityRole = candidate.id === priorityHighlights.currentRelayId
+                ? "current"
+                : candidate.id === priorityHighlights.nextRelayId
+                  ? "next"
+                  : null;
               return (
-                <label className={`aggregate-member-row ${checked ? "selected" : ""}`} key={candidate.id}>
+                <label
+                  className={`aggregate-member-row ${checked ? "selected" : ""}${priorityFallback ? " priority-fallback" : ""}${priorityRole ? ` priority-${priorityRole}` : ""}`}
+                  key={candidate.id}
+                >
                   <input
                     checked={checked}
                     onChange={(event) => toggleMember(candidate.id, event.currentTarget.checked)}
@@ -8901,16 +9332,24 @@ function AggregateRelayProfileEditor({
                     <strong>{candidate.name || t("未命名供应商")}</strong>
                     <small>{relayModeLabel(candidate.relayMode)} · {relayProtocolLabel(candidate.protocol)} · {relayProfileConfigBrief(candidate)}</small>
                   </span>
-                  <span className="aggregate-weight-box">
-                    <span>{t("权重")}</span>
-                    <Input
-                      disabled={!checked}
-                      min={1}
-                      onChange={(event) => updateWeight(candidate.id, Number.parseInt(event.currentTarget.value, 10))}
-                      type="number"
-                      value={String(member?.weight ?? 1)}
+                  {priorityFallback ? (
+                    <RelayCooldownSummary
+                      active={cooldownStatusActive}
+                      priorityRole={priorityRole}
+                      status={cooldownStatus?.members.find((item) => item.relayId === candidate.id) ?? null}
                     />
-                  </span>
+                  ) : (
+                    <span className="aggregate-weight-box">
+                      <span>{t("权重")}</span>
+                      <Input
+                        disabled={!checked}
+                        min={1}
+                        onChange={(event) => updateWeight(candidate.id, Number.parseInt(event.currentTarget.value, 10))}
+                        type="number"
+                        value={String(member?.weight ?? 1)}
+                      />
+                    </span>
+                  )}
                 </label>
               );
             })}
@@ -8922,7 +9361,10 @@ function AggregateRelayProfileEditor({
       <div className="relay-grid compact aggregate-preview">
         <Metric label={t("策略")} value={aggregateStrategyLabel(aggregate.strategy)} />
         <Metric label={t("成员数量")} value={tf("{0} 个", [aggregate.members.length])} />
-        <Metric label={t("总权重")} value={`${totalWeight}`} />
+        <Metric
+          label={priorityFallback ? t("失败阈值") : t("总权重")}
+          value={priorityFallback ? tf("{0} 次", [3]) : `${totalWeight}`}
+        />
         <Metric label={t("序列化字段")} value="aggregate.strategy / aggregate.members" />
       </div>
       <div className="hint-line relay-protocol-hint">
@@ -8930,6 +9372,33 @@ function AggregateRelayProfileEditor({
         <span>{aggregateStrategyHelp(aggregate.strategy)}</span>
       </div>
     </div>
+  );
+}
+
+function RelayCooldownSummary({
+  active,
+  priorityRole,
+  status,
+}: {
+  active: boolean;
+  priorityRole: "current" | "next" | null;
+  status: RelayCooldownMemberStatus | null;
+}) {
+  const remaining = status?.cooldownRemainingSeconds ?? 0;
+  const failureCount = status?.consecutiveFailures ?? 0;
+  const threshold = status?.failureThreshold ?? 3;
+  const reason = relayCooldownReasonLabel(status?.lastCooldownReason ?? null, t("传输失败"));
+  return (
+    <span className={`aggregate-cooldown-box${remaining > 0 ? " cooling" : ""}`}>
+      {priorityRole ? (
+        <small className={`aggregate-priority-role ${priorityRole}`}>
+          {priorityRole === "current" ? t("当前使用") : t("冷却后下一顺位")}
+        </small>
+      ) : null}
+      <strong>{remaining > 0 ? tf("冷却 {0}", [formatCooldownDuration(remaining)]) : t("未冷却")}</strong>
+      <small>{active ? tf("连续失败 {0}/{1}", [failureCount, threshold]) : t("当前聚合未启用")}</small>
+      <small>{reason ? tf("上次原因：{0}", [reason]) : t("暂无冷却记录")}</small>
+    </span>
   );
 }
 
@@ -11103,6 +11572,10 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
             upstreamBaseUrl: settings.relayBaseUrl || defaultSettings.relayBaseUrl,
             apiKey: settings.relayApiKey || "",
             protocol: "responses" as RelayProtocol,
+            responsesReasoningPolicy: "passthrough" as ResponsesReasoningPolicy,
+            responsesWirePolicy: "compatible" as ResponsesWirePolicy,
+            customToolsAsFunctions: false,
+            nativeAgentInterop: "auto" as NativeAgentInterop,
             relayMode: "official" as RelayMode,
             sessionProvider: "custom" as RelaySessionProvider,
             officialMixApiKey: false,
@@ -11117,6 +11590,7 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
             modelList: "",
             modelWindows: "",
             modelVlm: "",
+            modelAliases: [],
             vlmApiKey: "",
             vlmModel: "",
             vlmBaseUrl: "",
@@ -11177,6 +11651,18 @@ function inputToCodexExtraArgs(value: string) {
   return value === "" ? [] : value.split(/\r?\n/);
 }
 
+/// C03：passthrough 与 Custom-as-Function 互斥；保存前显式拦截，不静默忽略。
+function customAdapterPolicyConflict(profile: RelayProfile): string | null {
+  if (
+    profile.protocol === "responses" &&
+    profile.customToolsAsFunctions === true &&
+    profile.responsesWirePolicy === "passthrough"
+  ) {
+    return "「Custom 工具转 Function」与「结构透传」互斥：请关闭其中一项。";
+  }
+  return null;
+}
+
 function normalizeRelayProfile(profile: RelayProfile): RelayProfile {
   const legacyMixedApi = profile.relayMode === "mixedApi";
   if (profile.relayMode === "aggregate" || profile.aggregate) {
@@ -11188,6 +11674,9 @@ function normalizeRelayProfile(profile: RelayProfile): RelayProfile {
         upstreamBaseUrl: "",
         apiKey: "",
         protocol: "responses",
+        responsesReasoningPolicy: normalizeResponsesReasoningPolicy(profile.responsesReasoningPolicy),
+        responsesWirePolicy: normalizeResponsesWirePolicy(profile.responsesWirePolicy),
+        nativeAgentInterop: normalizeNativeAgentInterop(profile.nativeAgentInterop),
         relayMode: "aggregate",
         sessionProvider: normalizeRelaySessionProvider(profile.sessionProvider),
         officialMixApiKey: false,
@@ -11197,11 +11686,13 @@ function normalizeRelayProfile(profile: RelayProfile): RelayProfile {
         configContents: "",
         authContents: "",
         useCommonConfig: profile.useCommonConfig !== false,
-        contextWindow: "",
-        autoCompactLimit: "",
-        modelList: "",
-        modelWindows: "",
+        contextWindow: profile.contextWindow || "",
+        autoCompactLimit: profile.autoCompactLimit || "",
+        newContextManagement: profile.newContextManagement === true,
+        modelList: profile.modelList || "",
+        modelWindows: profile.modelWindows || "",
         modelRoutes: [],
+        modelAliases: [],
         sub2apiEnabled: false,
         sub2apiMultiplier: "",
       },
@@ -11218,6 +11709,10 @@ function normalizeRelayProfile(profile: RelayProfile): RelayProfile {
     upstreamBaseUrl: profile.upstreamBaseUrl || profile.baseUrl || "",
     apiKey: noAuth ? "" : profile.apiKey || "",
     protocol: profile.protocol === "chatCompletions" ? "chatCompletions" : "responses",
+    responsesReasoningPolicy: normalizeResponsesReasoningPolicy(profile.responsesReasoningPolicy),
+    responsesWirePolicy: normalizeResponsesWirePolicy(profile.responsesWirePolicy),
+    customToolsAsFunctions: profile.customToolsAsFunctions === true,
+    nativeAgentInterop: normalizeNativeAgentInterop(profile.nativeAgentInterop),
     relayMode,
     sessionProvider: relaySessionProvider(profile),
     officialMixApiKey,
@@ -11232,6 +11727,7 @@ function normalizeRelayProfile(profile: RelayProfile): RelayProfile {
     modelList: profile.modelList || "",
     modelWindows: profile.modelWindows || "",
     modelRoutes: relayMode === "official" && !officialMixApiKey ? [] : normalizeRelayModelRoutes(profile.modelRoutes),
+    modelAliases: profile.modelAliases || [],
     userAgent: profile.userAgent || "",
     sub2apiEnabled: noAuth ? false : profile.sub2apiEnabled === true,
     sub2apiMultiplier: !noAuth && profile.sub2apiEnabled === true ? profile.sub2apiMultiplier || "" : "",
@@ -11249,6 +11745,7 @@ function hydrateAggregateRelayProfile(profile: RelayProfile, aggregate: Aggregat
     sessionProvider: normalizeRelaySessionProvider(aggregate.sessionProvider),
     aggregate: {
       strategy: aggregate.strategy,
+      codeModeHost: aggregate.codeModeHost === true,
       members: aggregate.members.map((member) => ({
         profileId: member.relayId,
         weight: clampAggregateWeight(member.weight),
@@ -11281,6 +11778,18 @@ function normalizeRelayMode(mode: RelayMode | undefined): RelayMode {
   if (mode === "aggregate") return mode;
   if (mode === "pureApi") return mode;
   return "official";
+}
+
+function normalizeResponsesReasoningPolicy(value: string | undefined): ResponsesReasoningPolicy {
+  return value === "openAiOpaque" || value === "strip" ? value : "passthrough";
+}
+
+function normalizeResponsesWirePolicy(value: string | undefined): ResponsesWirePolicy {
+  return value === "passthrough" ? "passthrough" : "compatible";
+}
+
+function normalizeNativeAgentInterop(value: string | undefined): NativeAgentInterop {
+  return value === "on" || value === "off" ? value : "auto";
 }
 
 function normalizeRelaySessionProvider(value: string | undefined): RelaySessionProvider {
@@ -12013,6 +12522,7 @@ function normalizeAggregateProfilesFromRelayProfiles(profiles: RelayProfile[]): 
       id: profile.id,
       name: profile.name || t("聚合供应商"),
       sessionProvider: normalizeRelaySessionProvider(profile.sessionProvider),
+      codeModeHost: aggregate.codeModeHost === true,
       strategy: aggregate.strategy,
       members: aggregate.members.map((member) => ({
         relayId: member.profileId,
@@ -12049,6 +12559,10 @@ function createRelayProfile(settings: BackendSettings): RelayProfile {
     upstreamBaseUrl: defaultSettings.relayBaseUrl,
     apiKey: "",
     protocol: "responses" as RelayProtocol,
+    responsesReasoningPolicy: "passthrough" as ResponsesReasoningPolicy,
+    responsesWirePolicy: "compatible" as ResponsesWirePolicy,
+    customToolsAsFunctions: false,
+    nativeAgentInterop: "auto" as NativeAgentInterop,
     relayMode: "official" as RelayMode,
     sessionProvider: "custom" as RelaySessionProvider,
     officialMixApiKey: false,
@@ -12063,6 +12577,7 @@ function createRelayProfile(settings: BackendSettings): RelayProfile {
     modelList: "",
     modelWindows: "",
     modelVlm: "",
+    modelAliases: [],
     vlmApiKey: "",
     vlmModel: "",
     vlmBaseUrl: "",
@@ -12086,6 +12601,9 @@ function createAggregateRelayProfile(settings: BackendSettings): RelayProfile {
       upstreamBaseUrl: "",
       apiKey: "",
       protocol: "responses",
+      responsesReasoningPolicy: "passthrough",
+      responsesWirePolicy: "compatible",
+      nativeAgentInterop: "auto",
       relayMode: "aggregate",
       sessionProvider: "custom",
       officialMixApiKey: false,
@@ -12097,9 +12615,11 @@ function createAggregateRelayProfile(settings: BackendSettings): RelayProfile {
       useCommonConfig: true,
       contextWindow: "",
       autoCompactLimit: "",
+      newContextManagement: false,
       modelList: "",
       modelWindows: "",
       modelVlm: "",
+      modelAliases: [],
       vlmApiKey: "",
       vlmModel: "",
       vlmBaseUrl: "",
@@ -12109,6 +12629,7 @@ function createAggregateRelayProfile(settings: BackendSettings): RelayProfile {
       modelRoutes: [],
       aggregate: {
         strategy: "failover",
+        codeModeHost: false,
         members: candidates.slice(0, 1).map((profile) => ({ profileId: profile.id, weight: 1 })),
       },
     },
@@ -12197,6 +12718,11 @@ const aggregateStrategyOptions: Array<{ value: RelayAggregateStrategy; label: st
     description: t("按成员顺序请求，失败后切到下一个供应商。"),
   },
   {
+    value: "priorityFallback",
+    label: t("优先降级"),
+    description: t("固定成员优先级；失败成员冷却，到期后自动回切。"),
+  },
+  {
     value: "conversationRoundRobin",
     label: t("按对话轮转"),
     description: t("同一对话保持一个成员，不同对话依次分配。"),
@@ -12226,6 +12752,9 @@ function normalizeAggregateRelayProfile(profile: RelayProfile, settings: Backend
     upstreamBaseUrl: "",
     apiKey: "",
     protocol: "responses",
+    responsesReasoningPolicy: normalizeResponsesReasoningPolicy(profile.responsesReasoningPolicy),
+    responsesWirePolicy: normalizeResponsesWirePolicy(profile.responsesWirePolicy),
+    nativeAgentInterop: normalizeNativeAgentInterop(profile.nativeAgentInterop),
     relayMode: "aggregate",
     sessionProvider: normalizeRelaySessionProvider(profile.sessionProvider),
     officialMixApiKey: false,
@@ -12256,7 +12785,11 @@ function normalizeAggregateConfig(
       seen.add(member.profileId);
       return { profileId: member.profileId, weight: clampAggregateWeight(member.weight) };
     });
-  return { strategy, members };
+  return {
+    strategy,
+    members: orderAggregateMembersByCandidates(members, candidates.map((profile) => profile.id)),
+    codeModeHost: aggregate?.codeModeHost === true,
+  };
 }
 
 function aggregateMemberCandidates(settings: BackendSettings, aggregateId: string): RelayProfile[] {
@@ -12281,6 +12814,7 @@ function aggregateStrategyLabel(strategy: RelayAggregateStrategy): string {
 
 function aggregateStrategyHelp(strategy: RelayAggregateStrategy): string {
   if (strategy === "failover") return t("失败切换会保留成员顺序，优先使用第一个可用供应商。");
+  if (strategy === "priorityFallback") return t("优先降级会跳过仍在冷却的失败成员，并在冷却到期后的下一请求自动恢复其原始优先级。");
   if (strategy === "conversationRoundRobin") return t("按对话轮转会让同一对话尽量保持固定成员，降低上下文漂移。");
   if (strategy === "requestRoundRobin") return t("按请求轮转会逐请求切换成员，适合供应商能力接近的场景。");
   return t("权重轮转会读取每个成员的权重值，权重越高的成员获得更多请求。");
@@ -12325,6 +12859,27 @@ function zedRemoteSourceLabel(source: string) {
 function formatTime(value: number) {
   if (!value) return "-";
   return new Date(value).toLocaleString("zh-CN");
+}
+
+function modelRouteMinDateTime() {
+  const date = new Date(Date.now() + 60_000);
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 16);
+}
+
+function formatModelRouteStatus(status: RelayModelRouteStatus) {
+  if (status.enabled) return t("已启用");
+  if (status.permanent || !status.restoreAt) return t("永久禁用");
+  const remaining = Math.max(0, status.remainingSeconds);
+  const hours = Math.floor(remaining / 3600);
+  const minutes = Math.floor((remaining % 3600) / 60);
+  const seconds = remaining % 60;
+  return tf("禁用至 {0}（剩余 {1}:{2}:{3}）", [
+    new Date(status.restoreAt).toLocaleString(),
+    String(hours).padStart(2, "0"),
+    String(minutes).padStart(2, "0"),
+    String(seconds).padStart(2, "0"),
+  ]);
 }
 
 function formatDuration(startedAtMs: number): string {

@@ -19,6 +19,9 @@ const _profileTypeCheck: RelayProfile = {
   upstreamBaseUrl: "",
   apiKey: "",
   protocol: "responses",
+  responsesReasoningPolicy: "passthrough",
+  responsesWirePolicy: "compatible",
+  nativeAgentInterop: "auto",
   relayMode: "official",
   officialMixApiKey: false,
   noAuth: false,
@@ -89,9 +92,9 @@ describe("model-windows helpers", () => {
     assert.deepStrictEqual(
       modelWindowRowsFromProfile("a\nb\nc", '{"a":"1M","c":"200K"}'),
       [
-        { model: "a", window: "1M", imageHandling: "send-as-is" },
-        { model: "b", window: "", imageHandling: "send-as-is" },
-        { model: "c", window: "200K", imageHandling: "send-as-is" },
+        { model: "a", aliases: "", window: "1M", imageHandling: "send-as-is" },
+        { model: "b", aliases: "", window: "", imageHandling: "send-as-is" },
+        { model: "c", aliases: "", window: "200K", imageHandling: "send-as-is" },
       ],
     );
   });
@@ -100,9 +103,24 @@ describe("model-windows helpers", () => {
     assert.deepStrictEqual(
       modelWindowRowsFromProfile("a\nb\nc", '{}', '{"a":"vlm","b":"strip"}'),
       [
-        { model: "a", window: "", imageHandling: "vlm" },
-        { model: "b", window: "", imageHandling: "strip" },
-        { model: "c", window: "", imageHandling: "send-as-is" },
+        { model: "a", aliases: "", window: "", imageHandling: "vlm" },
+        { model: "b", aliases: "", window: "", imageHandling: "strip" },
+        { model: "c", aliases: "", window: "", imageHandling: "send-as-is" },
+      ],
+    );
+  });
+
+  it("modelWindowRowsFromProfile 解析模型别名并按模型分组", () => {
+    assert.deepStrictEqual(
+      modelWindowRowsFromProfile(
+        "glm-5.3\nluna-flash",
+        "{}",
+        "{}",
+        '{"luna":"glm-5.3","flash":"luna-flash"}',
+      ),
+      [
+        { model: "glm-5.3", aliases: "luna", window: "", imageHandling: "send-as-is" },
+        { model: "luna-flash", aliases: "flash", window: "", imageHandling: "send-as-is" },
       ],
     );
   });
@@ -110,14 +128,15 @@ describe("model-windows helpers", () => {
   it("serializeModelWindowRows 从行控件生成 modelList、modelWindows 和 modelVlm", () => {
     assert.deepStrictEqual(
       serializeModelWindowRows([
-        { model: "a", window: "1M", imageHandling: "vlm" },
-        { model: "", window: "400K", imageHandling: "send-as-is" },
-        { model: "b", window: "", imageHandling: "send-as-is" },
+        { model: "a", aliases: "luna", window: "1M", imageHandling: "vlm" },
+        { model: "", aliases: "", window: "400K", imageHandling: "send-as-is" },
+        { model: "b", aliases: "", window: "", imageHandling: "send-as-is" },
       ]),
       {
         modelList: "a\nb",
         modelWindows: '{"a":"1M"}',
         modelVlm: '{"a":"vlm"}',
+        modelAliases: [{ alias: "luna", model: "a" }],
       },
     );
   });
@@ -126,18 +145,18 @@ describe("model-windows helpers", () => {
     assert.deepStrictEqual(
       mergeModelWindowRows(
         [
-          { model: "deepseek-v4-flash", window: "1M", imageHandling: "vlm" },
-          { model: "  ", window: "", imageHandling: "send-as-is" },
+          { model: "deepseek-v4-flash", aliases: "flash", window: "1M", imageHandling: "vlm" },
+          { model: "  ", aliases: "", window: "", imageHandling: "send-as-is" },
         ],
         [
-          { model: "deepseek-v4-flash", window: "", imageHandling: "send-as-is" },
-          { model: "deepseek-v4-pro", window: "", imageHandling: "vlm" },
-          { model: " deepseek-v4-pro ", window: "200K", imageHandling: "send-as-is" },
+          { model: "deepseek-v4-flash", aliases: "", window: "", imageHandling: "send-as-is" },
+          { model: "deepseek-v4-pro", aliases: "", window: "", imageHandling: "vlm" },
+          { model: " deepseek-v4-pro ", aliases: "", window: "200K", imageHandling: "send-as-is" },
         ],
       ),
       [
-        { model: "deepseek-v4-flash", window: "1M", imageHandling: "vlm" },
-        { model: "deepseek-v4-pro", window: "", imageHandling: "vlm" },
+        { model: "deepseek-v4-flash", aliases: "flash", window: "1M", imageHandling: "vlm" },
+        { model: "deepseek-v4-pro", aliases: "", window: "", imageHandling: "vlm" },
       ],
     );
   });

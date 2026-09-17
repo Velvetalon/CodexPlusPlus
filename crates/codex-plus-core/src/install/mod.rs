@@ -288,6 +288,9 @@ where
         command.creation_flags(crate::windows_create_no_window());
     }
     command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|error| anyhow::anyhow!("无法启动 {}：{error}", path.to_string_lossy()))?;
     Ok(path.to_string_lossy().to_string())

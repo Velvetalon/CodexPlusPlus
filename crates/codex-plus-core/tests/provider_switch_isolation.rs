@@ -48,7 +48,12 @@ fn switching_providers_does_not_contaminate_the_previous_profile() {
     );
     settings = r.expect("切到 longcat").settings;
     let live1 = std::fs::read_to_string(home.join("config.toml")).unwrap();
-    assert!(live1.contains("longcat.example"), "live 应该是 longcat 的");
+    assert!(
+        live1.contains("LongCat-Flash")
+            && live1.contains("127.0.0.1:57321")
+            && !live1.contains("deepseek.example"),
+        "live 应该是 longcat 经 Codex++ proxy 的配置"
+    );
 
     // 2) 切到 deepseek（模拟用户第二步）
     settings.active_relay_id = "deepseek".into();
@@ -58,8 +63,10 @@ fn switching_providers_does_not_contaminate_the_previous_profile() {
     let settings = r.expect("切到 deepseek").settings;
     let live2 = std::fs::read_to_string(home.join("config.toml")).unwrap();
     assert!(
-        live2.contains("deepseek.example"),
-        "live 应该是 deepseek 的"
+        live2.contains("deepseek-v4")
+            && live2.contains("127.0.0.1:57321")
+            && !live2.contains("longcat.example"),
+        "live 应该是 deepseek 经 Codex++ proxy 的配置"
     );
 
     // 3) 检查 longcat 有没有被 deepseek 污染

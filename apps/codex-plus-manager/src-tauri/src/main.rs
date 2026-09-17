@@ -1,6 +1,9 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--cli") {
+        std::process::exit(codex_plus_manager_lib::cli::run());
+    }
     for arg in std::env::args() {
         if arg.starts_with("dreamskin://") {
             if codex_plus_manager_lib::handle_dream_skin_url(&arg) {

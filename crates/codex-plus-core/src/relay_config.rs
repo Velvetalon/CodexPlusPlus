@@ -352,7 +352,7 @@ pub fn apply_relay_config_to_home_with_session_provider(
         "",
         &codex_base_url,
         bearer_token,
-        true,
+        session_provider == RelaySessionProvider::Openai,
         session_provider,
     )?;
     let auth_contents = serde_json::to_string_pretty(&json!({
@@ -366,6 +366,66 @@ pub fn apply_relay_config_to_home_with_session_provider(
         backup_path,
         configured: status.configured,
     })
+}
+
+pub fn apply_aggregate_relay_profile_to_home_with_session_provider(
+    home: &Path,
+    profile: &RelayProfile,
+    common_config_contents: &str,
+    bearer_token: &str,
+    proxy_port: u16,
+    session_provider: RelaySessionProvider,
+) -> anyhow::Result<RelayApplyResult> {
+    if profile.relay_mode != crate::settings::RelayMode::Aggregate {
+        anyhow::bail!("仅聚合供应商可写入聚合代理配置");
+    }
+    let auth_contents = if session_provider == RelaySessionProvider::Openai {
+        let live_auth = read_optional_text(&home.join("auth.json"))?;
+        let source = if auth_contents_looks_like_chatgpt_auth(&live_auth) {
+            live_auth.as_str()
+        } else if auth_contents_looks_like_chatgpt_auth(&profile.auth_contents) {
+            profile.auth_contents.as_str()
+        } else {
+            anyhow::bail!(
+                "OpenAI 会话身份需要 ChatGPT 登录；未找到当前或已保存的官方账号凭据，请先登录官方账号。原配置未改动。"
+            );
+        };
+        remove_openai_api_key_from_auth_contents(source)?
+    } else {
+        serde_json::to_string_pretty(&json!({"OPENAI_API_KEY": bearer_token.trim()}))?
+    };
+    let bearer_token = bearer_token.trim();
+    if bearer_token.is_empty() {
+        anyhow::bail!("聚合代理 Key 不能为空");
+    }
+    let codex_base_url = codex_base_url_for_protocol(
+        &relay_profile_base_url(profile),
+        RelayProtocol::Responses,
+        proxy_port,
+    );
+    let base_config = upsert_model_provider_config_with_session_provider(
+        "",
+        &codex_base_url,
+        bearer_token,
+        session_provider == RelaySessionProvider::Openai,
+        session_provider,
+    )?;
+    let mut effective_profile = profile.clone();
+    effective_profile.config_contents = base_config;
+    let selected_common = if effective_profile.use_common_config {
+        prepare_common_config_for_apply(common_config_contents)?
+    } else {
+        String::new()
+    };
+    let profile_config = complete_relay_profile_config(&effective_profile)?;
+    let config_with_common = merge_common_config_into_config(&profile_config, &selected_common)?;
+    let config_with_common =
+        preserve_unmanaged_live_context_entries(home, &config_with_common, common_config_contents)?;
+    let config_with_limits =
+        apply_profile_context_to_config(&effective_profile, &config_with_common)?;
+    let config_with_catalog =
+        apply_model_catalog_to_config(home, &effective_profile, &config_with_limits)?;
+    apply_relay_files_to_home(home, &config_with_catalog, &auth_contents)
 }
 
 pub fn apply_pure_api_config_to_home(
@@ -440,15 +500,11 @@ pub fn apply_relay_profile_files_to_home_with_context(
     } else {
         String::new()
     };
-    let profile_config = complete_relay_profile_config(profile)?;
+    let profile_config = complete_relay_profile_config_with_proxy(profile, true)?;
     let config_with_common = merge_common_config_into_config(&profile_config, &selected_common)?;
     let config_with_common =
         preserve_unmanaged_live_context_entries(home, &config_with_common, common_config_contents)?;
-    let config_with_limits = apply_context_limits_to_config(
-        &config_with_common,
-        &profile.context_window,
-        &profile.auto_compact_limit,
-    )?;
+    let config_with_limits = apply_profile_context_to_config(profile, &config_with_common)?;
     let config_with_catalog = apply_model_catalog_to_config(home, profile, &config_with_limits)?;
     let compatible_config = apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
     let auth_contents = relay_profile_auth_contents_for_apply(profile)?;
@@ -465,15 +521,11 @@ pub fn apply_relay_profile_to_home_with_switch_rules(
     } else {
         String::new()
     };
-    let profile_config = complete_relay_profile_config(profile)?;
+    let profile_config = complete_relay_profile_config_with_proxy(profile, true)?;
     let config_with_common = merge_common_config_into_config(&profile_config, &selected_common)?;
     let config_with_common =
         preserve_unmanaged_live_context_entries(home, &config_with_common, common_config_contents)?;
-    let config_with_limits = apply_context_limits_to_config(
-        &config_with_common,
-        &profile.context_window,
-        &profile.auto_compact_limit,
-    )?;
+    let config_with_limits = apply_profile_context_to_config(profile, &config_with_common)?;
     let config_with_catalog = apply_model_catalog_to_config(home, profile, &config_with_limits)?;
     let compatible_config = apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
 
@@ -504,13 +556,9 @@ pub fn apply_relay_profile_config_to_home_with_context(
     } else {
         String::new()
     };
-    let profile_config = complete_relay_profile_config(profile)?;
+    let profile_config = complete_relay_profile_config_with_proxy(profile, true)?;
     let config_with_common = merge_common_config_into_config(&profile_config, &selected_common)?;
-    let config_with_limits = apply_context_limits_to_config(
-        &config_with_common,
-        &profile.context_window,
-        &profile.auto_compact_limit,
-    )?;
+    let config_with_limits = apply_profile_context_to_config(profile, &config_with_common)?;
     let config_with_catalog = apply_model_catalog_to_config(home, profile, &config_with_limits)?;
     let compatible_config = apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
     apply_relay_config_file_to_home(home, &compatible_config)
@@ -579,7 +627,7 @@ pub fn apply_pure_api_config_to_home_with_session_provider(
         "",
         &codex_base_url,
         bearer_token,
-        false,
+        session_provider == RelaySessionProvider::Openai,
         session_provider,
     )?;
     let auth_contents = serde_json::to_string_pretty(&json!({
@@ -697,6 +745,7 @@ fn codex_base_url_for_protocol(base_url: &str, protocol: RelayProtocol, proxy_po
 }
 
 const OPENAI_BASE_URL_KEY: &str = "openai_base_url";
+const CODEX_PLUS_UPSTREAM_BASE_URL_KEY: &str = "codex_plus_upstream_base_url";
 
 fn managed_openai_base_url() -> String {
     crate::protocol_proxy::local_responses_proxy_base_url(
@@ -857,6 +906,8 @@ pub fn backfill_relay_profile_from_home_with_common(
     };
     profile.config_contents =
         restore_profile_provider_id_for_backfill(&profile.config_contents, &template_config)?;
+    profile.config_contents =
+        remove_root_key(&profile.config_contents, CODEX_PLUS_UPSTREAM_BASE_URL_KEY);
     if profile.protocol == RelayProtocol::Responses
         && provider_string_from_config(&profile.config_contents, "base_url").as_deref()
             == Some(
@@ -1669,6 +1720,44 @@ fn apply_context_limits_to_config(
     Ok(normalize_optional_toml(doc))
 }
 
+fn apply_profile_context_to_config(
+    profile: &RelayProfile,
+    config_text: &str,
+) -> anyhow::Result<String> {
+    let config_text = apply_context_limits_to_config(
+        config_text,
+        &profile.context_window,
+        &profile.auto_compact_limit,
+    )?;
+    if profile.relay_mode != crate::settings::RelayMode::Aggregate {
+        return Ok(config_text);
+    }
+    let mut doc = parse_toml_document(&config_text)?;
+    if doc.get("features").and_then(Item::as_table_like).is_none() {
+        doc["features"] = toml_edit::table();
+    }
+    let features = doc
+        .get_mut("features")
+        .and_then(Item::as_table_like_mut)
+        .expect("features table was created above");
+    if features
+        .get("context_management")
+        .and_then(Item::as_table_like)
+        .is_none()
+    {
+        features.insert("context_management", toml_edit::table());
+    }
+    features
+        .get_mut("context_management")
+        .and_then(Item::as_table_like_mut)
+        .expect("context_management table was created above")
+        .insert(
+            "experimental_mode",
+            toml_edit::value(profile.new_context_management),
+        );
+    Ok(normalize_optional_toml(doc))
+}
+
 fn apply_model_catalog_to_config(
     home: &Path,
     profile: &RelayProfile,
@@ -1822,6 +1911,15 @@ pub fn apply_deepseek_responses_compatibility(
 }
 
 fn uses_official_deepseek_responses_for_config(profile: &RelayProfile, config_text: &str) -> bool {
+    if let Some(base_url) = root_key_string(config_text, CODEX_PLUS_UPSTREAM_BASE_URL_KEY)
+        .filter(|value| !value.trim().is_empty())
+        && base_url.trim()
+            != crate::protocol_proxy::local_responses_proxy_base_url(
+                crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+            )
+    {
+        return deepseek_api_base_url(&base_url);
+    }
     if let Ok(doc) = parse_toml_document(config_text) {
         if let Some(provider_id) = active_provider_id(&doc) {
             if let Some(provider) = doc
@@ -1839,6 +1937,13 @@ fn uses_official_deepseek_responses_for_config(profile: &RelayProfile, config_te
                     return false;
                 }
                 if let Some(base_url) = provider.get("base_url").and_then(Item::as_str) {
+                    if base_url.trim()
+                        == crate::protocol_proxy::local_responses_proxy_base_url(
+                            crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+                        )
+                    {
+                        return uses_official_deepseek_responses(profile);
+                    }
                     return deepseek_api_base_url(base_url);
                 }
             }
@@ -1847,6 +1952,13 @@ fn uses_official_deepseek_responses_for_config(profile: &RelayProfile, config_te
         if profile.protocol == RelayProtocol::Responses
             && let Some(base_url) = root_key_string(config_text, "base_url")
         {
+            if base_url.trim()
+                == crate::protocol_proxy::local_responses_proxy_base_url(
+                    crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+                )
+            {
+                return uses_official_deepseek_responses(profile);
+            }
             return deepseek_api_base_url(&base_url);
         }
     }
@@ -2498,6 +2610,13 @@ pub fn relay_profile_api_key(profile: &RelayProfile) -> String {
 }
 
 fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<String> {
+    complete_relay_profile_config_with_proxy(profile, false)
+}
+
+fn complete_relay_profile_config_with_proxy(
+    profile: &RelayProfile,
+    force_proxy: bool,
+) -> anyhow::Result<String> {
     let mut doc = parse_toml_document(&profile.config_contents)?;
     let session_provider_id = active_session_provider_id(&doc);
     let uses_openai_provider = session_provider_id == "openai";
@@ -2549,6 +2668,11 @@ fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<Strin
 
     let base_url = relay_profile_base_url(profile);
     let api_key = relay_profile_api_key(profile);
+    if force_proxy && profile.protocol == RelayProtocol::Responses {
+        doc[CODEX_PLUS_UPSTREAM_BASE_URL_KEY] = toml_edit::value(base_url.trim());
+    } else {
+        doc.as_table_mut().remove(CODEX_PLUS_UPSTREAM_BASE_URL_KEY);
+    }
     doc.as_table_mut().remove(CHAT_UPSTREAM_BASE_URL_KEY);
     retain_only_provider_table(&mut doc, &transport_provider_id);
     for legacy_provider in LEGACY_RELAY_PROVIDERS {
@@ -2575,7 +2699,7 @@ fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<Strin
     }
     if profile.uses_no_auth() {
         provider["requires_openai_auth"] = toml_edit::value(true);
-    } else if profile.relay_mode != crate::settings::RelayMode::PureApi
+    } else if (uses_openai_provider || profile.relay_mode == crate::settings::RelayMode::Official)
         && provider
             .get("requires_openai_auth")
             .and_then(Item::as_bool)
@@ -2583,7 +2707,7 @@ fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<Strin
     {
         provider["requires_openai_auth"] = toml_edit::value(true);
     }
-    let provider_base_url = if profile.has_model_routes() || profile.uses_no_auth() {
+    let provider_base_url = if force_proxy || profile.has_model_routes() || profile.uses_no_auth() {
         crate::protocol_proxy::local_responses_proxy_base_url(
             crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
         )
@@ -2756,7 +2880,7 @@ fn config_has_model_provider(config_contents: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn auth_contents_looks_like_chatgpt_auth(contents: &str) -> bool {
+pub(crate) fn auth_contents_looks_like_chatgpt_auth(contents: &str) -> bool {
     let Ok(value) = serde_json::from_str::<Value>(contents) else {
         return false;
     };
@@ -3237,6 +3361,8 @@ fn upsert_model_provider_config_with_session_provider(
     provider["wire_api"] = toml_edit::value("responses");
     if requires_openai_auth {
         provider["requires_openai_auth"] = toml_edit::value(true);
+    } else {
+        provider.remove("requires_openai_auth");
     }
     provider["base_url"] = toml_edit::value(base_url);
     provider["experimental_bearer_token"] = toml_edit::value(bearer_token);

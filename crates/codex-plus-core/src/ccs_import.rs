@@ -147,6 +147,10 @@ pub fn relay_profile_from_ccs(
         upstream_base_url: provider.base_url.clone(),
         api_key: provider.api_key.clone(),
         protocol: provider.protocol,
+        responses_reasoning_policy: Default::default(),
+        responses_wire_policy: Default::default(),
+        custom_tools_as_functions: false,
+        native_agent_interop: Default::default(),
         relay_mode: RelayMode::PureApi,
         official_mix_api_key: false,
         no_auth: false,
@@ -157,6 +161,7 @@ pub fn relay_profile_from_ccs(
         use_common_config: true,
         context_window: String::new(),
         auto_compact_limit: String::new(),
+        new_context_management: false,
         model_insert_mode: Default::default(),
         model_list: String::new(),
         model_windows: String::new(),
@@ -168,6 +173,7 @@ pub fn relay_profile_from_ccs(
         sub2api_enabled: false,
         sub2api_multiplier: String::new(),
         model_routes: Vec::new(),
+        model_aliases: Vec::new(),
     }
 }
 

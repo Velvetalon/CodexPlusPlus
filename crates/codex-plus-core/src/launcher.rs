@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -604,6 +604,31 @@ fn helper_bind_host() -> String {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "127.0.0.1".to_string())
+}
+
+pub async fn helper_backend_available(helper_port: u16) -> bool {
+    let Ok(client) = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    else {
+        return false;
+    };
+    let Ok(response) = client
+        .get(format!("http://127.0.0.1:{helper_port}/backend/status"))
+        .send()
+        .await
+    else {
+        return false;
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    let Ok(payload) = response.json::<serde_json::Value>().await else {
+        return false;
+    };
+    payload.get("status").and_then(serde_json::Value::as_str) == Some("ok")
+        && payload.get("transport").and_then(serde_json::Value::as_str) == Some("http-helper")
 }
 
 #[async_trait(?Send)]
@@ -1219,6 +1244,35 @@ async fn handle_helper_connection(
             "application/json; charset=utf-8".to_string(),
             "helper.backend_status_ok",
         )
+    } else if path == "/relay-rotation/status" && matches!(method, "GET" | "POST") {
+        let settings = crate::settings::SettingsStore::default()
+            .load()
+            .unwrap_or_default();
+        let cooldown = crate::relay_rotation::priority_fallback_cooldown_status(&settings);
+        (
+            "200 OK".to_string(),
+            serde_json::to_vec(&serde_json::json!({
+                "status": "ok",
+                "message": "优先降级冷却状态已读取。",
+                "aggregateId": cooldown.aggregate_id,
+                "members": cooldown.members
+            }))?,
+            "application/json; charset=utf-8".to_string(),
+            "helper.relay_rotation_status_ok",
+        )
+    } else if path == "/relay-rotation/reset" && method == "POST" {
+        let cooldown = crate::relay_rotation::reset_all_priority_fallback_cooldowns();
+        (
+            "200 OK".to_string(),
+            serde_json::to_vec(&serde_json::json!({
+                "status": "ok",
+                "message": "所有供应商的冷却时间和连续失败计数已重置。",
+                "aggregateId": cooldown.aggregate_id,
+                "members": cooldown.members
+            }))?,
+            "application/json; charset=utf-8".to_string(),
+            "helper.relay_rotation_reset_ok",
+        )
     } else if path == "/diagnostics/log" && matches!(method, "POST" | "OPTIONS") {
         if method == "POST" {
             let detail =
@@ -1571,14 +1625,102 @@ async fn handle_protocol_proxy_connection(
     if upstream.is_stream {
         write_http_stream_headers(stream, "200 OK", "text/event-stream; charset=utf-8").await?;
         if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
+            // Custom-as-Function（开关开启时）最先处理：吸收受管 function 事件，
+            // 完整校验后交付 custom 事件组；计划为空时逐字节透传。
+            let mut custom_agents = crate::custom_tool_adapter::CustomToolSseRewriter::new(
+                upstream.custom_adapter.clone().unwrap_or_default(),
+            );
+            let mut native_agents = upstream
+                .native_agent_plaintext
+                .then(crate::native_agents::NativeAgentSseRewriter::default);
+            let mut namespace_agents = crate::protocol_proxy::ResponsesNamespaceSseRewriter::new(
+                upstream.namespace_tools.clone(),
+            );
             let mut bytes_stream = upstream.response.bytes_stream();
+            // R10：上游读取错误必须区分于正常完成；不再"出错就 break，随后记 stream_ok"。
+            let mut stream_error: Option<String> = None;
             while let Some(chunk) = bytes_stream.next().await {
-                if let Ok(bytes) = chunk {
-                    stream.write_all(&bytes).await?;
-                } else {
-                    break;
+                match chunk {
+                    Ok(bytes) => {
+                        let bytes = custom_agents.push_bytes(&bytes);
+                        let bytes = namespace_agents.push_bytes(&bytes);
+                        let bytes = if let Some(rewriter) = &mut native_agents {
+                            rewriter.push_bytes(&bytes)
+                        } else {
+                            bytes
+                        };
+                        if !bytes.is_empty() {
+                            stream.write_all(&bytes).await?;
+                        }
+                    }
+                    Err(error) => {
+                        stream_error = Some(error.to_string());
+                        break;
+                    }
                 }
             }
+            let (custom_tail, custom_truncated) = custom_agents.finish_with_truncation();
+            let pushed_custom_tail = namespace_agents.push_bytes(&custom_tail);
+            let (namespace_tail, namespace_truncated) = namespace_agents.finish_with_truncation();
+            let namespace_tail = [pushed_custom_tail, namespace_tail].concat();
+            let (tail, native_truncated) = if let Some(rewriter) = &mut native_agents {
+                let mut tail = rewriter.push_bytes(&namespace_tail);
+                let (native_tail, truncated) = rewriter.finish_with_truncation();
+                tail.extend(native_tail);
+                (tail, truncated)
+            } else {
+                (namespace_tail, false)
+            };
+            if let Some(error) = stream_error {
+                // 上游错误：不发伪造的成功结束，不记 stream_ok，丢弃不完整的半帧。
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "helper.protocol_proxy_stream_failed",
+                    json!({
+                        "method": method,
+                        "path": path,
+                        "streamState": "upstream_error",
+                        "error": error
+                    }),
+                );
+                stream
+                    .write_all(b": codex-plus proxy: upstream stream error\r\n\r\n")
+                    .await?;
+                stream.flush().await?;
+                log_helper_response(
+                    "helper.protocol_proxy_stream_failed",
+                    method,
+                    path,
+                    "200 OK (upstream error)",
+                    remote_addr_text,
+                );
+                stream.shutdown().await?;
+                return Ok(());
+            }
+            if native_truncated || namespace_truncated || custom_truncated {
+                // EOF 处半帧：丢弃并明确报告截断，不把截断当成正常完成。
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "helper.protocol_proxy_stream_failed",
+                    json!({
+                        "method": method,
+                        "path": path,
+                        "streamState": "truncated"
+                    }),
+                );
+                stream
+                    .write_all(b": codex-plus proxy: upstream stream truncated\r\n\r\n")
+                    .await?;
+                stream.flush().await?;
+                log_helper_response(
+                    "helper.protocol_proxy_stream_failed",
+                    method,
+                    path,
+                    "200 OK (truncated)",
+                    remote_addr_text,
+                );
+                stream.shutdown().await?;
+                return Ok(());
+            }
+            stream.write_all(&tail).await?;
             log_helper_response(
                 "helper.protocol_proxy_stream_ok",
                 method,
@@ -1591,7 +1733,12 @@ async fn handle_protocol_proxy_connection(
         }
         let mut converter = request_json
             .as_ref()
-            .map(crate::protocol_proxy::ChatSseToResponsesConverter::with_request)
+            .map(|request| {
+                crate::protocol_proxy::ChatSseToResponsesConverter::with_request_plan(
+                    request,
+                    upstream.custom_adapter.as_ref(),
+                )
+            })
             .unwrap_or_default();
         let mut bytes_stream = upstream.response.bytes_stream();
         let mut stream_failed = false;
@@ -1633,7 +1780,17 @@ async fn handle_protocol_proxy_connection(
         return Ok(());
     }
     let upstream_body = upstream.response.bytes().await?;
+    let upstream_body = crate::protocol_proxy::restore_responses_json_with_custom_adapter(
+        &upstream_body,
+        upstream.custom_adapter.as_ref(),
+        &upstream.namespace_tools,
+    )?;
     if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
+        let body = if upstream.native_agent_plaintext {
+            crate::native_agents::restore_json(&upstream_body)
+        } else {
+            upstream_body.to_vec()
+        };
         write_http_response(
             stream,
             "200 OK",
@@ -1642,7 +1799,7 @@ async fn handle_protocol_proxy_connection(
             } else {
                 &upstream.content_type
             },
-            &upstream_body,
+            &body,
         )
         .await?;
         log_helper_response(
@@ -1657,7 +1814,11 @@ async fn handle_protocol_proxy_connection(
     }
     let chat_json: serde_json::Value = serde_json::from_slice(&upstream_body)?;
     let response_json = if let Some(request_json) = request_json.as_ref() {
-        crate::protocol_proxy::chat_completion_to_response_with_request(chat_json, request_json)?
+        crate::protocol_proxy::chat_completion_to_response_with_request_plan(
+            chat_json,
+            request_json,
+            upstream.custom_adapter.as_ref(),
+        )?
     } else {
         crate::protocol_proxy::chat_completion_to_response(chat_json)?
     };
@@ -1893,8 +2054,9 @@ mod computer_use_tests {
 }
 
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
-const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
-const MAX_HTTP_ENCODED_BODY_BYTES: usize = 64 * 1024 * 1024;
+// Krill Responses 实测：100 MiB 成功，多一个字节返回上游 413（2026-09-09）。
+const MAX_HTTP_BODY_BYTES: usize = 100 * 1024 * 1024;
+const MAX_HTTP_ENCODED_BODY_BYTES: usize = 2 * MAX_HTTP_BODY_BYTES;
 
 struct HttpRequest {
     headers: Vec<u8>,
@@ -3264,6 +3426,20 @@ mod tests {
         assert!(decode_protocol_proxy_request_body(body, Some("gzip")).is_err());
     }
 
+    #[test]
+    fn protocol_proxy_zstd_body_accepts_upstream_limit_and_rejects_one_byte_more() {
+        let mut body = vec![b' '; MAX_HTTP_BODY_BYTES];
+        let compressed = zstd::stream::encode_all(std::io::Cursor::new(&body), 1).unwrap();
+        let decoded = decode_protocol_proxy_request_body(&compressed, Some("zstd")).unwrap();
+        assert_eq!(decoded.len(), MAX_HTTP_BODY_BYTES);
+        drop(decoded);
+
+        body.push(b' ');
+        let compressed = zstd::stream::encode_all(std::io::Cursor::new(&body), 1).unwrap();
+        let error = decode_protocol_proxy_request_body(&compressed, Some("zstd")).unwrap_err();
+        assert!(error.to_string().contains("解压后的请求体超过大小限制"));
+    }
+
     #[tokio::test]
     async fn helper_replaces_chatgpt_auth_when_proxying_zstd_responses_request() {
         let _settings_guard = crate::paths::settings_path_test_guard();
@@ -3359,6 +3535,182 @@ mod tests {
             serde_json::from_slice(&upstream_request[header_end + 4..]).unwrap();
         assert_eq!(upstream_body["model"], "gpt-5.6-sol");
         crate::paths::set_settings_path_for_tests(previous_settings_path);
+    }
+
+    #[tokio::test]
+    async fn helper_cooldown_routes_hide_429_and_apply_three_failure_threshold_and_reset() {
+        let _settings_guard = crate::paths::settings_path_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let settings_path = temp.path().join("settings.json");
+        let previous_settings_path =
+            crate::paths::set_settings_path_for_tests(Some(settings_path.clone()));
+        let failing_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let failing_addr = failing_listener.local_addr().unwrap();
+        let working_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let working_addr = working_listener.local_addr().unwrap();
+        let failing_calls = Arc::new(AtomicUsize::new(0));
+        let working_calls = Arc::new(AtomicUsize::new(0));
+        let failing_server = tokio::spawn(mock_responses_server(
+            failing_listener,
+            429,
+            failing_calls.clone(),
+        ));
+        let working_server = tokio::spawn(mock_responses_server(
+            working_listener,
+            200,
+            working_calls.clone(),
+        ));
+        let settings = serde_json::json!({
+            "relayProfiles": [
+                {
+                    "id": "relay-threshold-a",
+                    "name": "A",
+                    "baseUrl": format!("http://{failing_addr}/v1"),
+                    "apiKey": "sk-a",
+                    "protocol": "responses",
+                    "relayMode": "pureApi"
+                },
+                {
+                    "id": "relay-threshold-b",
+                    "name": "B",
+                    "baseUrl": format!("http://{working_addr}/v1"),
+                    "apiKey": "sk-b",
+                    "protocol": "responses",
+                    "relayMode": "pureApi"
+                },
+                {
+                    "id": "aggregate-threshold",
+                    "name": "Aggregate",
+                    "relayMode": "aggregate",
+                    "protocol": "responses"
+                }
+            ],
+            "aggregateRelayProfiles": [{
+                "id": "aggregate-threshold",
+                "name": "Aggregate",
+                "sessionProvider": "custom",
+                "strategy": "priorityFallback",
+                "members": [
+                    { "relayId": "relay-threshold-a", "weight": 1 },
+                    { "relayId": "relay-threshold-b", "weight": 1 }
+                ]
+            }],
+            "activeRelayId": "aggregate-threshold",
+            "activeAggregateRelayId": "aggregate-threshold"
+        });
+        std::fs::write(settings_path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+
+        let request_body = r#"{"model":"gpt-test","input":"probe","stream":false}"#;
+        let request = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{request_body}",
+            request_body.len()
+        );
+        for expected_failures in [1, 2] {
+            let response = send_raw_helper_request(request.as_bytes()).await;
+            assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK"));
+            let status = helper_json_response(
+                &send_raw_helper_request(
+                    b"GET /relay-rotation/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+                )
+                .await,
+            );
+            assert_eq!(
+                status["members"][0]["consecutiveFailures"],
+                expected_failures
+            );
+            assert_eq!(status["members"][0]["cooldownRemainingSeconds"], 0);
+            assert_eq!(working_calls.load(Ordering::SeqCst), expected_failures);
+        }
+
+        let response = send_raw_helper_request(request.as_bytes()).await;
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK"));
+        let cooling = helper_json_response(
+            &send_raw_helper_request(
+                b"GET /relay-rotation/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            )
+            .await,
+        );
+        assert_eq!(cooling["members"][0]["consecutiveFailures"], 0);
+        assert!(
+            cooling["members"][0]["cooldownRemainingSeconds"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(
+            cooling["members"][0]["lastCooldownReason"]["type"],
+            "httpStatus"
+        );
+        assert_eq!(
+            cooling["members"][0]["lastCooldownReason"]["statusCode"],
+            429
+        );
+
+        let response = send_raw_helper_request(request.as_bytes()).await;
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(failing_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(working_calls.load(Ordering::SeqCst), 4);
+
+        let reset = helper_json_response(
+            &send_raw_helper_request(
+                b"POST /relay-rotation/reset HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await,
+        );
+        assert_eq!(reset["members"][0]["consecutiveFailures"], 0);
+        assert_eq!(reset["members"][0]["cooldownRemainingSeconds"], 0);
+
+        let response = send_raw_helper_request(request.as_bytes()).await;
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(failing_calls.load(Ordering::SeqCst), 4);
+        assert_eq!(working_calls.load(Ordering::SeqCst), 5);
+
+        failing_server.abort();
+        working_server.abort();
+        crate::paths::set_settings_path_for_tests(previous_settings_path);
+    }
+
+    async fn mock_responses_server(
+        listener: tokio::net::TcpListener,
+        status_code: u16,
+        calls: Arc<AtomicUsize>,
+    ) {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            calls.fetch_add(1, Ordering::SeqCst);
+            let mut buffer = [0_u8; 8192];
+            let _ = stream.read(&mut buffer).await;
+            let (status, body) = if status_code == 200 {
+                (
+                    "200 OK",
+                    br#"{"id":"resp_mock","object":"response","status":"completed","output":[]}"#
+                        .as_slice(),
+                )
+            } else {
+                (
+                    "429 Too Many Requests",
+                    br#"{"error":{"message":"mock rate limit","type":"rate_limit_error"}}"#
+                        .as_slice(),
+                )
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.write_all(body).await;
+        }
+    }
+
+    fn helper_json_response(response: &[u8]) -> serde_json::Value {
+        let header_end = find_header_end(response).expect("helper response has headers");
+        serde_json::from_slice(&response[header_end + 4..]).unwrap()
     }
 
     async fn send_raw_helper_request(request: &[u8]) -> Vec<u8> {

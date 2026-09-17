@@ -36,6 +36,17 @@ pub struct RelayProfile {
     pub api_key: String,
     #[serde(default)]
     pub protocol: RelayProtocol,
+    #[serde(rename = "responsesReasoningPolicy", default)]
+    pub responses_reasoning_policy: ResponsesReasoningPolicy,
+    #[serde(rename = "responsesWirePolicy", default)]
+    pub responses_wire_policy: ResponsesWirePolicy,
+    /// Custom-as-Function 双向适配开关（默认关闭）。缺失字段的旧 profile 反序列化
+    /// 为 false，原有行为完全不变；始终序列化，保证 CLI provider-update 的
+    /// 允许字段检查能看到它。
+    #[serde(rename = "customToolsAsFunctions", default)]
+    pub custom_tools_as_functions: bool,
+    #[serde(rename = "nativeAgentInterop", default)]
+    pub native_agent_interop: NativeAgentInterop,
     #[serde(rename = "relayMode", default)]
     pub relay_mode: RelayMode,
     #[serde(rename = "officialMixApiKey", default)]
@@ -56,6 +67,8 @@ pub struct RelayProfile {
     pub context_window: String,
     #[serde(rename = "autoCompactLimit", default)]
     pub auto_compact_limit: String,
+    #[serde(default)]
+    pub new_context_management: bool,
     #[serde(rename = "modelInsertMode", default)]
     pub model_insert_mode: RelayModelInsertMode,
     #[serde(rename = "modelList", default)]
@@ -94,6 +107,12 @@ pub struct RelayProfile {
     pub sub2api_multiplier: String,
     #[serde(rename = "modelRoutes", default, skip_serializing_if = "Vec::is_empty")]
     pub model_routes: Vec<RelayModelRoute>,
+    #[serde(
+        rename = "modelAliases",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub model_aliases: Vec<RelayModelAlias>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -108,6 +127,68 @@ pub struct RelayModelRoute {
         skip_serializing_if = "String::is_empty"
     )]
     pub target_model: String,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
+    #[serde(rename = "restoreAt", default, skip_serializing_if = "Option::is_none")]
+    pub restore_at: Option<u64>,
+}
+
+impl RelayModelRoute {
+    pub fn is_effectively_enabled_at(&self, now_ms: u64) -> bool {
+        self.enabled
+            || self
+                .restore_at
+                .is_some_and(|restore_at| restore_at <= now_ms)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayModelRouteStatus {
+    pub model: String,
+    pub target_relay_id: String,
+    pub target_relay_name: String,
+    pub target_model: String,
+    pub enabled: bool,
+    pub restore_at: Option<u64>,
+    pub permanent: bool,
+    pub remaining_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayModelRoutesResult {
+    pub status: &'static str,
+    pub provider_id: String,
+    pub provider_name: String,
+    pub observed_at: u64,
+    pub routes: Vec<RelayModelRouteStatus>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetRelayModelRouteRequest {
+    pub id: String,
+    pub model: String,
+    pub enabled: bool,
+    #[serde(default)]
+    pub restore_at: Option<u64>,
+    #[serde(default)]
+    pub duration_seconds: Option<u64>,
+    #[serde(default)]
+    pub permanent: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetRelayModelRouteResult {
+    pub status: &'static str,
+    pub provider_id: String,
+    pub observed_at: u64,
+    pub route: RelayModelRouteStatus,
+    pub dry_run: bool,
+    pub restart_requested: bool,
+    pub applied_live_config: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -115,6 +196,7 @@ pub struct RelayModelRoute {
 pub enum AggregateRelayStrategy {
     #[default]
     Failover,
+    PriorityFallback,
     ConversationRoundRobin,
     RequestRoundRobin,
     WeightedRoundRobin,
@@ -154,6 +236,8 @@ pub struct AggregateRelayProfile {
     #[serde(default)]
     pub session_provider: RelaySessionProvider,
     #[serde(default)]
+    pub code_mode_host: bool,
+    #[serde(default)]
     pub strategy: AggregateRelayStrategy,
     #[serde(default)]
     pub members: Vec<AggregateRelayMember>,
@@ -169,6 +253,10 @@ impl Default for RelayProfile {
             upstream_base_url: String::new(),
             api_key: String::new(),
             protocol: RelayProtocol::Responses,
+            responses_reasoning_policy: ResponsesReasoningPolicy::default(),
+            responses_wire_policy: ResponsesWirePolicy::default(),
+            custom_tools_as_functions: false,
+            native_agent_interop: NativeAgentInterop::default(),
             relay_mode: RelayMode::Official,
             official_mix_api_key: false,
             no_auth: false,
@@ -179,6 +267,7 @@ impl Default for RelayProfile {
             use_common_config: true,
             context_window: String::new(),
             auto_compact_limit: String::new(),
+            new_context_management: false,
             model_insert_mode: RelayModelInsertMode::Patch,
             model_list: String::new(),
             model_windows: String::new(),
@@ -190,6 +279,7 @@ impl Default for RelayProfile {
             sub2api_enabled: false,
             sub2api_multiplier: String::new(),
             model_routes: Vec::new(),
+            model_aliases: Vec::new(),
         }
     }
 }
@@ -220,6 +310,72 @@ pub enum RelayProtocol {
     #[default]
     Responses,
     ChatCompletions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ResponsesReasoningPolicy {
+    #[default]
+    Passthrough,
+    OpenAiOpaque,
+    Strip,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum NativeAgentInterop {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl NativeAgentInterop {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+}
+
+/// R08/R07.2：Responses wire 结构策略。
+/// compatible：沿用既有兼容能力（namespace 扁平化、ID 规范化、原生子任务别名等）；
+/// passthrough：跳过全部 Codex 扩展/工具/任务/ID 结构改写，供原生透传链路使用。
+/// 缺失该字段的旧 profile 反序列化时取 Compatible，保持既有行为不变。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ResponsesWirePolicy {
+    #[default]
+    Compatible,
+    Passthrough,
+}
+
+impl ResponsesWirePolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Compatible => "compatible",
+            Self::Passthrough => "passthrough",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayModelAlias {
+    pub alias: String,
+    pub model: String,
+}
+
+impl ResponsesReasoningPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Passthrough => "passthrough",
+            Self::OpenAiOpaque => "openAiOpaque",
+            Self::Strip => "strip",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -636,6 +792,10 @@ impl BackendSettings {
                 },
                 api_key: self.relay_api_key.clone(),
                 protocol: RelayProtocol::Responses,
+                responses_reasoning_policy: ResponsesReasoningPolicy::default(),
+                responses_wire_policy: ResponsesWirePolicy::default(),
+                custom_tools_as_functions: false,
+                native_agent_interop: NativeAgentInterop::default(),
                 relay_mode: RelayMode::MixedApi,
                 official_mix_api_key: true,
                 no_auth: false,
@@ -646,6 +806,7 @@ impl BackendSettings {
                 use_common_config: true,
                 context_window: String::new(),
                 auto_compact_limit: String::new(),
+                new_context_management: false,
                 model_insert_mode: RelayModelInsertMode::Patch,
                 model_list: String::new(),
                 model_windows: String::new(),
@@ -657,6 +818,7 @@ impl BackendSettings {
                 sub2api_enabled: false,
                 sub2api_multiplier: String::new(),
                 model_routes: Vec::new(),
+                model_aliases: Vec::new(),
             };
         }
 
@@ -665,7 +827,29 @@ impl BackendSettings {
             .iter()
             .find(|profile| profile.id == self.active_relay_id)
         {
-            return profile.clone();
+            let mut profile = profile.clone();
+            self.apply_aggregate_context_fallback(&mut profile);
+            if profile.relay_mode == RelayMode::Aggregate
+                && self
+                    .active_aggregate_relay_profile()
+                    .is_some_and(|aggregate| {
+                        aggregate.session_provider == RelaySessionProvider::Openai
+                    })
+                && !crate::relay_config::auth_contents_looks_like_chatgpt_auth(
+                    &profile.auth_contents,
+                )
+            {
+                if let Some(official) = self.relay_profiles.iter().find(|candidate| {
+                    candidate.id == default_active_relay_id()
+                        && candidate.relay_mode == RelayMode::Official
+                        && crate::relay_config::auth_contents_looks_like_chatgpt_auth(
+                            &candidate.auth_contents,
+                        )
+                }) {
+                    profile.auth_contents = official.auth_contents.clone();
+                }
+            }
+            return profile;
         }
 
         RelayProfile {
@@ -688,6 +872,10 @@ impl BackendSettings {
             },
             api_key: self.relay_api_key.clone(),
             protocol: RelayProtocol::Responses,
+            responses_reasoning_policy: ResponsesReasoningPolicy::default(),
+            responses_wire_policy: ResponsesWirePolicy::default(),
+            custom_tools_as_functions: false,
+            native_agent_interop: NativeAgentInterop::default(),
             relay_mode: RelayMode::Official,
             official_mix_api_key: false,
             no_auth: false,
@@ -698,6 +886,7 @@ impl BackendSettings {
             use_common_config: true,
             context_window: String::new(),
             auto_compact_limit: String::new(),
+            new_context_management: false,
             model_insert_mode: RelayModelInsertMode::Patch,
             model_list: String::new(),
             model_windows: String::new(),
@@ -709,6 +898,7 @@ impl BackendSettings {
             sub2api_enabled: false,
             sub2api_multiplier: String::new(),
             model_routes: Vec::new(),
+            model_aliases: Vec::new(),
         }
     }
 
@@ -735,6 +925,81 @@ impl BackendSettings {
             .iter()
             .find(|profile| profile.id == active_aggregate_id)
             .cloned()
+    }
+
+    fn apply_aggregate_context_fallback(&self, profile: &mut RelayProfile) {
+        if profile.relay_mode != RelayMode::Aggregate {
+            return;
+        }
+        let Some(aggregate) = self.active_aggregate_relay_profile() else {
+            return;
+        };
+        let preferred_model = relay_profile_models(profile).into_iter().next();
+        let member_profiles = aggregate
+            .members
+            .iter()
+            .filter_map(|member| {
+                self.relay_profiles
+                    .iter()
+                    .find(|candidate| candidate.id == member.relay_id)
+            })
+            .collect::<Vec<_>>();
+        let mut aggregate_models = Vec::new();
+        for member in &member_profiles {
+            for model in relay_profile_models(member) {
+                if !aggregate_models.contains(&model) {
+                    aggregate_models.push(model);
+                }
+            }
+        }
+        if !aggregate_models.is_empty() {
+            profile.model = preferred_model
+                .filter(|model| aggregate_models.contains(model))
+                .unwrap_or_else(|| aggregate_models[0].clone());
+            profile.model_list = aggregate_models.join("\n");
+        }
+        let mut source: Option<(&RelayProfile, u64)> = None;
+        for member_profile in member_profiles {
+            let Some(context_window) = member_profile
+                .context_window
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0)
+            else {
+                continue;
+            };
+            if source.is_none_or(|(_, selected_window)| context_window > selected_window) {
+                source = Some((member_profile, context_window));
+            }
+        }
+        let Some((source, source_window)) = source else {
+            return;
+        };
+
+        let inherited_context = profile.context_window.trim().is_empty();
+        let explicit_context_matches_source = profile
+            .context_window
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .is_some_and(|value| value == source_window);
+        if inherited_context {
+            profile.context_window = source.context_window.clone();
+        }
+        if profile.auto_compact_limit.trim().is_empty()
+            && (inherited_context || explicit_context_matches_source)
+        {
+            profile.auto_compact_limit = source.auto_compact_limit.clone();
+        }
+        if inherited_context {
+            if profile.model.trim().is_empty() {
+                profile.model = source.model.clone();
+            }
+            if profile.model_windows.trim().is_empty() {
+                profile.model_windows = source.model_windows.clone();
+            }
+        }
     }
 
     pub fn active_relay_session_provider(&self) -> RelaySessionProvider {
@@ -766,6 +1031,19 @@ impl BackendSettings {
             || self.active_relay_profile().uses_no_auth()
             || self.active_relay_session_provider() == RelaySessionProvider::Openai
     }
+}
+
+fn relay_profile_models(profile: &RelayProfile) -> Vec<String> {
+    let mut models = Vec::new();
+    for raw in std::iter::once(profile.model.as_str())
+        .chain(profile.model_list.split(['\r', '\n', ',']).map(str::trim))
+    {
+        let (model, _) = crate::model_suffix::parse_model_suffix(raw);
+        if !model.is_empty() && !models.contains(&model) {
+            models.push(model);
+        }
+    }
+    models
 }
 
 pub fn default_stepwise_api_key_env() -> String {
@@ -943,6 +1221,10 @@ pub fn default_true() -> bool {
     true
 }
 
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
 pub fn default_relay_base_url() -> String {
     String::new()
 }
@@ -1084,6 +1366,22 @@ impl SettingsStore {
         Self { path }
     }
 
+    /// GUI and CLI control operations share a cross-process write lock.
+    pub fn control_lock(&self) -> anyhow::Result<fs::File> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.path.with_extension("control.lock"))?;
+        fs2::FileExt::try_lock_exclusive(&file)
+            .context("Another Codex++ control operation is writing settings; retry later")?;
+        Ok(file)
+    }
+
     pub fn load(&self) -> anyhow::Result<BackendSettings> {
         let contents = match fs::read_to_string(&self.path) {
             Ok(contents) => contents,
@@ -1104,8 +1402,127 @@ impl SettingsStore {
     pub fn save(&self, settings: &BackendSettings) -> anyhow::Result<()> {
         let mut settings = normalize_settings_config_sections(settings.clone());
         settings.codex_extra_args = normalize_codex_extra_args(&settings.codex_extra_args);
+        if let Ok(current) = self.load() {
+            preserve_model_route_states(&mut settings.relay_profiles, &current.relay_profiles);
+        }
         let bytes = serde_json::to_vec_pretty(&settings)?;
         atomic_write(&self.path, &bytes)
+    }
+
+    pub fn model_routes_list(&self, provider_id: &str) -> anyhow::Result<RelayModelRoutesResult> {
+        let settings = self.load()?;
+        let provider = settings
+            .relay_profiles
+            .iter()
+            .find(|profile| profile.id == provider_id)
+            .context("Provider not found")?;
+        let observed_at = unix_time_ms();
+        Ok(RelayModelRoutesResult {
+            status: "ok",
+            provider_id: provider.id.clone(),
+            provider_name: provider.name.clone(),
+            observed_at,
+            routes: provider
+                .model_routes
+                .iter()
+                .map(|route| model_route_status(&settings, route, observed_at))
+                .collect(),
+        })
+    }
+
+    pub fn model_route_set(
+        &self,
+        request: &SetRelayModelRouteRequest,
+        dry_run: bool,
+    ) -> anyhow::Result<SetRelayModelRouteResult> {
+        let recovery_choices = usize::from(request.restore_at.is_some())
+            + usize::from(request.duration_seconds.is_some())
+            + usize::from(request.permanent);
+        if request.enabled && recovery_choices != 0 {
+            anyhow::bail!("Recovery options are only valid when disabling a route");
+        }
+        if recovery_choices > 1 {
+            anyhow::bail!("restoreAt, durationSeconds and permanent are mutually exclusive");
+        }
+        if request.id.trim().is_empty() || request.model.trim().is_empty() {
+            anyhow::bail!("Provider id and model are required");
+        }
+        let observed_at = unix_time_ms();
+        let restore_at = if request.enabled || request.permanent {
+            None
+        } else if let Some(restore_at) = request.restore_at {
+            if restore_at <= observed_at {
+                anyhow::bail!("restoreAt must be a future UTC Unix millisecond timestamp");
+            }
+            Some(restore_at)
+        } else if let Some(duration_seconds) = request.duration_seconds {
+            if duration_seconds == 0 {
+                anyhow::bail!("durationSeconds must be positive");
+            }
+            Some(observed_at.saturating_add(duration_seconds.saturating_mul(1000)))
+        } else {
+            Some(observed_at.saturating_add(5 * 60 * 60 * 1000))
+        };
+
+        let _lock = self.control_lock()?;
+        let mut raw = self.load_raw_object()?;
+        let profiles = raw
+            .get_mut("relayProfiles")
+            .and_then(Value::as_array_mut)
+            .context("Provider list is missing")?;
+        let provider = profiles
+            .iter_mut()
+            .find(|value| {
+                value.get("id").and_then(Value::as_str).map(str::trim) == Some(request.id.trim())
+            })
+            .context("Provider not found")?;
+        let routes = provider
+            .get_mut("modelRoutes")
+            .and_then(Value::as_array_mut)
+            .context("Model route not found")?;
+        let route = routes
+            .iter_mut()
+            .find(|value| {
+                value.get("model").and_then(Value::as_str).map(str::trim)
+                    == Some(request.model.trim())
+            })
+            .context("Model route not found")?;
+        let route_object = route.as_object_mut().context("Invalid model route")?;
+        route_object.insert("enabled".to_string(), Value::Bool(request.enabled));
+        match restore_at {
+            Some(value) => {
+                route_object.insert("restoreAt".to_string(), Value::Number(value.into()));
+            }
+            None => {
+                route_object.remove("restoreAt");
+            }
+        }
+        let candidate = normalize_settings_config_sections(serde_json::from_value::<
+            BackendSettings,
+        >(Value::Object(raw.clone()))?);
+        let provider = candidate
+            .relay_profiles
+            .iter()
+            .find(|profile| profile.id.trim() == request.id.trim())
+            .context("Provider not found")?;
+        let route = provider
+            .model_routes
+            .iter()
+            .find(|route| route.model.trim() == request.model.trim())
+            .context("Model route not found")?;
+        let status = model_route_status(&candidate, route, observed_at);
+        if !dry_run {
+            atomic_write(&self.path, &serde_json::to_vec_pretty(&Value::Object(raw))?)?;
+        }
+        Ok(SetRelayModelRouteResult {
+            status: "ok",
+            provider_id: request.id.trim().to_string(),
+            observed_at,
+            route: status,
+            dry_run,
+            restart_requested: false,
+            applied_live_config: false,
+        })
     }
 
     pub fn update(&self, payload: Value) -> anyhow::Result<BackendSettings> {
@@ -1146,6 +1563,59 @@ impl SettingsStore {
         match serde_json::from_str::<Value>(&contents) {
             Ok(Value::Object(map)) => Ok(map),
             Ok(_) | Err(_) => Ok(settings_to_object(&BackendSettings::default())),
+        }
+    }
+}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn model_route_status(
+    settings: &BackendSettings,
+    route: &RelayModelRoute,
+    observed_at: u64,
+) -> RelayModelRouteStatus {
+    let enabled = route.is_effectively_enabled_at(observed_at);
+    let restore_at = (!enabled).then_some(route.restore_at).flatten();
+    RelayModelRouteStatus {
+        model: route.model.clone(),
+        target_relay_id: route.target_relay_id.clone(),
+        target_relay_name: settings
+            .relay_profiles
+            .iter()
+            .find(|profile| profile.id == route.target_relay_id)
+            .map(|profile| profile.name.clone())
+            .unwrap_or_default(),
+        target_model: route.target_model.clone(),
+        enabled,
+        restore_at,
+        permanent: !enabled && route.restore_at.is_none(),
+        remaining_seconds: restore_at
+            .map(|value| value.saturating_sub(observed_at).saturating_add(999) / 1000)
+            .unwrap_or(0),
+    }
+}
+
+fn preserve_model_route_states(next: &mut [RelayProfile], current: &[RelayProfile]) {
+    for profile in next {
+        let Some(current_profile) = current.iter().find(|item| item.id == profile.id) else {
+            continue;
+        };
+        for route in &mut profile.model_routes {
+            if let Some(current_route) = current_profile
+                .model_routes
+                .iter()
+                .find(|item| item.model == route.model)
+            {
+                route.enabled = current_route.enabled;
+                route.restore_at = current_route.restore_at;
+            }
         }
     }
 }
@@ -1568,6 +2038,7 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
     for profile in &mut settings.relay_profiles {
         let _ = crate::relay_config::normalize_relay_profile_for_storage(profile);
     }
+    normalize_aggregate_member_order(&mut settings);
     settings.codex_app_image_overlay_opacity =
         clamp_image_overlay_opacity(settings.codex_app_image_overlay_opacity);
     settings.codex_app_image_overlay_fit_mode =
@@ -1626,6 +2097,25 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
     settings.codex_app_stepwise_timeout_ms =
         clamp_stepwise_timeout_ms(settings.codex_app_stepwise_timeout_ms);
     settings
+}
+
+fn normalize_aggregate_member_order(settings: &mut BackendSettings) {
+    for aggregate in &mut settings.aggregate_relay_profiles {
+        let mut stored_members = std::mem::take(&mut aggregate.members);
+        let mut ordered_members = Vec::with_capacity(stored_members.len());
+        for relay in &settings.relay_profiles {
+            if let Some(index) = stored_members
+                .iter()
+                .position(|member| member.relay_id == relay.id)
+            {
+                ordered_members.push(stored_members.remove(index));
+            }
+        }
+        // Keep unknown members so the existing validation path can report them
+        // instead of silently discarding a malformed settings entry.
+        ordered_members.extend(stored_members);
+        aggregate.members = ordered_members;
+    }
 }
 
 fn split_context_config_sections(config: &str) -> (String, String) {
@@ -1917,6 +2407,34 @@ mod tests {
     }
 
     #[test]
+    fn relay_profile_reasoning_policy_defaults_and_round_trips() {
+        let legacy: RelayProfile =
+            serde_json::from_str(r#"{"id":"legacy","name":"Legacy"}"#).unwrap();
+        assert_eq!(
+            legacy.responses_reasoning_policy,
+            ResponsesReasoningPolicy::Passthrough
+        );
+
+        for (raw, expected) in [
+            ("passthrough", ResponsesReasoningPolicy::Passthrough),
+            ("openAiOpaque", ResponsesReasoningPolicy::OpenAiOpaque),
+            ("strip", ResponsesReasoningPolicy::Strip),
+        ] {
+            let profile: RelayProfile = serde_json::from_value(json!({
+                "id": "relay",
+                "name": "Relay",
+                "responsesReasoningPolicy": raw
+            }))
+            .unwrap();
+            assert_eq!(profile.responses_reasoning_policy, expected);
+            assert_eq!(
+                serde_json::to_value(profile).unwrap()["responsesReasoningPolicy"],
+                raw
+            );
+        }
+    }
+
+    #[test]
     fn relay_profile_context_fields_default_to_empty() {
         let profile = RelayProfile::default();
 
@@ -1967,6 +2485,74 @@ mod tests {
         let saved = serde_json::to_value(profile).unwrap();
         assert_eq!(saved["modelRoutes"][0]["targetRelayId"], "relay-b");
         assert_eq!(saved["modelRoutes"][0]["targetModel"], "provider-luna");
+    }
+
+    // R08：wire 策略字段 serde round-trip；缺失字段默认 compatible，不改变旧 profile 行为。
+    #[test]
+    fn relay_profile_responses_wire_policy_roundtrip() {
+        let missing: RelayProfile = serde_json::from_str(
+            r#"{ "id":"relay-a", "name":"A" }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            missing.responses_wire_policy,
+            ResponsesWirePolicy::Compatible,
+            "旧 profile 缺失新字段时保持既有兼容行为"
+        );
+
+        let passthrough: RelayProfile = serde_json::from_str(
+            r#"{ "id":"relay-a", "name":"A", "responsesWirePolicy":"passthrough" }"#,
+        )
+        .unwrap();
+        assert_eq!(passthrough.responses_wire_policy, ResponsesWirePolicy::Passthrough);
+
+        let saved = serde_json::to_value(passthrough).unwrap();
+        assert_eq!(saved["responsesWirePolicy"], "passthrough");
+    }
+
+    // Custom-as-Function 开关：缺失字段默认 false（旧 profile 行为不变），
+    // true/false round-trip 一致，且字段始终序列化以便 CLI provider-update 识别。
+    #[test]
+    fn relay_profile_custom_tools_as_functions_roundtrip() {
+        let missing: RelayProfile =
+            serde_json::from_str(r#"{ "id":"relay-a", "name":"A" }"#).unwrap();
+        assert!(
+            !missing.custom_tools_as_functions,
+            "旧 profile 缺失字段时适配器必须关闭"
+        );
+
+        let enabled: RelayProfile = serde_json::from_str(
+            r#"{ "id":"relay-a", "name":"A", "customToolsAsFunctions":true }"#,
+        )
+        .unwrap();
+        assert!(enabled.custom_tools_as_functions);
+        let saved = serde_json::to_value(enabled).unwrap();
+        assert_eq!(saved["customToolsAsFunctions"], true);
+
+        let disabled: RelayProfile = serde_json::from_str(
+            r#"{ "id":"relay-a", "name":"A", "customToolsAsFunctions":false }"#,
+        )
+        .unwrap();
+        assert!(!disabled.custom_tools_as_functions);
+        let saved_disabled = serde_json::to_value(disabled).unwrap();
+        assert_eq!(saved_disabled["customToolsAsFunctions"], false);
+    }
+
+    #[test]
+    fn relay_profile_native_interop_and_model_aliases_roundtrip() {
+        let profile: RelayProfile = serde_json::from_value(json!({
+            "id": "relay",
+            "name": "Relay",
+            "nativeAgentInterop": "on",
+            "modelAliases": [{"alias": "luna", "model": "glm-5.3-flash"}]
+        }))
+        .unwrap();
+        assert_eq!(profile.native_agent_interop, NativeAgentInterop::On);
+        assert_eq!(profile.model_aliases.first().unwrap().alias, "luna");
+        assert_eq!(
+            profile.model_aliases.first().unwrap().model,
+            "glm-5.3-flash"
+        );
     }
 
     /// 旧版按供应商勾选上下文条目的 `contextSelection` / `contextSelectionInitialized`
@@ -2349,6 +2935,8 @@ experimental_bearer_token = "sk-existing""#
             model: "gpt-5.6-luna".to_string(),
             target_relay_id: "target".to_string(),
             target_model: String::new(),
+            enabled: true,
+            restore_at: None,
         }];
         let settings = BackendSettings {
             active_relay_id: "source".to_string(),
@@ -2433,6 +3021,7 @@ experimental_bearer_token = "sk-existing""#
                 id: "agg".to_string(),
                 name: "聚合".to_string(),
                 session_provider: RelaySessionProvider::Openai,
+                code_mode_host: true,
                 strategy: AggregateRelayStrategy::WeightedRoundRobin,
                 members: vec![
                     AggregateRelayMember {
@@ -2465,11 +3054,184 @@ experimental_bearer_token = "sk-existing""#
             active_aggregate.session_provider,
             RelaySessionProvider::Openai
         );
+        assert!(active_aggregate.code_mode_host);
         assert_eq!(
             loaded.active_relay_session_provider(),
             RelaySessionProvider::Openai
         );
         assert!(loaded.active_relay_uses_protocol_proxy());
+    }
+
+    #[test]
+    fn active_aggregate_inherits_largest_member_context_and_paired_compaction_limit() {
+        let settings = BackendSettings {
+            relay_profiles: vec![
+                RelayProfile {
+                    id: "openai-account-relay".to_string(),
+                    context_window: String::new(),
+                    auto_compact_limit: String::new(),
+                    ..RelayProfile::default()
+                },
+                RelayProfile {
+                    id: "krill".to_string(),
+                    model: "gpt-5.6-sol".to_string(),
+                    context_window: "1000000".to_string(),
+                    auto_compact_limit: "900000".to_string(),
+                    model_list: "gpt-5.6-sol\ngpt-5.6-terra".to_string(),
+                    model_windows: r#"{"gpt-5.6-sol":"1000000"}"#.to_string(),
+                    ..RelayProfile::default()
+                },
+                RelayProfile {
+                    id: "shuai-api".to_string(),
+                    context_window: "272000".to_string(),
+                    auto_compact_limit: "250000".to_string(),
+                    ..RelayProfile::default()
+                },
+                RelayProfile {
+                    id: "agg".to_string(),
+                    relay_mode: RelayMode::Aggregate,
+                    context_window: String::new(),
+                    auto_compact_limit: String::new(),
+                    ..RelayProfile::default()
+                },
+            ],
+            active_relay_id: "agg".to_string(),
+            active_aggregate_relay_id: "agg".to_string(),
+            aggregate_relay_profiles: vec![AggregateRelayProfile {
+                id: "agg".to_string(),
+                name: "聚合".to_string(),
+                session_provider: RelaySessionProvider::Custom,
+                code_mode_host: false,
+                strategy: AggregateRelayStrategy::PriorityFallback,
+                members: vec![
+                    AggregateRelayMember {
+                        relay_id: "openai-account-relay".to_string(),
+                        weight: 1,
+                    },
+                    AggregateRelayMember {
+                        relay_id: "krill".to_string(),
+                        weight: 1,
+                    },
+                    AggregateRelayMember {
+                        relay_id: "shuai-api".to_string(),
+                        weight: 1,
+                    },
+                ],
+            }],
+            ..BackendSettings::default()
+        };
+
+        let active = settings.active_relay_profile();
+        assert_eq!(active.context_window, "1000000");
+        assert_eq!(active.auto_compact_limit, "900000");
+        assert_eq!(active.model, "gpt-5.6-sol");
+        assert_eq!(active.model_list, "gpt-5.6-sol\ngpt-5.6-terra");
+        assert_eq!(active.model_windows, r#"{"gpt-5.6-sol":"1000000"}"#);
+        assert!(settings.relay_profiles[3].context_window.is_empty());
+    }
+
+    #[test]
+    fn active_aggregate_explicit_context_and_compaction_limit_override_members() {
+        let settings = BackendSettings {
+            relay_profiles: vec![
+                RelayProfile {
+                    id: "member".to_string(),
+                    context_window: "1000000".to_string(),
+                    auto_compact_limit: "900000".to_string(),
+                    ..RelayProfile::default()
+                },
+                RelayProfile {
+                    id: "agg".to_string(),
+                    relay_mode: RelayMode::Aggregate,
+                    context_window: "500000".to_string(),
+                    auto_compact_limit: "450000".to_string(),
+                    ..RelayProfile::default()
+                },
+            ],
+            active_relay_id: "agg".to_string(),
+            active_aggregate_relay_id: "agg".to_string(),
+            aggregate_relay_profiles: vec![AggregateRelayProfile {
+                id: "agg".to_string(),
+                name: "聚合".to_string(),
+                session_provider: RelaySessionProvider::Custom,
+                code_mode_host: false,
+                strategy: AggregateRelayStrategy::PriorityFallback,
+                members: vec![AggregateRelayMember {
+                    relay_id: "member".to_string(),
+                    weight: 1,
+                }],
+            }],
+            ..BackendSettings::default()
+        };
+
+        let active = settings.active_relay_profile();
+        assert_eq!(active.context_window, "500000");
+        assert_eq!(active.auto_compact_limit, "450000");
+    }
+
+    #[test]
+    fn active_aggregate_lists_the_union_of_member_models_in_member_order() {
+        let settings = BackendSettings {
+            relay_profiles: vec![
+                RelayProfile {
+                    id: "openai".to_string(),
+                    model_list: "gpt-6-astra\ngpt-5.6-sol\ngpt-5.6-terra\ngpt-5.5\ngpt-5.4"
+                        .to_string(),
+                    ..RelayProfile::default()
+                },
+                RelayProfile {
+                    id: "krill".to_string(),
+                    model_list: "gpt-5.6-sol\ngpt-5.4\ngpt-5.5\ngpt-5.6-terra\ngpt-image-2"
+                        .to_string(),
+                    ..RelayProfile::default()
+                },
+                RelayProfile {
+                    id: "shuai".to_string(),
+                    model_list: "gpt-5.6-sol\ngpt-5.4\ngpt-5.6-terra\ngpt-5.5".to_string(),
+                    ..RelayProfile::default()
+                },
+                RelayProfile {
+                    id: "agg".to_string(),
+                    relay_mode: RelayMode::Aggregate,
+                    model_list: "gpt-5.6-sol".to_string(),
+                    ..RelayProfile::default()
+                },
+            ],
+            active_relay_id: "agg".to_string(),
+            active_aggregate_relay_id: "agg".to_string(),
+            aggregate_relay_profiles: vec![AggregateRelayProfile {
+                id: "agg".to_string(),
+                name: "聚合".to_string(),
+                session_provider: RelaySessionProvider::Custom,
+                code_mode_host: false,
+                strategy: AggregateRelayStrategy::PriorityFallback,
+                members: ["openai", "krill", "shuai"]
+                    .into_iter()
+                    .map(|relay_id| AggregateRelayMember {
+                        relay_id: relay_id.to_string(),
+                        weight: 1,
+                    })
+                    .collect(),
+            }],
+            ..BackendSettings::default()
+        };
+
+        let active = settings.active_relay_profile();
+        assert_eq!(active.model, "gpt-5.6-sol");
+        assert_eq!(
+            active.model_list,
+            "gpt-6-astra\ngpt-5.6-sol\ngpt-5.6-terra\ngpt-5.5\ngpt-5.4\ngpt-image-2"
+        );
+    }
+
+    #[test]
+    fn priority_fallback_strategy_uses_camel_case_json_and_roundtrips() {
+        let serialized = serde_json::to_value(AggregateRelayStrategy::PriorityFallback).unwrap();
+        assert_eq!(serialized, json!("priorityFallback"));
+        assert_eq!(
+            serde_json::from_value::<AggregateRelayStrategy>(serialized).unwrap(),
+            AggregateRelayStrategy::PriorityFallback
+        );
     }
 
     #[test]
@@ -2866,6 +3628,7 @@ experimental_bearer_token = "sk-existing""#
                     {
                         "id": "agg",
                         "name": "聚合",
+                        "codeModeHost": true,
                         "strategy": "weightedRoundRobin",
                         "members": [
                             { "relayId": "relay-a", "weight": 1 },
@@ -2887,7 +3650,51 @@ experimental_bearer_token = "sk-existing""#
         assert_eq!(active_aggregate.members.len(), 2);
         assert_eq!(active_aggregate.members[1].relay_id, "relay-b");
         assert_eq!(active_aggregate.members[1].weight, 4);
+        assert!(active_aggregate.code_mode_host);
         assert!(updated.active_relay_uses_protocol_proxy());
+    }
+
+    #[test]
+    fn settings_load_reorders_selected_aggregate_members_to_match_relay_profiles() {
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "relayProfiles": [
+                    { "id": "openai-account-relay", "name": "OpenAI账号中转" },
+                    { "id": "krill", "name": "krill" },
+                    { "id": "shuai-api", "name": "帅api" },
+                    { "id": "agg", "name": "聚合", "relayMode": "aggregate" }
+                ],
+                "activeRelayId": "agg",
+                "aggregateRelayProfiles": [{
+                    "id": "agg",
+                    "name": "聚合",
+                    "strategy": "priorityFallback",
+                    "members": [
+                        { "relayId": "krill", "weight": 2 },
+                        { "relayId": "shuai-api", "weight": 3 },
+                        { "relayId": "openai-account-relay", "weight": 1 }
+                    ]
+                }],
+                "activeAggregateRelayId": "agg"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let loaded = SettingsStore::new(path).load().unwrap();
+        let member_ids = loaded.aggregate_relay_profiles[0]
+            .members
+            .iter()
+            .map(|member| member.relay_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            member_ids,
+            vec!["openai-account-relay", "krill", "shuai-api"]
+        );
+        assert_eq!(loaded.aggregate_relay_profiles[0].members[0].weight, 1);
     }
 
     #[test]
@@ -3002,5 +3809,155 @@ experimental_bearer_token = "sk-existing""#
 
         assert!(!updated.provider_sync_enabled);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn old_model_route_json_defaults_to_enabled() {
+        let route: RelayModelRoute = serde_json::from_value(json!({
+            "model": "gpt-5.6-terra",
+            "targetRelayId": "glm",
+            "targetModel": "glm-5.3"
+        }))
+        .unwrap();
+
+        assert!(route.enabled);
+        assert!(route.restore_at.is_none());
+        assert!(route.is_effectively_enabled_at(1));
+    }
+
+    #[test]
+    fn model_route_set_supports_default_permanent_and_manual_enable() {
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        let store = SettingsStore::new(path.clone());
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "activeRelayId": "source",
+                "relayProfiles": [
+                    {
+                        "id": "source",
+                        "name": "Source",
+                        "modelRoutes": [{
+                            "model": "gpt-5.6-terra",
+                            "targetRelayId": "target",
+                            "targetModel": "glm-5.3",
+                            "futureField": "keep"
+                        }]
+                    },
+                    { "id": "target", "name": "Target" }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let disabled = store
+            .model_route_set(
+                &SetRelayModelRouteRequest {
+                    id: "source".to_string(),
+                    model: "gpt-5.6-terra".to_string(),
+                    enabled: false,
+                    restore_at: None,
+                    duration_seconds: None,
+                    permanent: false,
+                },
+                false,
+            )
+            .unwrap();
+        assert!(!disabled.route.enabled);
+        assert!(!disabled.route.permanent);
+        assert!((17_999..=18_000).contains(&disabled.route.remaining_seconds));
+
+        let permanent = store
+            .model_route_set(
+                &SetRelayModelRouteRequest {
+                    id: "source".to_string(),
+                    model: "gpt-5.6-terra".to_string(),
+                    enabled: false,
+                    restore_at: None,
+                    duration_seconds: None,
+                    permanent: true,
+                },
+                false,
+            )
+            .unwrap();
+        assert!(permanent.route.permanent);
+        assert!(permanent.route.restore_at.is_none());
+
+        let enabled = store
+            .model_route_set(
+                &SetRelayModelRouteRequest {
+                    id: "source".to_string(),
+                    model: "gpt-5.6-terra".to_string(),
+                    enabled: true,
+                    restore_at: None,
+                    duration_seconds: None,
+                    permanent: false,
+                },
+                false,
+            )
+            .unwrap();
+        assert!(enabled.route.enabled);
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved["relayProfiles"][0]["modelRoutes"][0]["futureField"],
+            "keep"
+        );
+        assert_eq!(saved["relayProfiles"][0]["modelRoutes"][0]["enabled"], true);
+        assert!(
+            saved["relayProfiles"][0]["modelRoutes"][0]
+                .get("restoreAt")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn settings_save_preserves_authoritative_model_route_state() {
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        let store = SettingsStore::new(path);
+        let mut settings = BackendSettings {
+            active_relay_id: "source".to_string(),
+            relay_profiles: vec![
+                RelayProfile {
+                    id: "source".to_string(),
+                    name: "Source".to_string(),
+                    relay_mode: RelayMode::PureApi,
+                    upstream_base_url: "https://source.example/v1".to_string(),
+                    config_contents: "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"custom\"\nwire_api = \"responses\"\nbase_url = \"https://source.example/v1\"\n".to_string(),
+                    auth_contents: "{\"OPENAI_API_KEY\":\"sk-source\"}".to_string(),
+                    model_routes: vec![RelayModelRoute {
+                        model: "gpt-5.6-sol".to_string(),
+                        target_relay_id: "target".to_string(),
+                        target_model: String::new(),
+                        enabled: false,
+                        restore_at: Some(u64::MAX - 1),
+                    }],
+                    ..RelayProfile::default()
+                },
+                RelayProfile {
+                    id: "target".to_string(),
+                    name: "Target".to_string(),
+                    relay_mode: RelayMode::PureApi,
+                    upstream_base_url: "https://target.example/v1".to_string(),
+                    config_contents: "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"custom\"\nwire_api = \"responses\"\nbase_url = \"https://target.example/v1\"\n".to_string(),
+                    auth_contents: "{\"OPENAI_API_KEY\":\"sk-target\"}".to_string(),
+                    ..RelayProfile::default()
+                },
+            ],
+            ..BackendSettings::default()
+        };
+        store.save(&settings).unwrap();
+        settings.relay_profiles[0].name = "Stale draft rename".to_string();
+        settings.relay_profiles[0].model_routes[0].enabled = true;
+        settings.relay_profiles[0].model_routes[0].restore_at = None;
+
+        store.save(&settings).unwrap();
+        let loaded = store.load().unwrap();
+        let route = &loaded.relay_profiles[0].model_routes[0];
+        assert_eq!(loaded.relay_profiles[0].name, "Stale draft rename");
+        assert!(!route.enabled);
+        assert_eq!(route.restore_at, Some(u64::MAX - 1));
     }
 }

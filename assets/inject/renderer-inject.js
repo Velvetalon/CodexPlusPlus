@@ -1,4 +1,4 @@
-(() => {
+﻿(() => {
   // The launcher targets the Codex app page, but keep a renderer-side guard
   // so this bundle cannot create UI in embedded browser documents.
   const codexPlusIsNodeTestHarness = typeof process === "object" && !!process.versions?.node;
@@ -473,7 +473,7 @@
   const codexThreadServiceTierMaxEntries = 120;
   const codexThreadServiceTierDraftBindWindowMs = 60 * 1000;
   const codexServiceTierRequestOverrideVersion = "9";
-  const codexAppServerModelRequestPatchVersion = "6";
+  const codexAppServerModelRequestPatchVersion = "9";
   const codexRemoteSessionRecoveryVersion = "5";
   const codexPluginMarketplaceUnlockVersion = "15";
   const codexThreadScrollMaxEntries = 120;
@@ -2539,6 +2539,13 @@
     return candidates;
   }
 
+  function appServerRequestCandidatesFromMessageBusModule(module, assetPrefix) {
+    const bus = module?.r;
+    if (!bus || typeof bus.dispatchMessage !== "function" || typeof bus.subscribe !== "function") return [];
+    patchAppServerMessageBusRequestClient(bus);
+    return bus.__codexPlusModelRequestPatch === codexAppServerModelRequestPatchVersion ? [bus] : [];
+  }
+
   async function loadAppServerRequestModules() {
     const modules = [];
     const sources = [];
@@ -2550,10 +2557,13 @@
       modules.push(module);
       sources.push(source);
     };
-    for (const assetPrefix of ["use-host-config-", "app-server-manager-signals-"]) {
+    for (const assetPrefix of ["use-host-config-", "app-server-manager-signals-", "message-bus-"]) {
       try {
         const module = await loadOptionalCodexAppModule(assetPrefix);
-        if (module) pushModule(module, assetPrefix);
+      if (module) {
+        pushModule(module, assetPrefix);
+        appServerRequestCandidatesFromMessageBusModule(module, assetPrefix);
+      }
       } catch {
       }
     }
@@ -2577,6 +2587,9 @@
         if (seen.has(candidate)) continue;
         seen.add(candidate);
         candidates.push(candidate);
+      }
+      if (module?.r && candidates.indexOf(module.r) === -1) {
+        candidates.push(module.r);
       }
     }
     const usedFallback = sources.some((source) => !source.endsWith("-"));
@@ -3326,6 +3339,18 @@
       || codexModelCatalog?.modelProvider
       || ""
     ).trim();
+  }
+
+  function codexRemoteSessionProviderFingerprint() {
+    const profile = codexRemoteSessionActiveProfile();
+    const fromConfig = codexRelayConfigModelProvider(profile?.configContents || "");
+    return [
+      String(profile?.id || ""),
+      String(profile?.name || ""),
+      String(profile?.relayMode || ""),
+      fromConfig || codexRemoteSessionTargetProvider(),
+      codexModelCatalog?.model_provider || codexModelCatalog?.codex_model_provider || "",
+    ].join("\u0000");
   }
 
   function codexRemoteSessionProviderRequestMethod(method) {
@@ -6359,10 +6384,250 @@
     return await codexStateCall("set-global-state", { params: { key, value } });
   }
 
-  function dispatchCodexPlusMessage(dispatcher, type, payload) {
+  // —— 线程绑定刷新（R01/R02 修复）——
+  // 契约：意图 ≠ 已确认状态。thread/resume 的真实 ACK 到达之前，
+  // 原始 turn 不能发出，目标上下文也不能缓存为成功。
+  // promise 永不 reject（resolve 出 {status}），避免消息总线上出现无人接收的 rejection。
+  const codexPlusThreadRefreshDefaultTimeoutMs = 10000;
+
+  function codexPlusThreadBindingKey(hostId, threadId) {
+    const host = String(hostId || "").trim() || "local";
+    return `${host}\u0000${String(threadId || "").trim()}`;
+  }
+
+  function codexPlusThreadModelContextStore() {
+    if (!(window.__codexPlusThreadModelContexts instanceof Map)) {
+      window.__codexPlusThreadModelContexts = new Map();
+    }
+    return window.__codexPlusThreadModelContexts;
+  }
+
+  function codexPlusThreadRefreshPendingMap() {
+    if (!(window.__codexPlusThreadRefreshPending instanceof Map)) {
+      window.__codexPlusThreadRefreshPending = new Map();
+    }
+    return window.__codexPlusThreadRefreshPending;
+  }
+
+  function codexPlusThreadRefreshWaiterMap() {
+    if (!(window.__codexPlusThreadRefreshWaiters instanceof Map)) {
+      window.__codexPlusThreadRefreshWaiters = new Map();
+    }
+    return window.__codexPlusThreadRefreshWaiters;
+  }
+
+  function codexPlusResetThreadBindingState() {
+    // 注入重装 / host 更换时清空，避免跨 app-server 生命周期保留假绑定。
+    const pendingMap = window.__codexPlusThreadRefreshPending instanceof Map
+      ? window.__codexPlusThreadRefreshPending
+      : new Map();
+    window.__codexPlusThreadModelContexts = new Map();
+    window.__codexPlusThreadRefreshWaiters = new Map();
+    window.__codexPlusThreadRefreshPending = new Map();
+    for (const pending of pendingMap.values()) {
+      try {
+        pending.settle({ status: "stale" });
+      } catch {
+      }
+    }
+  }
+
+  function codexPlusThreadRefreshTimeoutMs() {
+    const override = Number(window.__codexPlusThreadModelRefreshTimeoutMs);
+    return Number.isFinite(override) && override > 0
+      ? override
+      : codexPlusThreadRefreshDefaultTimeoutMs;
+  }
+
+  // 共享刷新核心：同一绑定同一目标合并 pending；目标改变时旧 pending 按过期处理，
+  // 其原始 turn 不得再发送，迟到 ACK 不得确认新目标。
+  function codexPlusRefreshThreadBinding(bindingKey, contextKey, meta, performResume) {
+    const pendingMap = codexPlusThreadRefreshPendingMap();
+    const existing = pendingMap.get(bindingKey);
+    if (existing && existing.targetKey === contextKey) return existing.promise;
+    if (existing) {
+      pendingMap.delete(bindingKey);
+      existing.superseded = true;
+      existing.settle({ status: "stale" });
+    }
+    let settle = () => {};
+    const promise = new Promise((resolve) => { settle = resolve; });
+    const pending = {
+      ...meta,
+      targetKey: contextKey,
+      bindingKey,
+      onSettle: null,
+      timer: 0,
+      done: false,
+      superseded: false,
+      settle: (outcome) => {
+        if (pending.done) return;
+        pending.done = true;
+        if (pending.timer) {
+          clearTimeout(pending.timer);
+          pending.timer = 0;
+        }
+        if (typeof pending.onSettle === "function") {
+          try {
+            pending.onSettle();
+          } catch {
+          }
+        }
+        settle(outcome || { status: "failed" });
+      },
+    };
+    pendingMap.set(bindingKey, pending);
+    promise.then((outcome) => {
+      if (pendingMap.get(bindingKey) === pending) pendingMap.delete(bindingKey);
+      // 只有真正确认成功才写缓存；被取代的 pending 即使晚到 confirmed 也不能写。
+      if (outcome?.status === "confirmed" && !pending.superseded) {
+        codexPlusThreadModelContextStore().set(bindingKey, pending.targetKey);
+      }
+    }).catch(() => {});
+    pending.timer = setTimeout(() => {
+      pending.settle({ status: "timed_out" });
+    }, codexPlusThreadRefreshTimeoutMs());
+    try {
+      performResume(pending);
+    } catch (error) {
+      pending.settle({ status: "failed" });
+    }
+    return promise;
+  }
+
+  // 消息总线/窗口两条响应通道共用：按 requestId 匹配内部 resume 的回复。
+  // 不匹配的回复（不同 request id，或 hostId 明确不一致）不能释放 barrier。
+  function codexPlusDeliverThreadRefreshResponse(data) {
+    if (!data || typeof data !== "object" || String(data.type || "") !== "mcp-response") return false;
+    const message = data.message || data.response;
+    const requestId = String(message?.id ?? data.id ?? "");
+    if (!requestId) return false;
+    const waiters = codexPlusThreadRefreshWaiterMap();
+    const waiter = waiters.get(requestId);
+    if (!waiter) return false;
+    const responseHostId = String(data.hostId ?? "").trim();
+    if (waiter.hostId && responseHostId && responseHostId !== waiter.hostId) return false;
+    waiters.delete(requestId);
+    const pending = waiter.pending;
+    const detail = { threadId: pending.threadId, model: pending.model };
+    if (message?.error || data.error) {
+      sendCodexPlusDiagnostic("thread_model_context_refresh_failed", {
+        ...detail,
+        errorName: "RpcError",
+        errorMessage: String(
+          message?.error?.message || data.error?.message || "thread/resume failed"
+        ),
+      });
+      pending.settle({ status: "failed" });
+      return true;
+    }
+    sendCodexPlusDiagnostic("thread_model_context_refreshed", {
+      ...detail,
+      providerChanged: !!pending.previousKey
+        && pending.previousKey.split("\u0000").slice(1).join("\u0000")
+          !== pending.targetKey.split("\u0000").slice(1).join("\u0000"),
+    });
+    pending.settle({ status: "confirmed" });
+    return true;
+  }
+
+  // 返回值：true=已确认可发 turn；false=刷新失败/超时（必须阻断 turn）；null=无需刷新。
+  async function dispatchMessageBusThreadModelRefresh(dispatcher, originalDispatch, nextPayload, request) {
+    const params = request?.params;
+    const threadId = String(params?.threadId || "").trim();
+    const model = String(params?.model || "").trim();
+    if (!threadId || !model) return null;
+    const hostId = String(nextPayload?.hostId || "").trim();
+    const bindingKey = codexPlusThreadBindingKey(hostId, threadId);
+    const state = { requestMethod: "turn/start", threadId, model };
+    const contextKey = codexThreadModelContextKey(state);
+    const previousKey = codexPlusThreadModelContextStore().get(bindingKey) || "";
+    if (previousKey === contextKey) return null;
+    const targetProvider = codexRemoteSessionTargetProvider();
+    const resumeParams = { threadId, model };
+    // For non-OpenAI targets include modelProvider so the app-server binds the
+    // thread to the correct provider. For OpenAI the default is already right.
+    if (targetProvider && targetProvider !== "openai") {
+      resumeParams.modelProvider = targetProvider;
+    }
+    const detail = { threadId, model };
+    const outcome = await codexPlusRefreshThreadBinding(bindingKey, contextKey, {
+      threadId,
+      model,
+      previousKey,
+    }, (pending) => {
+      const requestId = "codex-plus-provider-refresh-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+      const waiters = codexPlusThreadRefreshWaiterMap();
+      // 先注册等待者再 dispatch，避免同步 mock/快速回复丢失。
+      waiters.set(requestId, { hostId, pending });
+      pending.onSettle = () => {
+        waiters.delete(requestId);
+      };
+      sendCodexPlusDiagnostic("thread_model_context_refresh_requested", detail);
+      try {
+        originalDispatch.call(dispatcher, "mcp-request", {
+          hostId: nextPayload?.hostId || "",
+          priority: nextPayload?.priority || "normal",
+          source: nextPayload?.source || "codex-plus-provider-refresh",
+          request: {
+            id: requestId,
+            method: "thread/resume",
+            params: resumeParams,
+          },
+        });
+        // dispatch 的返回值只代表投递受理，不作为业务 ACK；真实确认走
+        // codexPlusDeliverThreadRefreshResponse 按 requestId 匹配。
+      } catch (error) {
+        sendCodexPlusDiagnostic("thread_model_context_refresh_failed", {
+          ...detail,
+          errorName: error?.name || "",
+          errorMessage: error?.message || String(error),
+        });
+        pending.settle({ status: "failed" });
+      }
+    });
+    return outcome?.status === "confirmed";
+  }
+
+  async function dispatchCodexPlusMessage(dispatcher, type, payload) {
     const message = codexServiceTierRequestOverride({ ...(payload || {}), type });
     const nextType = message?.type || type;
     const { type: _type, ...nextPayload } = message || {};
+    if (String(nextType || "") === "mcp-request") {
+      if (!codexPlusBackendSettingsLoaded) {
+        const loaded = await loadBackendSettingsState();
+        if (!loaded) sendCodexPlusDiagnostic("message_bus_provider_refresh_failed", {});
+      }
+      if (codexRemoteSessionProviderPatchEnabled()) {
+        const request = nextPayload?.request;
+        if (request?.method === "turn/start" && request.params
+            && !Object.prototype.hasOwnProperty.call(request.params, "modelProvider")) {
+          request.params = applyCodexRemoteSessionProviderOverride("turn/start", request.params);
+        }
+      }
+    }
+    if (window.__codexPlusAppServerMessageBus === dispatcher && String(nextType || "") === "mcp-request") {
+      const request = nextPayload?.request;
+      if (request?.method === "turn/start" && request.params) {
+        request.params = applyCodexRemoteSessionProviderOverride("turn/start", request.params);
+        if (codexRemoteSessionProviderPatchEnabled()) {
+          const originalDispatch = dispatcher.__codexServiceTierOriginalDispatchMessage
+            || dispatcher.__codexPlusOriginalDispatchMessage;
+          if (typeof originalDispatch === "function") {
+            const refreshed = await dispatchMessageBusThreadModelRefresh(dispatcher, originalDispatch, nextPayload, request);
+            if (refreshed === false) {
+              // ACK 失败/超时/过期：不投递原始 turn。调用方可能不消费 Promise，
+              // 因此不制造无人接收的 rejection，靠诊断事件反馈失败。
+              sendCodexPlusDiagnostic("turn_blocked_until_thread_binding_confirmed", {
+                threadId: String(request.params?.threadId || "").trim(),
+                hostId: String(nextPayload?.hostId || "").trim(),
+              });
+              return undefined;
+            }
+          }
+        }
+      }
+    }
     if (nextType === "browser-use-session-route-capture") {
       observeCodexRemoteSessionNotification({ type: nextType, params: nextPayload });
     }
@@ -6430,6 +6695,7 @@
         codexPlusBackendSettings = { ...codexPlusBackendSettings, ...settings };
         codexPlusBackendSettingsLoaded = true;
       },
+      providerFingerprint: () => codexRemoteSessionProviderFingerprint(),
       providerPatchEnabled: () => codexRemoteSessionProviderPatchEnabled(),
       providerNormalizationEnabled: () => codexRemoteSessionProviderNormalizationEnabled(),
       setServiceTierState: (state = {}) => {
@@ -6448,6 +6714,7 @@
       stateApiFromModule: codexStateApiFromModule,
       dispatcherFromModule: codexServiceTierDispatcherFromModule,
       patchAppServerClient: patchAppServerModelRequestClient,
+      patchAppServerMessageBus: patchAppServerMessageBusRequestClient,
     };
     return;
   }
@@ -6844,6 +7111,93 @@
     return String(method || "");
   }
 
+  function codexThreadModelState(method, params, result) {
+    const requestMethod = String(method || "");
+    const threadId = String(
+      params?.threadId
+      || params?.conversationId
+      || result?.thread?.id
+      || result?.threadId
+      || ""
+    ).trim();
+    const model = String(params?.model || result?.thread?.model || "").trim();
+    return { requestMethod, threadId, model };
+  }
+
+  function codexThreadModelContextKey(state) {
+    return [
+      state.model,
+      codexRemoteSessionProviderFingerprint(),
+    ].join("\u0000");
+  }
+
+  // 返回值：true=已确认；false=刷新失败/超时（调用方必须阻断本次 turn）；null=无需刷新。
+  async function refreshCodexThreadModelBeforeTurn(originalSendRequest, method, params, options) {
+    if (String(method || "") !== "turn/start") return null;
+    if (!codexRemoteSessionProviderPatchEnabled()) return null;
+    const state = codexThreadModelState(method, params);
+    if (!state.threadId || !state.model) return null;
+    const hostId = String(params?.hostId || "").trim();
+    const bindingKey = codexPlusThreadBindingKey(hostId, state.threadId);
+    const contextKey = codexThreadModelContextKey(state);
+    const previousKey = codexPlusThreadModelContextStore().get(bindingKey) || "";
+    if (previousKey === contextKey) return null;
+    const resumeParams = {
+      threadId: state.threadId,
+      model: state.model,
+      modelProvider: String(codexPlusBackendSettings.activeRelayCodexProvider || "").trim()
+        || codexRemoteSessionTargetProvider(),
+    };
+    const detail = { threadId: state.threadId, model: state.model };
+    const outcome = await codexPlusRefreshThreadBinding(bindingKey, contextKey, {
+      threadId: state.threadId,
+      model: state.model,
+      previousKey,
+    }, (pending) => {
+      // 内部 resume 直接走原始 sendRequest，旁路自身 hook，避免递归与自等待。
+      // 同步发起调用，保持"ACK 前 turn 不发"的可观察时序；同步抛错按失败处理。
+      let resumeResult;
+      try {
+        resumeResult = originalSendRequest("thread/resume", resumeParams, options);
+      } catch (error) {
+        sendCodexPlusDiagnostic("thread_model_context_refresh_failed", {
+          ...detail,
+          errorName: error?.name || "",
+          errorMessage: error?.message || String(error),
+        });
+        pending.settle({ status: "failed" });
+        return;
+      }
+      Promise.resolve(resumeResult).then((result) => {
+        const resultModel = String(result?.thread?.model || result?.model || "").trim();
+        if (resultModel && resultModel !== state.model) {
+          // 服务端返回的目标和请求不一致时按失败处理，不用请求参数伪装成功。
+          sendCodexPlusDiagnostic("thread_model_context_refresh_mismatch", {
+            ...detail,
+            resultModel,
+          });
+          pending.settle({ status: "failed" });
+          return;
+        }
+        sendCodexPlusDiagnostic("thread_model_context_refreshed", {
+          ...detail,
+          providerChanged: !!previousKey
+            && previousKey.split("\u0000").slice(1).join("\u0000")
+              !== contextKey.split("\u0000").slice(1).join("\u0000"),
+        });
+        pending.settle({ status: "confirmed" });
+      }).catch((error) => {
+        sendCodexPlusDiagnostic("thread_model_context_refresh_failed", {
+          ...detail,
+          errorName: error?.name || "",
+          errorMessage: error?.message || String(error),
+        });
+        pending.settle({ status: "failed" });
+      });
+    });
+    return outcome?.status === "confirmed";
+  }
+
   function patchAppServerModelResult(method, result) {
     if (method !== "list-models-for-host") return result;
     try {
@@ -6885,12 +7239,84 @@
       const nextParams = providerRefreshFailed
         ? params
         : applyCodexRemoteSessionProviderOverride(requestMethod, params);
+      // send-cli-request-for-host 这类 wrapper：用规范化后的 method/内层 params 做刷新判断，
+      // hostId 从外层 params 透传，外层封装本身不被破坏。
+      const wrapperParams = params && typeof params === "object"
+        && params.params && typeof params.params === "object"
+        && requestMethod !== String(method || "")
+        ? { ...params.params, hostId: params.hostId }
+        : null;
+      const refreshed = await refreshCodexThreadModelBeforeTurn(
+        originalSendRequest,
+        wrapperParams ? requestMethod : method,
+        wrapperParams || nextParams,
+        options,
+      );
+      if (refreshed === false) {
+        // 刷新失败时不发送原始 turn，把失败反馈给调用方（R01）。
+        throw new Error("codex-plus: thread model context refresh failed; turn blocked");
+      }
       const result = await originalSendRequest(method, nextParams, options);
+      const threadState = codexThreadModelState(requestMethod, nextParams, result);
+      // 只有 thread/start、thread/resume 的成功结果才算服务端确认；
+      // turn/start 成功不能证明 provider 已切换，不据此覆盖绑定（R01）。
+      if (threadState.threadId && threadState.model
+          && ["thread/start", "thread/resume"].includes(threadState.requestMethod)) {
+        codexPlusThreadModelContextStore().set(
+          codexPlusThreadBindingKey(
+            String(nextParams?.hostId || "").trim(),
+            threadState.threadId,
+          ),
+          codexThreadModelContextKey(threadState),
+        );
+      }
       if (!codexPlusModelUnlockEnabled()) return result;
       if (!codexPlusModelNames().length) await loadCodexModelCatalog();
       return patchAppServerModelResult(requestMethod, result);
     };
     client.__codexPlusModelRequestPatch = codexAppServerModelRequestPatchVersion;
+    return true;
+  }
+
+  function patchAppServerMessageBusRequestClient(bus) {
+    if (!bus || typeof bus.dispatchMessage !== "function" || typeof bus.subscribe !== "function") return false;
+    if (bus.__codexPlusModelRequestPatch === codexAppServerModelRequestPatchVersion) return true;
+    if (bus.__codexPlusOriginalDispatchMessage) return true;
+    // 换了新的 bus 实例说明 app-server 侧生命周期已变化，旧绑定状态不能跨周期保留。
+    if (window.__codexPlusAppServerMessageBus && window.__codexPlusAppServerMessageBus !== bus) {
+      codexPlusResetThreadBindingState();
+    }
+    if (typeof window.__codexPlusThreadRefreshResponseUnsubscribe === "function") {
+      try {
+        window.__codexPlusThreadRefreshResponseUnsubscribe();
+      } catch {
+      }
+    }
+    try {
+      window.__codexPlusThreadRefreshResponseUnsubscribe = bus.subscribe("mcp-response", (payload) => {
+        try {
+          codexPlusDeliverThreadRefreshResponse(payload);
+        } catch {
+        }
+      });
+    } catch {
+    }
+    if (!window.__codexPlusThreadRefreshWindowListenerInstalled) {
+      window.__codexPlusThreadRefreshWindowListenerInstalled = true;
+      window.addEventListener("message", (event) => {
+        try {
+          codexPlusDeliverThreadRefreshResponse(event?.data);
+        } catch {
+        }
+      }, true);
+    }
+    const originalDispatchMessage = bus.dispatchMessage.bind(bus);
+    bus.__codexPlusOriginalDispatchMessage = originalDispatchMessage;
+    bus.__codexServiceTierOriginalDispatchMessage = originalDispatchMessage;
+    bus.dispatchMessage = (type, payload) => dispatchCodexPlusMessage(bus, type, payload);
+    window.__codexPlusAppServerMessageBus = bus;
+    window.__codexPlusAppServerMessageBusAsset = "message-bus";
+    bus.__codexPlusModelRequestPatch = codexAppServerModelRequestPatchVersion;
     return true;
   }
 
@@ -6951,7 +7377,8 @@
         }
         let patchedCount = 0;
         for (const candidate of candidates) {
-          if (patchAppServerModelRequestClient(candidate)) patchedCount += 1;
+          if (patchAppServerModelRequestClient(candidate)
+              || patchAppServerMessageBusRequestClient(candidate)) patchedCount += 1;
         }
         if (patchedCount > 0) {
           clearTimeout(appServerModelRequestPatchRetryTimer);

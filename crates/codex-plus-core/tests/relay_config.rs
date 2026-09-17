@@ -1,19 +1,21 @@
 use codex_plus_core::codex_sqlite::codex_session_db_path_from_home;
 use codex_plus_core::relay_config::{
-    apply_pure_api_config_to_home, apply_relay_config_file_to_home, apply_relay_config_to_home,
-    apply_relay_files_to_home, apply_relay_files_to_home_with_common,
-    apply_relay_profile_files_to_home_with_context, apply_relay_profile_to_home_with_switch_rules,
-    backfill_relay_profile_from_home, backfill_relay_profile_from_home_with_common,
-    chatgpt_auth_status_from_home, cleanup_unsupported_approval_policies_in_home,
-    clear_relay_config_to_home, clear_relay_config_to_home_with_auth,
-    delete_context_entry_from_common_config, extract_common_config_from_config,
-    list_context_entries_from_common_config, normalize_relay_profile_for_storage,
-    prepare_common_config_for_apply, relay_config_status_from_home, relay_profile_api_key,
-    sanitize_common_config_contents, set_codex_goals_feature_in_home,
-    strip_common_config_from_config, sync_live_config_context_entries,
-    upsert_context_entry_in_common_config,
+    apply_aggregate_relay_profile_to_home_with_session_provider, apply_pure_api_config_to_home,
+    apply_relay_config_file_to_home, apply_relay_config_to_home, apply_relay_files_to_home,
+    apply_relay_files_to_home_with_common, apply_relay_profile_files_to_home_with_context,
+    apply_relay_profile_to_home_with_switch_rules, backfill_relay_profile_from_home,
+    backfill_relay_profile_from_home_with_common, chatgpt_auth_status_from_home,
+    cleanup_unsupported_approval_policies_in_home, clear_relay_config_to_home,
+    clear_relay_config_to_home_with_auth, delete_context_entry_from_common_config,
+    extract_common_config_from_config, list_context_entries_from_common_config,
+    normalize_relay_profile_for_storage, prepare_common_config_for_apply,
+    relay_config_status_from_home, relay_profile_api_key, sanitize_common_config_contents,
+    set_codex_goals_feature_in_home, strip_common_config_from_config,
+    sync_live_config_context_entries, upsert_context_entry_in_common_config,
 };
-use codex_plus_core::settings::{RelayMode, RelayModelRoute, RelayProfile, RelayProtocol};
+use codex_plus_core::settings::{
+    RelayMode, RelayModelRoute, RelayProfile, RelayProtocol, RelaySessionProvider,
+};
 
 fn write_remote_plugin_marketplace_snapshot(home: &std::path::Path) {
     let root = home.join(".tmp").join("plugins-remote");
@@ -543,7 +545,7 @@ model = "gpt-5-mini"
     assert!(updated.contains("[model_providers.custom]"));
     assert!(updated.contains(r#"name = "custom""#));
     assert!(updated.contains(r#"wire_api = "responses""#));
-    assert!(updated.contains("requires_openai_auth = true"));
+    assert!(!updated.contains("requires_openai_auth"));
     assert!(updated.contains(r#"base_url = "https://relay.example.test/v1""#));
     assert!(updated.contains(r#"experimental_bearer_token = "sk-test-redacted""#));
 }
@@ -592,7 +594,7 @@ fn openai_session_provider_rejects_chat_completions() {
 }
 
 #[test]
-fn responses_profile_stays_direct_and_backfill_repairs_legacy_local_proxy() {
+fn responses_profile_uses_proxy_and_backfill_repairs_legacy_local_proxy() {
     let temp = tempfile::tempdir().unwrap();
     let profile = RelayProfile {
         id: "custom".to_string(),
@@ -615,9 +617,11 @@ base_url = "https://responses.example.test/v1"
     apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
     let config_path = temp.path().join("config.toml");
     let updated = std::fs::read_to_string(&config_path).unwrap();
-
-    assert!(updated.contains("https://responses.example.test/v1"));
-    assert!(!updated.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
+    assert!(updated.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
+    assert!(
+        updated.contains(r#"codex_plus_upstream_base_url = "https://responses.example.test/v1""#)
+    );
+    assert!(!updated.contains("\nbase_url = \"https://responses.example.test/v1\""));
     assert_eq!(
         codex_plus_core::relay_config::relay_profile_base_url(&profile),
         "https://responses.example.test/v1"
@@ -719,6 +723,8 @@ base_url = "https://responses.example.test/v1"
             model: "gpt-5.6-luna".to_string(),
             target_relay_id: "target".to_string(),
             target_model: String::new(),
+            enabled: true,
+            restore_at: None,
         }],
         ..RelayProfile::default()
     };
@@ -768,6 +774,289 @@ fn apply_aggregate_relay_points_codex_to_local_responses_proxy_without_snapshot(
     assert!(updated.contains(r#"wire_api = "responses""#));
     assert!(updated.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
     assert!(updated.contains(r#"experimental_bearer_token = "codex-plus-aggregate""#));
+}
+
+#[test]
+fn aggregate_custom_session_uses_custom_bearer_auth_not_chatgpt_auth() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile = RelayProfile {
+        id: "agg-custom".to_string(),
+        name: "Aggregate Custom".to_string(),
+        relay_mode: RelayMode::Aggregate,
+        ..RelayProfile::default()
+    };
+
+    apply_aggregate_relay_profile_to_home_with_session_provider(
+        temp.path(),
+        &profile,
+        "",
+        "codex-plus-aggregate",
+        57321,
+        RelaySessionProvider::Custom,
+    )
+    .unwrap();
+
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    let config = config.parse::<toml_edit::DocumentMut>().unwrap();
+    assert_eq!(config["model_provider"].as_str(), Some("custom"));
+    assert!(
+        config["model_providers"]["custom"]
+            .get("requires_openai_auth")
+            .is_none()
+    );
+    assert_eq!(
+        config["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
+        Some("codex-plus-aggregate")
+    );
+    assert!(config.get("openai_base_url").is_none());
+
+    let auth = std::fs::read_to_string(temp.path().join("auth.json")).unwrap();
+    let auth: serde_json::Value = serde_json::from_str(&auth).unwrap();
+    assert_eq!(auth["OPENAI_API_KEY"], "codex-plus-aggregate");
+    assert!(auth.get("auth_mode").is_none());
+    assert!(auth.get("tokens").is_none());
+}
+
+#[test]
+fn aggregate_openai_session_keeps_openai_identity_explicit() {
+    let temp = tempfile::tempdir().unwrap();
+    let login = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"test-access","refresh_token":"test-refresh","id_token":"test-id"},"last_refresh":"2026-09-10T10:05:12Z"}"#;
+    std::fs::write(temp.path().join("auth.json"), login).unwrap();
+    let profile = RelayProfile {
+        id: "agg-openai".to_string(),
+        name: "Aggregate OpenAI".to_string(),
+        relay_mode: RelayMode::Aggregate,
+        ..RelayProfile::default()
+    };
+
+    apply_aggregate_relay_profile_to_home_with_session_provider(
+        temp.path(),
+        &profile,
+        "",
+        "codex-plus-aggregate",
+        57321,
+        RelaySessionProvider::Openai,
+    )
+    .unwrap();
+
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    let config = config.parse::<toml_edit::DocumentMut>().unwrap();
+    assert_eq!(config["model_provider"].as_str(), Some("openai"));
+    let restored: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(temp.path().join("auth.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        restored,
+        serde_json::from_str::<serde_json::Value>(login).unwrap()
+    );
+    assert!(restored.get("OPENAI_API_KEY").is_none());
+    assert_eq!(
+        config["model_providers"]["custom"]["requires_openai_auth"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        config["openai_base_url"].as_str(),
+        Some("http://127.0.0.1:57321/v1")
+    );
+}
+
+#[test]
+fn apply_aggregate_relay_projects_one_million_context_and_model_catalog() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile = RelayProfile {
+        id: "agg".to_string(),
+        name: "聚合供应商 1".to_string(),
+        model: "gpt-5.6-sol".to_string(),
+        relay_mode: RelayMode::Aggregate,
+        context_window: "1000000".to_string(),
+        auto_compact_limit: "900000".to_string(),
+        model_list: "gpt-5.6-sol[1M]".to_string(),
+        config_contents: String::new(),
+        auth_contents: String::new(),
+        ..RelayProfile::default()
+    };
+
+    apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
+    let updated = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+
+    assert!(updated.contains("model_context_window = 1000000"));
+    assert!(updated.contains("model_auto_compact_token_limit = 900000"));
+    assert!(updated.contains(r#"model_catalog_json = "model-catalogs/agg.json""#));
+    let catalog =
+        std::fs::read_to_string(temp.path().join("model-catalogs").join("agg.json")).unwrap();
+    assert!(catalog.contains(r#""slug": "gpt-5.6-sol""#));
+    assert!(catalog.contains(r#""context_window": 1000000"#));
+}
+
+#[test]
+fn aggregate_openai_recovers_saved_official_login_and_prefers_refreshed_live_tokens() {
+    let temp = tempfile::tempdir().unwrap();
+    let login = serde_json::json!({"auth_mode":"chatgpt","tokens":{"access_token":"saved-access","refresh_token":"saved-refresh","id_token":"saved-id"}});
+    let settings: codex_plus_core::settings::BackendSettings = serde_json::from_value(serde_json::json!({
+        "activeRelayId":"agg","activeAggregateRelayId":"agg",
+        "relayProfiles":[
+            {"id":"default","name":"Official","relayMode":"official","authContents":login.to_string()},
+            {"id":"agg","name":"Aggregate","relayMode":"aggregate"}
+        ],
+        "aggregateRelayProfiles":[{"id":"agg","name":"Aggregate","sessionProvider":"openai","members":[]}]
+    })).unwrap();
+    let profile = settings.active_relay_profile();
+    for identity in [
+        RelaySessionProvider::Openai,
+        RelaySessionProvider::Custom,
+        RelaySessionProvider::Openai,
+    ] {
+        apply_aggregate_relay_profile_to_home_with_session_provider(
+            temp.path(),
+            &profile,
+            "",
+            "local-key",
+            57321,
+            identity,
+        )
+        .unwrap();
+        let auth: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(temp.path().join("auth.json")).unwrap())
+                .unwrap();
+        if identity == RelaySessionProvider::Openai {
+            assert_eq!(auth, login);
+            assert!(auth.get("OPENAI_API_KEY").is_none());
+        } else {
+            assert_eq!(auth["OPENAI_API_KEY"], "local-key");
+            assert!(auth.get("tokens").is_none());
+        }
+    }
+    let mut fresh = login.clone();
+    fresh["tokens"]["access_token"] = serde_json::json!("refreshed-live-access");
+    std::fs::write(temp.path().join("auth.json"), fresh.to_string()).unwrap();
+    apply_aggregate_relay_profile_to_home_with_session_provider(
+        temp.path(),
+        &profile,
+        "",
+        "local-key",
+        57321,
+        RelaySessionProvider::Openai,
+    )
+    .unwrap();
+    let auth: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(temp.path().join("auth.json")).unwrap())
+            .unwrap();
+    assert_eq!(auth, fresh);
+}
+
+#[test]
+fn aggregate_openai_missing_login_does_not_replace_config_or_auth() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = "model_provider = \"custom\"\n";
+    let auth = r#"{"OPENAI_API_KEY":"existing-key"}"#;
+    std::fs::write(temp.path().join("config.toml"), config).unwrap();
+    std::fs::write(temp.path().join("auth.json"), auth).unwrap();
+    let profile = RelayProfile {
+        relay_mode: RelayMode::Aggregate,
+        ..RelayProfile::default()
+    };
+    let result = apply_aggregate_relay_profile_to_home_with_session_provider(
+        temp.path(),
+        &profile,
+        "",
+        "local-key",
+        57321,
+        RelaySessionProvider::Openai,
+    );
+    assert!(result.is_err());
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("config.toml")).unwrap(),
+        config
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("auth.json")).unwrap(),
+        auth
+    );
+}
+
+#[test]
+fn aggregate_new_context_management_roundtrips_and_writes_on_off_for_both_entrypoints() {
+    use codex_plus_core::settings::{BackendSettings, SettingsStore};
+    let temp = tempfile::tempdir().unwrap();
+    let store = SettingsStore::new(temp.path().join("settings.json"));
+    let mut settings = BackendSettings {
+        relay_profiles: vec![RelayProfile {
+            id: "agg-context".to_string(),
+            relay_mode: RelayMode::Aggregate,
+            context_window: "1000000".to_string(),
+            auto_compact_limit: "900000".to_string(),
+            ..RelayProfile::default()
+        }],
+        active_relay_id: "agg-context".to_string(),
+        ..BackendSettings::default()
+    };
+    assert!(!settings.relay_profiles[0].new_context_management);
+    let home = temp.path().join("home");
+    let common = "[features]\ncode_mode_host = true\n[features.context_management]\nexperimental_mode = true\n";
+    let mut auth_by_entrypoint = std::collections::HashMap::new();
+    for enabled in [true, false, true] {
+        settings.relay_profiles[0].new_context_management = enabled;
+        store.save(&settings).unwrap();
+        let profile = store.load().unwrap().active_relay_profile();
+        assert_eq!(profile.new_context_management, enabled);
+        let serialized = serde_json::to_value(&profile).unwrap();
+        assert_eq!(serialized["newContextManagement"], enabled);
+        for manager_path in [true, false] {
+            if manager_path {
+                apply_aggregate_relay_profile_to_home_with_session_provider(
+                    &home,
+                    &profile,
+                    common,
+                    "codex-plus-aggregate",
+                    57322,
+                    RelaySessionProvider::Custom,
+                )
+                .unwrap();
+            } else {
+                apply_relay_profile_to_home_with_switch_rules(&home, &profile, common).unwrap();
+            }
+            let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+            let config = config.parse::<toml_edit::DocumentMut>().unwrap();
+            assert_eq!(
+                config["features"]["context_management"]["experimental_mode"].as_bool(),
+                Some(enabled)
+            );
+            assert_eq!(config["features"]["code_mode_host"].as_bool(), Some(true));
+            assert_eq!(config["model_context_window"].as_integer(), Some(1_000_000));
+            assert_eq!(
+                config["model_auto_compact_token_limit"].as_integer(),
+                Some(900_000)
+            );
+            assert_eq!(config["model_provider"].as_str(), Some("custom"));
+            assert!(
+                config["model_providers"]["custom"]
+                    .get("requires_openai_auth")
+                    .is_none()
+            );
+            assert_eq!(
+                config["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
+                Some("codex-plus-aggregate")
+            );
+            let auth = std::fs::read_to_string(home.join("auth.json")).unwrap();
+            if let Some(previous) = auth_by_entrypoint.insert(manager_path, auth.clone()) {
+                assert_eq!(
+                    auth, previous,
+                    "toggle must preserve each entrypoint's auth"
+                );
+            }
+        }
+    }
+    let regular = RelayProfile {
+        id: "other".to_string(),
+        relay_mode: RelayMode::PureApi,
+        new_context_management: true,
+        config_contents: "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://example.test/v1\"\nwire_api = \"responses\"\n".to_string(),
+        auth_contents: r#"{"OPENAI_API_KEY":"test-key"}"#.to_string(),
+        ..RelayProfile::default()
+    };
+    apply_relay_profile_to_home_with_switch_rules(&home, &regular, "").unwrap();
+    let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+    assert!(!config.contains("experimental_mode"));
 }
 
 #[test]

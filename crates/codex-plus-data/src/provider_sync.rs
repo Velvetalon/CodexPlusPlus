@@ -2024,10 +2024,7 @@ pub fn session_index_lines_for_thread(
 ///
 /// Best-effort: returns `Ok(0)` without writing when the file is missing or
 /// changed since it was read, so a delete flow never clobbers fresh entries.
-pub fn remove_session_index_entry(
-    codex_home: &Path,
-    thread_id: &str,
-) -> anyhow::Result<usize> {
+pub fn remove_session_index_entry(codex_home: &Path, thread_id: &str) -> anyhow::Result<usize> {
     let path = codex_home.join("session_index.jsonl");
     if !path.exists() {
         return Ok(0);
@@ -2057,10 +2054,7 @@ pub fn remove_session_index_entry(
 /// Lines whose `id` already exists are skipped. Returns the number of
 /// appended lines. Best-effort: returns `Ok(0)` without writing when the
 /// file changed since it was read.
-pub fn restore_session_index_entries(
-    codex_home: &Path,
-    lines: &[String],
-) -> anyhow::Result<usize> {
+pub fn restore_session_index_entries(codex_home: &Path, lines: &[String]) -> anyhow::Result<usize> {
     if lines.is_empty() {
         return Ok(0);
     }
@@ -2464,9 +2458,7 @@ fn sqlite_provider_ids(path: &Path) -> anyhow::Result<Vec<String>> {
     Ok(sorted_provider_ids(ids))
 }
 
-fn sqlite_provider_sync_thread_kinds(
-    paths: &[PathBuf],
-) -> anyhow::Result<ProviderSyncThreadKinds> {
+fn sqlite_provider_sync_thread_kinds(paths: &[PathBuf]) -> anyhow::Result<ProviderSyncThreadKinds> {
     let mut kinds = ProviderSyncThreadKinds::default();
     for path in paths {
         if !path.exists() {
@@ -2697,14 +2689,9 @@ fn count_sqlite_updates(
     let catalog_columns = table_columns(&db, "local_thread_catalog")?;
     let mut total = 0;
     if columns.contains("id") && columns.contains("model_provider") {
-        total += provider_update_thread_ids(
-            &db,
-            "threads",
-            "id",
-            target_provider,
-            excluded_thread_ids,
-        )?
-        .len();
+        total +=
+            provider_update_thread_ids(&db, "threads", "id", target_provider, excluded_thread_ids)?
+                .len();
     }
     if catalog_columns.contains("thread_id") && catalog_columns.contains("model_provider") {
         total += provider_update_thread_ids(
@@ -2782,13 +2769,9 @@ fn apply_sqlite_update(
     let tx = db.transaction()?;
     let mut counts = SqliteUpdateCounts::default();
     if columns.contains("id") && columns.contains("model_provider") {
-        for thread_id in provider_update_thread_ids(
-            &tx,
-            "threads",
-            "id",
-            target_provider,
-            excluded_thread_ids,
-        )? {
+        for thread_id in
+            provider_update_thread_ids(&tx, "threads", "id", target_provider, excluded_thread_ids)?
+        {
             counts.provider_rows += tx.execute(
                 "UPDATE threads SET model_provider = ?1 WHERE id = ?2 AND COALESCE(model_provider, '') <> ?1",
                 (target_provider, thread_id),
@@ -3037,9 +3020,7 @@ fn repair_missing_local_thread_catalog_rows_filtered(
     update_full_sync_state: bool,
 ) -> anyhow::Result<CatalogRepairCounts> {
     let plan = collect_catalog_repair_plan(home, paths, target_provider, thread_ids)?;
-    if plan.threads.is_empty()
-        && (!update_full_sync_state || !plan.has_cleanup_candidates())
-    {
+    if plan.threads.is_empty() && (!update_full_sync_state || !plan.has_cleanup_candidates()) {
         return Ok(CatalogRepairCounts::default());
     }
     let mut total = CatalogRepairCounts::default();
@@ -3339,8 +3320,7 @@ fn collect_catalog_marked_non_root_thread_ids(
             if thread_source_is_user(thread_source.as_deref()) {
                 continue;
             }
-            if source_marks_non_root_agent(&source_kind) || spawned_child_ids.contains(&thread_id)
-            {
+            if source_marks_non_root_agent(&source_kind) || spawned_child_ids.contains(&thread_id) {
                 thread_ids_by_path
                     .entry(path.clone())
                     .or_default()
@@ -3364,8 +3344,7 @@ fn is_catalog_non_root_agent(
     if thread_source_is_user(thread.thread_source.as_deref()) {
         return false;
     }
-    source_marks_non_root_agent(&thread.source_kind)
-        || spawned_child_ids.contains(&thread.id)
+    source_marks_non_root_agent(&thread.source_kind) || spawned_child_ids.contains(&thread.id)
 }
 
 fn thread_source_is_user(thread_source: Option<&str>) -> bool {
@@ -3376,8 +3355,7 @@ fn thread_source_is_user(thread_source: Option<&str>) -> bool {
 
 fn thread_source_marks_non_root(thread_source: Option<&str>) -> bool {
     thread_source.map(str::trim).is_some_and(|value| {
-        value.eq_ignore_ascii_case("subagent")
-            || value.eq_ignore_ascii_case("memory_consolidation")
+        value.eq_ignore_ascii_case("subagent") || value.eq_ignore_ascii_case("memory_consolidation")
     })
 }
 
@@ -3888,7 +3866,9 @@ mod non_root_agent_tests {
 
     #[test]
     fn structured_subagent_markers_still_identify_child_threads() {
-        assert!(marks_non_root(r#"{"subagent":{"thread_spawn":{"depth":1}}}"#));
+        assert!(marks_non_root(
+            r#"{"subagent":{"thread_spawn":{"depth":1}}}"#
+        ));
         assert!(marks_non_root(r#"{"sub_agent":{"other":"review"}}"#));
         assert!(marks_non_root(r#"{"internal":true}"#));
     }

@@ -196,7 +196,11 @@ fn switch_to_aggregate_relay_allows_empty_config_snapshot() {
     let home = temp.path().join("codex");
     std::fs::create_dir(&home).unwrap();
     let store = SettingsStore::new(temp.path().join("settings.json"));
-    let api = pure_profile("api", "https://api.example/v1", "sk-api");
+    let api = RelayProfile {
+        context_window: "1000000".to_string(),
+        auto_compact_limit: "900000".to_string(),
+        ..pure_profile("api", "https://api.example/v1", "sk-api")
+    };
     let aggregate = RelayProfile {
         id: "agg".to_string(),
         name: "聚合供应商 1".to_string(),
@@ -218,6 +222,7 @@ fn switch_to_aggregate_relay_allows_empty_config_snapshot() {
             id: "agg".to_string(),
             name: "聚合供应商 1".to_string(),
             session_provider: RelaySessionProvider::Custom,
+            code_mode_host: false,
             strategy: AggregateRelayStrategy::Failover,
             members: vec![AggregateRelayMember {
                 relay_id: "api".to_string(),
@@ -234,6 +239,8 @@ fn switch_to_aggregate_relay_allows_empty_config_snapshot() {
     assert!(result.configured);
     assert_eq!(store.load().unwrap().active_relay_id, "agg");
     assert!(live.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
+    assert!(live.contains("model_context_window = 1000000"));
+    assert!(live.contains("model_auto_compact_token_limit = 900000"));
 }
 
 #[test]

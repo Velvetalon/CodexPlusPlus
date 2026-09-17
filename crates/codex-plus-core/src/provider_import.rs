@@ -188,6 +188,10 @@ fn relay_profile_from_request(
         upstream_base_url: request.base_url.clone(),
         api_key: request.api_key.clone(),
         protocol: relay_protocol(&request.wire_api),
+        responses_reasoning_policy: Default::default(),
+        responses_wire_policy: Default::default(),
+        custom_tools_as_functions: false,
+        native_agent_interop: Default::default(),
         relay_mode: relay_mode(&request.relay_mode),
         official_mix_api_key: false,
         no_auth: false,
@@ -198,6 +202,7 @@ fn relay_profile_from_request(
         use_common_config: true,
         context_window: String::new(),
         auto_compact_limit: String::new(),
+        new_context_management: false,
         model_insert_mode: Default::default(),
         model_list: String::new(),
         model_windows: String::new(),
@@ -209,6 +214,7 @@ fn relay_profile_from_request(
         sub2api_enabled: false,
         sub2api_multiplier: String::new(),
         model_routes: Vec::new(),
+        model_aliases: Vec::new(),
     }
 }
 

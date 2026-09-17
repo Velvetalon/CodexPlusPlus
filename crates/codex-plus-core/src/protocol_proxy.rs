@@ -9,8 +9,8 @@ use std::time::Duration;
 use anyhow::Context;
 use serde_json::{Value, json};
 
-use crate::relay_rotation::{RotationContext, RotationEvent};
-use crate::settings::{RelayProtocol, SettingsStore};
+use crate::relay_rotation::{RelayRequestOutcome, RotationContext};
+use crate::settings::{RelayProtocol, ResponsesReasoningPolicy, SettingsStore};
 
 pub const DEFAULT_PROTOCOL_PROXY_PORT: u16 = 57321;
 pub const NO_AUTH_PROXY_BEARER_TOKEN: &str = "codex-plus-no-auth";
@@ -60,6 +60,9 @@ struct CodexCustomToolSpec {
     openai_name: String,
     kind: CodexCustomToolKind,
     proxy_action: Option<CodexPatchProxyAction>,
+    /// 客户端 namespace（顶层 custom 为空）。Custom-as-Function 适配合并的
+    /// namespace 工具用它把 custom_tool_call 还原回带 namespace 的客户端视图。
+    namespace: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -112,6 +115,34 @@ impl CodexToolContext {
             .get(upstream_name)
             .map(|spec| spec.openai_name.clone())
             .unwrap_or_else(|| upstream_name.to_string())
+    }
+
+    /// 受管 custom 工具的客户端身份（原名, namespace）。仅供
+    /// Custom-as-Function 适配合并进来的 namespace custom 使用。
+    fn custom_tool_namespace(&self, upstream_name: &str) -> String {
+        self.custom_tools
+            .get(upstream_name)
+            .map(|spec| spec.namespace.clone())
+            .unwrap_or_default()
+    }
+
+    /// 把 Custom-as-Function 适配计划的 wire 名登记进上下文。
+    /// 已存在的条目（例如 apply_patch 代理名）不被覆盖，保持既有行为。
+    fn merge_custom_adapter_plan(
+        &mut self,
+        plan: &crate::custom_tool_adapter::CustomToolAdapterPlan,
+    ) {
+        for (wire_name, identity) in plan.entries() {
+            self.custom_tools.entry(wire_name.clone()).or_insert_with(|| CodexCustomToolSpec {
+                openai_name: identity.client_name.clone(),
+                kind: CodexCustomToolKind::Raw,
+                proxy_action: None,
+                namespace: identity.namespace.clone(),
+            });
+        }
+        if !plan.is_empty() {
+            self.has_custom_tools = true;
+        }
     }
 
     fn openai_name_for_function_tool(&self, upstream_name: &str) -> (String, String) {
@@ -231,7 +262,18 @@ pub fn chat_completion_to_response_with_request(
     body: Value,
     original_request: &Value,
 ) -> anyhow::Result<Value> {
-    let context = build_codex_tool_context(original_request.get("tools"));
+    chat_completion_to_response_with_request_plan(body, original_request, None)
+}
+
+pub fn chat_completion_to_response_with_request_plan(
+    body: Value,
+    original_request: &Value,
+    custom_adapter: Option<&crate::custom_tool_adapter::CustomToolAdapterPlan>,
+) -> anyhow::Result<Value> {
+    let mut context = build_codex_tool_context(original_request.get("tools"));
+    if let Some(plan) = custom_adapter {
+        context.merge_custom_adapter_plan(plan);
+    }
     chat_completion_to_response_with_context(body, &context, Some(original_request))
 }
 
@@ -282,6 +324,7 @@ fn chat_completion_to_response_with_context(
     Ok(response)
 }
 
+#[derive(Debug)]
 pub struct ProxyHttpResponse {
     pub status: String,
     pub content_type: String,
@@ -293,6 +336,10 @@ pub struct UpstreamProxyResponse {
     pub content_type: String,
     pub is_stream: bool,
     pub wire_api: UpstreamWireApi,
+    pub native_agent_plaintext: bool,
+    pub namespace_tools: BTreeMap<String, (String, String)>,
+    /// 请求级 Custom-as-Function 适配计划；开关关闭时为 None，所有响应路径退回既有行为。
+    pub custom_adapter: Option<crate::custom_tool_adapter::CustomToolAdapterPlan>,
     pub response: reqwest::Response,
 }
 
@@ -381,8 +428,15 @@ impl Default for ChatSseToResponsesConverter {
 
 impl ChatSseToResponsesConverter {
     pub fn with_request(original_request: &Value) -> Self {
+        Self::with_request_plan(original_request, None)
+    }
+
+    pub fn with_request_plan(
+        original_request: &Value,
+        custom_adapter: Option<&crate::custom_tool_adapter::CustomToolAdapterPlan>,
+    ) -> Self {
         Self {
-            state: ChatSseState::with_request(original_request),
+            state: ChatSseState::with_request_plan(original_request, custom_adapter),
             ..Self::default()
         }
     }
@@ -559,6 +613,12 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     request_path: &str,
 ) -> anyhow::Result<UpstreamProxyResponse> {
     let mut request_json: Value = serde_json::from_str(body)?;
+    if settings
+        .active_aggregate_relay_profile()
+        .is_some_and(|aggregate| aggregate.code_mode_host)
+    {
+        normalize_code_mode_host_tools(&mut request_json);
+    }
     let is_stream = request_json
         .get("stream")
         .and_then(Value::as_bool)
@@ -595,8 +655,17 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     let relay_count = relays.len();
     for (attempt, relay) in relays.into_iter().enumerate() {
         validate_upstream(&relay)?;
-        let (endpoint, upstream_body, wire_api) =
-            upstream_request_parts(&relay, request_json.clone(), request_path).await?;
+        // 每个候选从原始请求克隆后独立编码（R03）：native-agent 预处理、模型映射、
+        // 工具/ID 转换都只作用于本候选的副本，失败转移后不把上一家的改写带给下一家。
+        let mut attempt_body = request_json.clone();
+        // R08：passthrough 策略下不执行原生子任务别名等结构改写，
+        // 即使 nativeAgentInterop 处于 auto/on。
+        let native_agent_plaintext = relay.responses_wire_policy
+            == crate::settings::ResponsesWirePolicy::Compatible
+            && crate::native_agents::interop_enabled(&relay)
+            && crate::native_agents::prepare_request(&mut attempt_body);
+        let (endpoint, upstream_body, wire_api, namespace_tools, custom_adapter) =
+            upstream_request_parts(&relay, attempt_body, request_path).await?;
         let has_more_candidates = attempt + 1 < relay_count;
         let header_timeout = response_header_timeout(is_stream);
         let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -606,6 +675,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 "relayName": relay.name,
                 "endpoint": endpoint,
                 "wireApi": wire_api,
+                "nativeAgentPlaintext": native_agent_plaintext,
                 "stream": is_stream,
                 "attempt": attempt + 1,
                 "candidateCount": relay_count,
@@ -635,6 +705,13 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         {
             Ok(upstream) => upstream,
             Err(error) => {
+                let entered_cooldown_or_regular_failure =
+                    crate::relay_rotation::record_relay_request_outcome(
+                        &settings,
+                        &relay.id,
+                        RelayRequestOutcome::TransportFailure,
+                    );
+                let should_failover = has_more_candidates && entered_cooldown_or_regular_failure;
                 let _ = crate::diagnostic_log::append_diagnostic_log(
                     "protocol_proxy.upstream_request_failed",
                     json!({
@@ -646,12 +723,11 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         "attempt": attempt + 1,
                         "candidateCount": relay_count,
                         "headerTimeoutSeconds": header_timeout.as_secs(),
-                        "willFailover": has_more_candidates,
+                        "willFailover": should_failover,
                         "error": error.to_string()
                     }),
                 );
-                crate::relay_rotation::record_relay_request_failure(&settings);
-                if has_more_candidates {
+                if should_failover {
                     continue;
                 }
                 return Err(error).with_context(|| {
@@ -663,6 +739,15 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             }
         };
         let status_code = upstream.status().as_u16();
+        let entered_cooldown_or_regular_failure =
+            crate::relay_rotation::record_relay_request_outcome(
+                &settings,
+                &relay.id,
+                RelayRequestOutcome::HttpStatus(status_code),
+            );
+        let should_failover = has_more_candidates
+            && !(200..300).contains(&status_code)
+            && (status_code == 429 || entered_cooldown_or_regular_failure);
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "protocol_proxy.upstream_response",
             json!({
@@ -675,16 +760,8 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 "attempt": attempt + 1,
                 "candidateCount": relay_count,
                 "headerTimeoutSeconds": header_timeout.as_secs(),
-                "willFailover": has_more_candidates && !(200..300).contains(&status_code)
+                "willFailover": should_failover
             }),
-        );
-        crate::relay_rotation::record_relay_request_event(
-            &settings,
-            if (200..300).contains(&status_code) {
-                RotationEvent::Success
-            } else {
-                RotationEvent::Failure
-            },
         );
         let content_type = upstream
             .headers()
@@ -692,12 +769,15 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             .and_then(|value| value.to_str().ok())
             .unwrap_or("")
             .to_string();
-        if (200..300).contains(&status_code) || !has_more_candidates {
+        if (200..300).contains(&status_code) || !should_failover {
             return Ok(UpstreamProxyResponse {
                 status_code,
                 is_stream: is_stream || content_type.contains("text/event-stream"),
                 content_type,
                 wire_api,
+                native_agent_plaintext,
+                namespace_tools,
+                custom_adapter,
                 response: upstream,
             });
         }
@@ -719,6 +799,20 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     anyhow::bail!("未找到可用的聚合供应商成员")
 }
 
+fn normalize_code_mode_host_tools(body: &mut Value) {
+    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    tools.retain(|tool| tool.get("type").and_then(Value::as_str) == Some("function"));
+    if tools.is_empty()
+        && let Some(object) = body.as_object_mut()
+    {
+        object.remove("tools");
+        object.remove("tool_choice");
+        object.remove("parallel_tool_calls");
+    }
+}
+
 fn select_model_route(
     settings: &crate::settings::BackendSettings,
     model: &str,
@@ -728,10 +822,16 @@ fn select_model_route(
     }
 
     let source = settings.active_relay_profile();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
     let Some(route) = source
         .model_routes
         .iter()
-        .find(|route| route.model.trim() == model)
+        .find(|route| route.model.trim() == model && route.is_effectively_enabled_at(now_ms))
     else {
         return Ok(None);
     };
@@ -801,6 +901,9 @@ pub async fn open_models_proxy_request(
         is_stream: false,
         content_type,
         wire_api: UpstreamWireApi::Responses,
+        native_agent_plaintext: false,
+        namespace_tools: BTreeMap::new(),
+        custom_adapter: None,
         response: upstream,
     })
 }
@@ -850,6 +953,9 @@ pub async fn open_audio_transcriptions_proxy_request(
         is_stream: false,
         content_type,
         wire_api: UpstreamWireApi::AudioTranscriptions,
+        native_agent_plaintext: false,
+        namespace_tools: BTreeMap::new(),
+        custom_adapter: None,
         response: upstream,
     })
 }
@@ -904,25 +1010,103 @@ pub async fn open_chat_completions_proxy_request(
         is_stream: is_stream || content_type.contains("text/event-stream"),
         content_type,
         wire_api: UpstreamWireApi::ChatCompletions,
+        native_agent_plaintext: false,
+        namespace_tools: BTreeMap::new(),
+        custom_adapter: None,
         response: upstream,
     })
 }
 
 async fn upstream_request_parts(
     relay: &crate::settings::RelayProfile,
-    request_json: Value,
+    mut request_json: Value,
     request_path: &str,
-) -> anyhow::Result<(String, Value, UpstreamWireApi)> {
+) -> anyhow::Result<(
+    String,
+    Value,
+    UpstreamWireApi,
+    BTreeMap<String, (String, String)>,
+    Option<crate::custom_tool_adapter::CustomToolAdapterPlan>,
+)> {
     let compact = is_responses_compact_proxy_path(request_path);
     if compact && relay.protocol == RelayProtocol::ChatCompletions {
         anyhow::bail!("Chat Completions 协议暂不支持 Responses compact 请求");
     }
+
+    // Custom-as-Function 开关（默认关闭）：按候选 profile 冻结适配计划。
+    // passthrough 组合是显式配置冲突，发送前报错而不是静默忽略。
+    let mut custom_adapter = None;
+    if relay.custom_tools_as_functions {
+        if relay.protocol == RelayProtocol::Responses
+            && relay.responses_wire_policy == crate::settings::ResponsesWirePolicy::Passthrough
+        {
+            return Err(crate::custom_tool_adapter::AdapterError::new(
+                crate::custom_tool_adapter::AdapterErrorCode::PolicyConflict,
+                "「Custom 工具转 Function」与 Responses 结构透传（passthrough）互斥；请关闭其中一项",
+            )
+            .into());
+        }
+        match relay.protocol {
+            RelayProtocol::ChatCompletions => {
+                let plan = crate::custom_tool_adapter::chat_plan_for_namespace_customs(
+                    request_json.get("tools"),
+                );
+                if !plan.is_empty() {
+                    hoist_namespace_custom_tools_for_chat(&mut request_json, &plan);
+                    custom_adapter = Some(plan);
+                }
+            }
+            RelayProtocol::Responses => {
+                if crate::custom_tool_adapter::has_unsupported_state_reference(&request_json) {
+                    return Err(crate::custom_tool_adapter::AdapterError::new(
+                        crate::custom_tool_adapter::AdapterErrorCode::StateReferenceUnsupported,
+                        "请求依赖服务端保存的会话状态（previous_response_id/conversation/item_reference），Custom-as-Function 适配要求完整内联历史",
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+
     let mut body = match relay.protocol {
         RelayProtocol::Responses => request_json,
         RelayProtocol::ChatCompletions => responses_to_chat_completions(request_json)?,
     };
-    if relay.protocol == RelayProtocol::Responses {
+    let mut namespace_tools = BTreeMap::new();
+    // R12：模型别名按候选 profile 解析，协议无关——Responses 与 ChatCompletions
+    // 上游都按同一规则把逻辑名换成物理名，不允许界面可填但某条协议默默不生效。
+    if let Some(model) = body.get("model").and_then(Value::as_str).map(str::trim) {
+        if let Some(alias) = relay
+            .model_aliases
+            .iter()
+            .find(|alias| alias.alias.eq_ignore_ascii_case(model))
+        {
+            body["model"] = Value::String(alias.model.trim().to_string());
+        }
+    }
+    // R08：passthrough = 结构透传边界。跳过 reasoning/ID/原生子任务/additional_tools/
+    // namespace 扁平化等全部 Codex 扩展改写；模型路由与认证仍按显式配置执行。
+    let responses_compat = relay.protocol == RelayProtocol::Responses
+        && relay.responses_wire_policy == crate::settings::ResponsesWirePolicy::Compatible;
+    if responses_compat {
+        normalize_responses_reasoning_policy(
+            &mut body,
+            relay.responses_reasoning_policy,
+            &relay.id,
+        );
+        normalize_responses_item_ids(&mut body);
+        if crate::native_agents::interop_enabled(relay) {
+            crate::native_agents::prepare_glm_messages(&mut body);
+        }
+        normalize_responses_additional_tools(&mut body);
+        namespace_tools = flatten_responses_tool_namespaces(&mut body)?;
         normalize_responses_custom_tool_call_ids(&mut body);
+        if relay.custom_tools_as_functions {
+            let plan = crate::custom_tool_adapter::encode_request(&mut body, &namespace_tools)?;
+            if !plan.is_empty() {
+                custom_adapter = Some(plan);
+            }
+        }
     }
 
     // Image handling (per-model): send-as-is / strip / VLM analysis
@@ -991,7 +1175,665 @@ async fn upstream_request_parts(
         },
         body,
         wire_api,
+        namespace_tools,
+        custom_adapter,
     ))
+}
+
+fn normalize_responses_reasoning_policy(
+    body: &mut Value,
+    policy: ResponsesReasoningPolicy,
+    relay_id: &str,
+) {
+    let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    let mut index = 0;
+    input.retain_mut(|item| {
+        let item_index = index;
+        index += 1;
+        if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+            return true;
+        }
+
+        let content_length = responses_reasoning_content_length(item.get("content"));
+        let has_non_empty_content = content_is_non_empty(item.get("content"));
+        let encrypted_content_present = item
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty());
+        let mut content_cleared = false;
+        let keep = match policy {
+            ResponsesReasoningPolicy::Passthrough => true,
+            ResponsesReasoningPolicy::OpenAiOpaque if has_non_empty_content => {
+                if encrypted_content_present {
+                    if let Some(object) = item.as_object_mut() {
+                        object.insert("content".to_string(), Value::Array(Vec::new()));
+                    }
+                    content_cleared = true;
+                    true
+                } else {
+                    false
+                }
+            }
+            ResponsesReasoningPolicy::OpenAiOpaque => encrypted_content_present,
+            ResponsesReasoningPolicy::Strip => false,
+        };
+
+        let reasoning_content_removed = if keep && policy == ResponsesReasoningPolicy::OpenAiOpaque
+        {
+            item.as_object_mut()
+                .and_then(|object| object.remove("reasoning_content"))
+                .is_some()
+        } else {
+            false
+        };
+        let action = if !keep {
+            "item_removed"
+        } else if content_cleared && reasoning_content_removed {
+            "content_cleared_and_reasoning_content_removed"
+        } else if content_cleared {
+            "content_cleared"
+        } else if reasoning_content_removed {
+            "reasoning_content_removed"
+        } else {
+            "passthrough"
+        };
+
+        if action != "passthrough" {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "protocol_proxy.reasoning_normalization",
+                responses_reasoning_normalization_detail(
+                    item_index,
+                    content_length,
+                    encrypted_content_present,
+                    action,
+                    policy,
+                    relay_id,
+                ),
+            );
+        }
+        keep
+    });
+}
+
+fn responses_reasoning_normalization_detail(
+    index: usize,
+    content_length: usize,
+    encrypted_content_present: bool,
+    action: &str,
+    policy: ResponsesReasoningPolicy,
+    relay_id: &str,
+) -> Value {
+    json!({
+        "index": index,
+        "contentLength": content_length,
+        "encryptedContentPresent": encrypted_content_present,
+        "action": action,
+        "policy": policy.as_str(),
+        "relay": relay_id,
+    })
+}
+
+fn normalize_responses_item_ids(body: &mut Value) {
+    let Some(input) = body.get_mut("input") else {
+        return;
+    };
+    match input {
+        Value::Array(items) => {
+            for item in items {
+                normalize_responses_item_id(item);
+            }
+        }
+        Value::Object(_) => normalize_responses_item_id(input),
+        _ => {}
+    }
+}
+
+fn normalize_responses_item_id(item: &mut Value) {
+    let Some(id) = item.get("id").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(suffix) = id.strip_prefix("item_") else {
+        return;
+    };
+    let prefix = match item.get("type").and_then(Value::as_str) {
+        Some("message") => "msg_",
+        Some("reasoning") => "rs_",
+        Some("function_call") => "fc_",
+        // custom_tool_call 由 normalize_responses_custom_tool_call_ids 一处权威
+        // 规范化，这里跳过以免两套规则叠加出 ctc_ct_（R07）。
+        _ => return,
+    };
+    item["id"] = json!(format!("{prefix}{suffix}"));
+}
+
+fn content_is_non_empty(content: Option<&Value>) -> bool {
+    match content {
+        None | Some(Value::Null) => false,
+        Some(Value::String(value)) => !value.is_empty(),
+        Some(Value::Array(value)) => !value.is_empty(),
+        Some(Value::Object(value)) => !value.is_empty(),
+        Some(_) => true,
+    }
+}
+
+fn responses_reasoning_content_length(content: Option<&Value>) -> usize {
+    match content {
+        None | Some(Value::Null) => 0,
+        Some(Value::String(value)) => usize::from(!value.is_empty()),
+        Some(Value::Array(values)) => values.len(),
+        Some(Value::Object(values)) => usize::from(!values.is_empty()),
+        Some(_) => 1,
+    }
+}
+
+fn normalize_responses_additional_tools(body: &mut Value) {
+    if body.get("tools").is_some_and(|tools| !tools.is_array()) {
+        return;
+    }
+    let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    // GLM accepts these tool definitions in `tools`, but ignores their input-item form.
+    let mut additional_tools = Vec::new();
+    input.retain(|item| {
+        if item.get("type").and_then(Value::as_str) != Some("additional_tools") {
+            return true;
+        }
+        let Some(tools) = item.get("tools").and_then(Value::as_array) else {
+            return true;
+        };
+        additional_tools.extend(tools.iter().cloned());
+        false
+    });
+    if additional_tools.is_empty() {
+        return;
+    }
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+        tools.extend(additional_tools);
+    } else {
+        body["tools"] = Value::Array(additional_tools);
+    }
+}
+
+/// R05：扁平名占用检查。不同身份（命名空间, 原名）争用同一 wire name → 显式报错；
+/// 同一身份且定义完全一致 → 去重（返回 false 跳过重复推送）；
+/// 同一身份但定义不同 → 显式报错，绝不静默覆盖或任选其一。
+fn check_flattened_tool_name(
+    occupied: &mut BTreeMap<String, ((String, String), Option<Value>)>,
+    wire_name: &str,
+    identity: (String, String),
+    definition: Option<Value>,
+) -> anyhow::Result<bool> {
+    match occupied.get(wire_name) {
+        Some((existing_identity, _)) if *existing_identity != identity => {
+            anyhow::bail!(
+                "工具名称冲突：扁平名「{}」同时来自命名空间「{}」的工具「{}」和命名空间「{}」的工具「{}」，已拒绝发送以免误派工具",
+                wire_name,
+                existing_identity.0,
+                existing_identity.1,
+                identity.0,
+                identity.1
+            );
+        }
+        Some((_, existing_definition)) => {
+            let same_definition = match (existing_definition, &definition) {
+                (Some(existing), Some(new)) => existing == new,
+                _ => false,
+            };
+            if same_definition {
+                return Ok(false);
+            }
+            anyhow::bail!(
+                "工具名称冲突：命名空间「{}」的工具「{}」存在多个不同定义（扁平名「{}」），已拒绝发送",
+                identity.0,
+                identity.1,
+                wire_name
+            );
+        }
+        None => {
+            occupied.insert(wire_name.to_string(), (identity, definition));
+            Ok(true)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flatten_responses_namespace_children(
+    namespace_tool: &Value,
+    parent_namespace: &str,
+    parent_description: &str,
+    wire_tools: &mut Vec<Value>,
+    namespace_tools: &mut BTreeMap<String, (String, String)>,
+    occupied: &mut BTreeMap<String, ((String, String), Option<Value>)>,
+) -> anyhow::Result<()> {
+    let child_namespace = namespace_tool
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let namespace = flatten_namespace_tool_name(parent_namespace, child_namespace);
+    let namespace_description = combine_namespace_description(
+        parent_description,
+        namespace_tool
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+    );
+    let children = namespace_tool
+        .get("tools")
+        .and_then(Value::as_array)
+        .or_else(|| namespace_tool.get("children").and_then(Value::as_array));
+    let Some(children) = children else {
+        return Ok(());
+    };
+    for child in children {
+        if child.get("type").and_then(Value::as_str) == Some("namespace") {
+            flatten_responses_namespace_children(
+                child,
+                &namespace,
+                &namespace_description,
+                wire_tools,
+                namespace_tools,
+                occupied,
+            )?;
+            continue;
+        }
+        let Some(name) = child
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let flat = flatten_namespace_tool_name(&namespace, name);
+        if child.get("type").and_then(Value::as_str) != Some("function") {
+            let mut wire_tool = child.clone();
+            wire_tool["name"] = json!(flat);
+            if check_flattened_tool_name(
+                occupied,
+                &flat,
+                (namespace.clone(), name.to_string()),
+                Some(wire_tool.clone()),
+            )? {
+                namespace_tools.insert(flat.clone(), (namespace.clone(), name.to_string()));
+                wire_tools.push(wire_tool);
+            }
+            continue;
+        }
+        let description = combine_namespace_description(
+            &namespace_description,
+            child
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        );
+        // R04：从子工具完整 clone 开始，只改 wire name/type 并按既有策略合并描述；
+        // strict、defer_loading、allowed_callers、async、output_schema 等显式字段
+        // 与未知字段全部保留，显式 false/null 不会被默认值覆盖。
+        let mut wire_tool = child.clone();
+        if let Some(function) = child.get("function").and_then(Value::as_object) {
+            // 兼容嵌套 function 形状：仅回填顶层缺失的 parameters/strict（顶层显式值优先）。
+            if wire_tool.get("parameters").is_none()
+                && let Some(parameters) = function.get("parameters")
+            {
+                wire_tool["parameters"] = parameters.clone();
+            }
+            if wire_tool.get("strict").is_none()
+                && let Some(strict) = function.get("strict")
+            {
+                wire_tool["strict"] = strict.clone();
+            }
+        }
+        wire_tool["type"] = json!("function");
+        wire_tool["name"] = json!(flat);
+        if !description.is_empty() {
+            wire_tool["description"] = json!(description);
+        }
+        if check_flattened_tool_name(
+            occupied,
+            &flat,
+            (namespace.clone(), name.to_string()),
+            Some(wire_tool.clone()),
+        )? {
+            namespace_tools.insert(flat.clone(), (namespace.clone(), name.to_string()));
+            wire_tools.push(wire_tool);
+        }
+    }
+    Ok(())
+}
+
+fn flatten_responses_tool_namespaces(
+    body: &mut Value,
+) -> anyhow::Result<BTreeMap<String, (String, String)>> {
+    let mut namespace_tools = BTreeMap::new();
+    let mut occupied: BTreeMap<String, ((String, String), Option<Value>)> = BTreeMap::new();
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+        let source_tools = std::mem::take(tools);
+        let mut wire_tools = Vec::with_capacity(source_tools.len());
+        for mut tool in source_tools {
+            if tool.get("type").and_then(Value::as_str) != Some("namespace") {
+                // 顶层工具占用自身名字：完全重复的定义去重，同名不同义显式冲突。
+                let Some(name) = tool
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                else {
+                    wire_tools.push(tool);
+                    continue;
+                };
+                let wire_name = name.to_string();
+                let identity = (String::new(), wire_name.clone());
+                if check_flattened_tool_name(
+                    &mut occupied,
+                    &wire_name,
+                    identity,
+                    Some(tool.clone()),
+                )? {
+                    wire_tools.push(tool);
+                }
+                continue;
+            }
+            flatten_responses_namespace_children(
+                &tool,
+                "",
+                "",
+                &mut wire_tools,
+                &mut namespace_tools,
+                &mut occupied,
+            )?;
+        }
+        body["tools"] = Value::Array(wire_tools);
+    }
+    flatten_responses_input_item_namespaces(body);
+    Ok(namespace_tools)
+}
+
+/// R06：只对 input 中真实的调用 item 做扁平化。schema 示例、metadata、
+/// arguments/输出文本等业务 JSON 不是协议 item，不按 type 全树扫描。
+fn flatten_responses_input_item_namespaces(body: &mut Value) {
+    match body.get_mut("input") {
+        Some(Value::Array(items)) => {
+            for item in items.iter_mut() {
+                flatten_responses_tool_namespace_item(item);
+            }
+        }
+        Some(input) if input.is_object() => flatten_responses_tool_namespace_item(input),
+        _ => {}
+    }
+}
+
+/// Chat 上游 + 开关开启时：把 namespace 容器内的 custom 子工具提升为顶层
+/// 扁平名 custom，使既有 Chat 转换器的 custom→function 包装能覆盖它们；
+/// 历史 item 与 tool_choice 的 namespace 引用同步扁平化。开关关闭不执行。
+fn hoist_namespace_custom_tools_for_chat(
+    body: &mut Value,
+    plan: &crate::custom_tool_adapter::CustomToolAdapterPlan,
+) {
+    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut hoisted: Vec<Value> = Vec::new();
+    for tool in tools.iter_mut() {
+        if tool.get("type").and_then(Value::as_str) != Some("namespace") {
+            continue;
+        }
+        let namespace = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let Some(children) = tool.get_mut("tools").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let mut retained = Vec::new();
+        for child in children.drain(..) {
+            let name = child.get("name").and_then(Value::as_str).unwrap_or_default();
+            let flat = flatten_namespace_tool_name(&namespace, name);
+            if plan.identity(&flat).is_some() {
+                let mut custom = child;
+                custom["name"] = json!(flat);
+                hoisted.push(custom);
+            } else {
+                retained.push(child);
+            }
+        }
+        *children = retained;
+    }
+    tools.retain(|tool| {
+        !(tool.get("type").and_then(Value::as_str) == Some("namespace")
+            && tool
+                .get("tools")
+                .and_then(Value::as_array)
+                .is_some_and(|children| children.is_empty()))
+    });
+    tools.extend(hoisted);
+
+    if let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) {
+        for item in items.iter_mut() {
+            flatten_responses_tool_namespace_item(item);
+        }
+    }
+    if let Some(choice) = body.get_mut("tool_choice") {
+        if choice.get("type").and_then(Value::as_str) == Some("custom") {
+            let namespace = choice
+                .get("namespace")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if let Some(name) = choice.get("name").and_then(Value::as_str) {
+                let flat = flatten_namespace_tool_name(&namespace, name);
+                choice["name"] = json!(flat);
+                if let Some(object) = choice.as_object_mut() {
+                    object.remove("namespace");
+                }
+            }
+        }
+    }
+}
+
+fn flatten_responses_tool_namespace_item(item: &mut Value) {
+    if !matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("function_call") | Some("custom_tool_call")
+    ) {
+        return;
+    }
+    let Some(namespace) = item.get("namespace").and_then(Value::as_str) else {
+        return;
+    };
+    if namespace.trim().is_empty() {
+        return;
+    }
+    let name = item
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    item["name"] = json!(flatten_namespace_tool_name(namespace, &name));
+    if let Some(object) = item.as_object_mut() {
+        object.remove("namespace");
+    }
+}
+
+/// R06：恢复只作用于已识别的响应形状——根级调用 item（SSE output_item 事件）、
+/// 事件的 `item` 字段、`output` 数组、`response.completed` 的 `response.output`。
+/// 不再对任意 JSON 树递归，metadata/示例等业务数据保持原样。
+fn restore_responses_tool_namespaces(
+    value: &mut Value,
+    namespace_tools: &BTreeMap<String, (String, String)>,
+) {
+    let Value::Object(object) = value else {
+        return;
+    };
+    restore_responses_tool_namespace_item(object, namespace_tools);
+    if let Some(Value::Object(item)) = object.get_mut("item") {
+        restore_responses_tool_namespace_item(item, namespace_tools);
+    }
+    for container in ["output", "response"] {
+        match object.get_mut(container) {
+            Some(Value::Array(output)) => {
+                for item in output.iter_mut() {
+                    if let Some(item_object) = item.as_object_mut() {
+                        restore_responses_tool_namespace_item(item_object, namespace_tools);
+                    }
+                }
+            }
+            Some(Value::Object(response)) => {
+                if let Some(Value::Array(output)) = response.get_mut("output") {
+                    for item in output.iter_mut() {
+                        if let Some(item_object) = item.as_object_mut() {
+                            restore_responses_tool_namespace_item(item_object, namespace_tools);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn restore_responses_tool_namespace_item(
+    object: &mut serde_json::Map<String, Value>,
+    namespace_tools: &BTreeMap<String, (String, String)>,
+) {
+    if !matches!(
+        object.get("type").and_then(Value::as_str),
+        Some("function_call") | Some("custom_tool_call")
+    ) {
+        return;
+    }
+    if object.get("namespace").is_some() {
+        return;
+    }
+    if let Some(name) = object.get("name").and_then(Value::as_str) {
+        if let Some((namespace, original_name)) = namespace_tools.get(name) {
+            object.insert("namespace".to_string(), json!(namespace));
+            object.insert("name".to_string(), json!(original_name));
+        }
+    }
+}
+
+pub fn restore_responses_tool_namespace_json(
+    bytes: &[u8],
+    namespace_tools: &BTreeMap<String, (String, String)>,
+) -> Vec<u8> {
+    // R10：没有映射时按原样透传，不做无谓的解析重排。
+    if namespace_tools.is_empty() {
+        return bytes.to_vec();
+    }
+    let Ok(mut value) = serde_json::from_slice::<Value>(bytes) else {
+        return bytes.to_vec();
+    };
+    restore_responses_tool_namespaces(&mut value, namespace_tools);
+    serde_json::to_vec(&value).unwrap_or_else(|_| bytes.to_vec())
+}
+
+pub struct ResponsesNamespaceSseRewriter {
+    buffer: Vec<u8>,
+    namespace_tools: BTreeMap<String, (String, String)>,
+}
+
+impl ResponsesNamespaceSseRewriter {
+    pub fn new(namespace_tools: BTreeMap<String, (String, String)>) -> Self {
+        Self {
+            buffer: Vec::new(),
+            namespace_tools,
+        }
+    }
+
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.buffer.extend_from_slice(bytes);
+        let mut output = Vec::new();
+        loop {
+            let lf = self
+                .buffer
+                .windows(2)
+                .position(|window| window == b"\n\n")
+                .map(|index| index + 2);
+            let crlf = self
+                .buffer
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|index| index + 4);
+            let Some(end) = lf.into_iter().chain(crlf).min() else {
+                break;
+            };
+            let frame: Vec<u8> = self.buffer.drain(..end).collect();
+            output.extend(self.rewrite_frame(&frame));
+        }
+        output
+    }
+
+    pub fn finish(&mut self) -> Vec<u8> {
+        self.finish_with_truncation().0
+    }
+
+    /// R10 收尾：完整但缺少结尾空行的最后一帧按正常帧恢复；无法解析成完整
+    /// data JSON 的半帧丢弃并返回截断标记，避免未恢复的扁平名泄露给客户端。
+    pub fn finish_with_truncation(&mut self) -> (Vec<u8>, bool) {
+        let buffer = std::mem::take(&mut self.buffer);
+        if buffer.is_empty() {
+            return (Vec::new(), false);
+        }
+        let text = match std::str::from_utf8(&buffer) {
+            Ok(text) => text,
+            Err(_) => return (Vec::new(), true),
+        };
+        let data = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(|line| line.strip_prefix(' ').unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("
+");
+        if data.trim().is_empty() {
+            return (Vec::new(), true);
+        }
+        match serde_json::from_str::<Value>(&data) {
+            // 完整但未终止的帧：照常恢复后输出。
+            Ok(_) => (self.rewrite_frame(&buffer), false),
+            // 半帧：丢弃，明确报告截断。
+            Err(_) => (Vec::new(), true),
+        }
+    }
+
+    fn rewrite_frame(&self, frame: &[u8]) -> Vec<u8> {
+        // R10：没有 namespace 映射时不做任何改写，按原样透传，
+        // 不把每个 JSON frame 解析重排一遍。
+        if self.namespace_tools.is_empty() {
+            return frame.to_vec();
+        }
+        let Ok(text) = std::str::from_utf8(frame) else {
+            return frame.to_vec();
+        };
+        let data = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(|line| line.strip_prefix(' ').unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let Ok(mut value) = serde_json::from_str::<Value>(&data) else {
+            return frame.to_vec();
+        };
+        restore_responses_tool_namespaces(&mut value, &self.namespace_tools);
+        let mut output = String::new();
+        let mut wrote_data = false;
+        for line in text.split_inclusive('\n') {
+            if line.starts_with("data:") {
+                if !wrote_data {
+                    output.push_str("data: ");
+                    output.push_str(&value.to_string());
+                    output.push_str(if line.ends_with("\r\n") { "\r\n" } else { "\n" });
+                    wrote_data = true;
+                }
+            } else {
+                output.push_str(line);
+            }
+        }
+        output.into_bytes()
+    }
 }
 
 fn upstream_request_builder(
@@ -1065,6 +1907,7 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
     let upstream_content_type = upstream.content_type.clone();
     let is_stream = upstream.is_stream;
     let wire_api = upstream.wire_api;
+    let native_agent_plaintext = upstream.native_agent_plaintext;
     let upstream_body = upstream.response.bytes().await?;
 
     if !(200..300).contains(&status_code) {
@@ -1078,6 +1921,47 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
     }
 
     if wire_api == UpstreamWireApi::Responses {
+        let body = if is_stream {
+            // Custom-as-Function（开关开启时）最先处理：吸收受管 function 事件，
+            // 校验后交付 custom 事件组；普通事件原样流经后续 rewriter。
+            let mut custom_rewriter = crate::custom_tool_adapter::CustomToolSseRewriter::new(
+                upstream.custom_adapter.clone().unwrap_or_default(),
+            );
+            let mut custom_output = custom_rewriter.push_bytes(&upstream_body);
+            let (custom_tail, custom_truncated) = custom_rewriter.finish_with_truncation();
+            custom_output.extend(custom_tail);
+            if custom_truncated {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "helper.protocol_proxy_stream_failed",
+                    json!({ "streamState": "custom_adapter_truncated" }),
+                );
+            }
+            let mut native_rewriter =
+                native_agent_plaintext.then(crate::native_agents::NativeAgentSseRewriter::default);
+            let mut namespace_rewriter =
+                ResponsesNamespaceSseRewriter::new(upstream.namespace_tools.clone());
+            let mut namespace_output = namespace_rewriter.push_bytes(&custom_output);
+            namespace_output.extend(namespace_rewriter.finish());
+            let body = if let Some(rewriter) = &mut native_rewriter {
+                let mut output = rewriter.push_bytes(&namespace_output);
+                output.extend(rewriter.finish());
+                output
+            } else {
+                namespace_output
+            };
+            body
+        } else {
+            let body = restore_responses_json_with_custom_adapter(
+                &upstream_body,
+                upstream.custom_adapter.as_ref(),
+                &upstream.namespace_tools,
+            )?;
+            if native_agent_plaintext {
+                crate::native_agents::restore_json(&body)
+            } else {
+                body
+            }
+        };
         return Ok(ProxyHttpResponse {
             status: "200 OK".to_string(),
             content_type: if upstream_content_type.is_empty() {
@@ -1085,7 +1969,7 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
             } else {
                 upstream_content_type
             },
-            body: upstream_body.to_vec(),
+            body,
         });
     }
 
@@ -1094,12 +1978,21 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
         return Ok(ProxyHttpResponse {
             status: "200 OK".to_string(),
             content_type: "text/event-stream; charset=utf-8".to_string(),
-            body: chat_sse_to_responses_sse_with_request(&text, &request_json).into_bytes(),
+            body: chat_sse_to_responses_sse_with_request_plan(
+                &text,
+                &request_json,
+                upstream.custom_adapter.as_ref(),
+            )
+            .into_bytes(),
         });
     }
 
     let chat_json: Value = serde_json::from_slice(&upstream_body)?;
-    let response_json = chat_completion_to_response_with_request(chat_json, &request_json)?;
+    let response_json = chat_completion_to_response_with_request_plan(
+        chat_json,
+        &request_json,
+        upstream.custom_adapter.as_ref(),
+    )?;
     Ok(ProxyHttpResponse {
         status: "200 OK".to_string(),
         content_type: "application/json; charset=utf-8".to_string(),
@@ -1218,10 +2111,37 @@ pub fn chat_sse_to_responses_sse(input: &str) -> String {
 }
 
 pub fn chat_sse_to_responses_sse_with_request(input: &str, original_request: &Value) -> String {
-    let mut converter = ChatSseToResponsesConverter::with_request(original_request);
+    chat_sse_to_responses_sse_with_request_plan(input, original_request, None)
+}
+
+pub fn chat_sse_to_responses_sse_with_request_plan(
+    input: &str,
+    original_request: &Value,
+    custom_adapter: Option<&crate::custom_tool_adapter::CustomToolAdapterPlan>,
+) -> String {
+    let mut converter = ChatSseToResponsesConverter::with_request_plan(original_request, custom_adapter);
     let mut output = converter.push_bytes(input.as_bytes());
     output.extend(converter.finish());
     String::from_utf8(output).unwrap_or_default()
+}
+
+/// 非流式 Responses 响应的还原顺序（§7.3 逆序）：先解开本适配器的 function
+/// 包装，再走既有 namespace 恢复；计划为空时保持原有字节级行为。
+pub(crate) fn restore_responses_json_with_custom_adapter(
+    bytes: &[u8],
+    custom_adapter: Option<&crate::custom_tool_adapter::CustomToolAdapterPlan>,
+    namespace_tools: &BTreeMap<String, (String, String)>,
+) -> anyhow::Result<Vec<u8>> {
+    let Some(plan) = custom_adapter.filter(|plan| !plan.is_empty()) else {
+        return Ok(restore_responses_tool_namespace_json(bytes, namespace_tools));
+    };
+    let Ok(mut value) = serde_json::from_slice::<Value>(bytes) else {
+        // 不可解析的响应体按既有约定原样返回，由上层按上游错误处理。
+        return Ok(bytes.to_vec());
+    };
+    crate::custom_tool_adapter::restore_custom_tool_calls_json(&mut value, plan)?;
+    restore_responses_tool_namespaces(&mut value, namespace_tools);
+    Ok(serde_json::to_vec(&value).unwrap_or_else(|_| bytes.to_vec()))
 }
 
 pub fn response_id_from_chat_id(id: Option<&str>) -> String {
@@ -1326,9 +2246,16 @@ impl Default for ChatSseState {
 }
 
 impl ChatSseState {
-    fn with_request(original_request: &Value) -> Self {
+    fn with_request_plan(
+        original_request: &Value,
+        custom_adapter: Option<&crate::custom_tool_adapter::CustomToolAdapterPlan>,
+    ) -> Self {
+        let mut tool_context = build_codex_tool_context(original_request.get("tools"));
+        if let Some(plan) = custom_adapter {
+            tool_context.merge_custom_adapter_plan(plan);
+        }
         Self {
-            tool_context: build_codex_tool_context(original_request.get("tools")),
+            tool_context,
             original_request: Some(original_request.clone()),
             ..Self::default()
         }
@@ -2101,10 +3028,14 @@ fn normalize_custom_tool_call_item_id(item: &mut Value) {
     if id.starts_with("ctc_") {
         return;
     }
-    let suffix = id
+    // 只规范化已知跨适配器生成的 fc_/item_ 前缀；原生 ct_ 等其它 id 保持原样，
+    // 不被"统一风格"二次改写（R07）。
+    let Some(suffix) = id
         .strip_prefix("fc_")
         .or_else(|| id.strip_prefix("item_"))
-        .unwrap_or(id);
+    else {
+        return;
+    };
     item["id"] = json!(format!("ctc_{suffix}"));
 }
 
@@ -2812,6 +3743,7 @@ fn build_codex_tool_context(tools: Option<&Value>) -> CodexToolContext {
                         openai_name: "apply_patch".to_string(),
                         kind: CodexCustomToolKind::ApplyPatch,
                         proxy_action: Some(action),
+                        namespace: String::new(),
                     },
                 );
                 context.has_custom_tools = true;
@@ -2823,6 +3755,7 @@ fn build_codex_tool_context(tools: Option<&Value>) -> CodexToolContext {
                     openai_name: name.to_string(),
                     kind: CodexCustomToolKind::Raw,
                     proxy_action: None,
+                    namespace: String::new(),
                 },
             );
             context.has_custom_tools = true;
@@ -2845,6 +3778,7 @@ fn build_codex_tool_context(tools: Option<&Value>) -> CodexToolContext {
                         openai_name: name.to_string(),
                         kind,
                         proxy_action: None,
+                        namespace: String::new(),
                     },
                 );
                 if kind == CodexCustomToolKind::ApplyPatch {
@@ -2862,6 +3796,7 @@ fn build_codex_tool_context(tools: Option<&Value>) -> CodexToolContext {
                                 openai_name: name.to_string(),
                                 kind: CodexCustomToolKind::ApplyPatch,
                                 proxy_action: Some(action),
+                                namespace: String::new(),
                             },
                         );
                     }
@@ -2896,6 +3831,7 @@ fn build_codex_tool_context(tools: Option<&Value>) -> CodexToolContext {
                         openai_name: name.to_string(),
                         kind: CodexCustomToolKind::BuiltIn,
                         proxy_action: None,
+                        namespace: String::new(),
                     },
                 );
                 context.has_custom_tools = true;
@@ -3348,7 +4284,7 @@ fn combine_namespace_description(namespace_description: &str, child_description:
     }
 }
 
-fn flatten_namespace_tool_name(namespace: &str, name: &str) -> String {
+pub(crate) fn flatten_namespace_tool_name(namespace: &str, name: &str) -> String {
     if namespace.is_empty() {
         return name.to_string();
     }
@@ -3552,7 +4488,7 @@ fn tool_call_added_item(
     tool_context: &CodexToolContext,
 ) -> Value {
     if tool_context.is_custom_tool_proxy(&state.name) {
-        return json!({
+        let mut added = json!({
             "type": "response.output_item.added",
             "output_index": output_index,
             "item": {
@@ -3564,6 +4500,11 @@ fn tool_call_added_item(
                 "input": ""
             }
         });
+        let namespace = tool_context.custom_tool_namespace(&state.name);
+        if !namespace.is_empty() {
+            added["item"]["namespace"] = json!(namespace);
+        }
+        return added;
     }
     let (display_name, namespace) = tool_context.openai_name_for_function_tool(&state.name);
     let mut item = json!({
@@ -3654,7 +4595,7 @@ fn response_tool_call_item(
     tool_context: &CodexToolContext,
 ) -> Value {
     if tool_context.is_custom_tool_proxy(name) {
-        return json!({
+        let mut item = json!({
             "id": tool_call_item_id(call_id, name, tool_context),
             "type": "custom_tool_call",
             "status": "completed",
@@ -3662,6 +4603,11 @@ fn response_tool_call_item(
             "name": tool_context.original_custom_tool_name(name),
             "input": reconstruct_custom_tool_call_input_with_context(tool_context, name, arguments)
         });
+        let namespace = tool_context.custom_tool_namespace(name);
+        if !namespace.is_empty() {
+            item["namespace"] = json!(namespace);
+        }
+        return item;
     }
     let (display_name, namespace) = tool_context.openai_name_for_function_tool(name);
     let mut item = json!({
@@ -4685,3 +5631,800 @@ fn is_openai_o_series(model: &str) -> bool {
             .get(1)
             .is_some_and(|byte| byte.is_ascii_digit())
 }
+
+#[cfg(test)]
+mod glm_additional_tools_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn glm_responses_moves_complete_tool_definitions_without_filtering() {
+        let tools = json!([{
+            "type": "namespace", "name": "functions",
+            "tools": [
+                {"type": "custom", "name": "exec", "format": {"type": "text"}},
+                {"type": "function", "name": "wait", "parameters": {"type": "object"}}
+            ]
+        }, {"type": "future_tool", "opaque": {"keep": true}}]);
+        let message = json!({"role": "user", "content": "execute the task"});
+        let agent = json!({"type": "agent_message", "content": [
+            {"type": "encrypted_content", "encrypted_content": "opaque"}
+        ]});
+        let request = json!({
+            "model": "glm-5.3-flash", "stream": true,
+            "tool_choice": "auto", "parallel_tool_calls": true,
+            "input": [
+                {"type": "additional_tools", "role": "developer", "tools": tools},
+                message, agent
+            ]
+        });
+        let relay = crate::settings::RelayProfile {
+            base_url: "https://open.bigmodel.cn/api/v1".to_string(),
+            ..Default::default()
+        };
+        let (endpoint, actual, _, _, _) =
+            upstream_request_parts(&relay, request.clone(), "/responses")
+                .await
+                .unwrap();
+        let mut expected = request;
+        expected["input"] = json!([message, agent]);
+        expected["tools"] = json!([
+            {"type": "custom", "name": "functions__exec", "format": {"type": "text"}},
+            {"type": "function", "name": "functions__wait", "parameters": {"type": "object"}},
+            {"type": "future_tool", "opaque": {"keep": true}}
+        ]);
+        assert_eq!(endpoint, "https://open.bigmodel.cn/api/v1/responses");
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn responses_namespace_tool_wire_round_trips_for_glm_and_openai() {
+        let request = json!({
+            "model": "any-compatible-model",
+            "tools": [{"type": "function", "name": "plain__tool", "parameters": {"type": "object"}}],
+            "input": [
+                {"type": "additional_tools", "tools": [{
+                    "type": "namespace", "name": "functions", "tools": [
+                        {"type": "function", "name": "inspect", "parameters": {"type": "object"}},
+                        {"type": "custom", "name": "exec", "format": {"type": "text"}}
+                    ]
+                }]},
+                {"type": "function_call", "namespace": "functions", "name": "inspect", "call_id": "call-1", "arguments": "{}"},
+                {"type": "custom_tool_call", "namespace": "functions", "name": "exec", "call_id": "call-2", "input": "pwd"}
+            ]
+        });
+        let relay = crate::settings::RelayProfile::default();
+        let (_, wire, _, namespace_tools, _) = upstream_request_parts(&relay, request, "/responses")
+            .await
+            .unwrap();
+        assert_eq!(
+            wire["tools"],
+            json!([
+                {"type": "function", "name": "plain__tool", "parameters": {"type": "object"}},
+                {"type": "function", "name": "functions__inspect", "parameters": {"type": "object"}},
+                {"type": "custom", "name": "functions__exec", "format": {"type": "text"}}
+            ])
+        );
+        assert!(!namespace_tools.contains_key("plain__tool"));
+        assert_eq!(wire["input"][0]["name"], "functions__inspect");
+        assert_eq!(wire["input"][0].get("namespace"), None);
+        assert_eq!(wire["input"][1]["name"], "functions__exec");
+        assert_eq!(wire["input"][1].get("namespace"), None);
+
+        let response = json!({"output": [
+            {"type": "function_call", "name": "functions__inspect", "call_id": "call-1", "arguments": "{}"},
+            {"type": "custom_tool_call", "name": "functions__exec", "call_id": "call-2", "input": "pwd"},
+            {"type": "function_call", "name": "plain__tool", "call_id": "call-3", "arguments": "{}"}
+        ]});
+        let restored: Value = serde_json::from_slice(&restore_responses_tool_namespace_json(
+            &serde_json::to_vec(&response).unwrap(),
+            &namespace_tools,
+        ))
+        .unwrap();
+        assert_eq!(restored["output"][0]["namespace"], "functions");
+        assert_eq!(restored["output"][0]["name"], "inspect");
+        assert_eq!(restored["output"][1]["namespace"], "functions");
+        assert_eq!(restored["output"][1]["name"], "exec");
+        assert_eq!(restored["output"][2].get("namespace"), None);
+        assert_eq!(restored["output"][2]["name"], "plain__tool");
+
+        let frame = format!(
+            "event: response.output_item.done\ndata: {}\n\n",
+            serde_json::to_string(&response).unwrap()
+        );
+        let mut sse = ResponsesNamespaceSseRewriter::new(namespace_tools);
+        let mut stream = Vec::new();
+        for chunk in frame.as_bytes().chunks(9) {
+            stream.extend(sse.push_bytes(chunk));
+        }
+        stream.extend(sse.finish());
+        let stream = String::from_utf8(stream).unwrap();
+        assert!(stream.contains(r#""namespace":"functions""#));
+        assert!(stream.contains(r#""name":"inspect""#));
+        assert!(stream.contains(r#""name":"plain__tool""#));
+    }
+
+    #[test]
+    fn namespace_flattening_handles_nested_namespaces_and_history_without_tools() {
+        let mut body = json!({
+            "input": [
+                {"type": "function_call", "namespace": "outer__inner", "name": "run", "call_id": "call", "arguments": "{}"}
+            ]
+        });
+        let map = flatten_responses_tool_namespaces(&mut body).unwrap();
+        assert!(map.is_empty());
+        assert_eq!(body["input"][0]["name"], "outer__inner__run");
+        assert_eq!(body["input"][0].get("namespace"), None);
+
+        let mut body = json!({
+            "tools": [{
+                "type": "namespace", "name": "outer", "tools": [{
+                    "type": "namespace", "name": "inner", "tools": [
+                        {"type": "function", "name": "run", "parameters": {"type": "object"}}
+                    ]
+                }]
+            }]
+        });
+        let map = flatten_responses_tool_namespaces(&mut body).unwrap();
+        assert_eq!(
+            body["tools"],
+            json!([{"type": "function", "name": "outer__inner__run", "parameters": {"type": "object"}}])
+        );
+        assert_eq!(
+            map.get("outer__inner__run"),
+            Some(&("outer__inner".to_string(), "run".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn native_agent_namespace_restoration_composes_in_correct_order() {
+        let mut request = json!({
+            "tools": [{
+                "type": "namespace", "name": "collaboration", "tools": [
+                    {"type": "function", "name": "spawn_agent", "parameters": {"type": "object"}}
+                ]
+            }]
+        });
+        assert!(crate::native_agents::prepare_request(&mut request));
+        let relay = crate::settings::RelayProfile::default();
+        let (_, wire, _, namespace_tools, _) = upstream_request_parts(&relay, request, "/responses")
+            .await
+            .unwrap();
+        assert_eq!(
+            wire["tools"][0]["name"],
+            "codexpp_native_collaboration__spawn_agent"
+        );
+
+        let upstream_response = json!({"output": [{
+            "type": "function_call",
+            "name": "codexpp_native_collaboration__spawn_agent",
+            "call_id": "call",
+            "arguments": "{\"message\":\"run\"}"
+        }]});
+        let restored: Value = serde_json::from_slice(&restore_responses_tool_namespace_json(
+            &serde_json::to_vec(&upstream_response).unwrap(),
+            &namespace_tools,
+        ))
+        .unwrap();
+        assert_eq!(
+            restored["output"][0]["namespace"],
+            "codexpp_native_collaboration"
+        );
+        let restored: Value = serde_json::from_slice(&crate::native_agents::restore_json(
+            &serde_json::to_vec(&restored).unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(restored["output"][0]["namespace"], "collaboration");
+        assert_eq!(restored["output"][0]["name"], "spawn_agent");
+        assert_eq!(restored["output"][0]["encrypted_function_args"], json!([]));
+
+        let frame = format!(
+            "event: response.output_item.done\ndata: {}\n\n",
+            serde_json::to_string(&upstream_response).unwrap()
+        );
+        let mut namespace_rewriter = ResponsesNamespaceSseRewriter::new(namespace_tools);
+        let native_input = {
+            let mut output = namespace_rewriter.push_bytes(frame.as_bytes());
+            output.extend(namespace_rewriter.finish());
+            output
+        };
+        let mut native_rewriter = crate::native_agents::NativeAgentSseRewriter::default();
+        let mut output = native_rewriter.push_bytes(&native_input);
+        output.extend(native_rewriter.finish());
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains(r#""namespace":"collaboration""#));
+        assert!(output.contains(r#""name":"spawn_agent""#));
+        assert!(output.contains(r#""encrypted_function_args":[]"#));
+    }
+
+    #[test]
+    fn glm_preserves_existing_tools_and_multiple_additions() {
+        let mut body = json!({
+            "tools": [{"type": "function", "name": "existing"}],
+            "input": [
+                {"type": "additional_tools", "tools": [{"type": "custom", "name": "first"}]},
+                {"role": "user", "content": "hello"},
+                {"type": "additional_tools", "tools": [{"type": "function", "name": "second"}]}
+            ]
+        });
+        normalize_responses_additional_tools(&mut body);
+        assert_eq!(
+            body["tools"],
+            json!([
+                {"type": "function", "name": "existing"},
+                {"type": "custom", "name": "first"},
+                {"type": "function", "name": "second"}
+            ])
+        );
+        assert_eq!(body["input"], json!([{"role": "user", "content": "hello"}]));
+        let once = body.clone();
+        normalize_responses_additional_tools(&mut body);
+        assert_eq!(body, once);
+    }
+
+    #[tokio::test]
+    async fn glm_model_behind_local_proxy_preserves_plaintext_agent_context() {
+        let relay = crate::settings::RelayProfile {
+            base_url: "http://127.0.0.1:8788/v1".to_string(),
+            ..Default::default()
+        };
+        let content = json!([{"type": "input_text", "text": "CTX8788-K9"}]);
+        let request = json!({
+            "model": "glm-5.3",
+            "input": [
+                {"type": "agent_message", "content": content},
+                {"type": "additional_tools", "tools": [{"type": "function", "name": "inspect"}]}
+            ]
+        });
+        let (_, actual, _, _, _) = upstream_request_parts(&relay, request, "/responses")
+            .await
+            .unwrap();
+        assert_eq!(
+            actual["input"],
+            json!([{"type": "message", "role": "user", "content": content}])
+        );
+        assert_eq!(
+            actual["tools"],
+            json!([{"type": "function", "name": "inspect"}])
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_model_aliases_rewrite_responses_and_forwarded_requests() {
+        let relay = crate::settings::RelayProfile {
+            base_url: "https://provider.example/v1".to_string(),
+            model_aliases: vec![crate::settings::RelayModelAlias {
+                alias: "gpt-5.6-luna".to_string(),
+                model: "provider-canonical".to_string(),
+            }],
+            ..Default::default()
+        };
+        let request = json!({
+            "model": "GPT-5.6-LUNA",
+            "input": [{"type": "message", "role": "user", "content": "hello"}]
+        });
+        let (_, actual, _, _, _) = upstream_request_parts(&relay, request, "/responses")
+            .await
+            .unwrap();
+        assert_eq!(actual["model"], "provider-canonical");
+    }
+
+    #[test]
+    fn responses_additional_tools_are_normalized_without_target_restrictions() {
+        let request = json!({
+            "input": [{"type": "additional_tools", "tools": [{"type": "custom", "name": "exec"}]}]
+        });
+        let mut actual = request;
+        normalize_responses_additional_tools(&mut actual);
+        assert_eq!(
+            actual,
+            json!({
+                "input": [],
+                "tools": [{"type": "custom", "name": "exec"}]
+            })
+        );
+    }
+}
+
+#[cfg(test)]
+mod responses_reasoning_policy_tests {
+    use super::*;
+
+    fn request() -> Value {
+        json!({
+            "model": "gpt-5.4",
+            "input": [
+                {"type": "message", "role": "user", "content": "before"},
+                {"type": "reasoning", "content": "visible", "encrypted_content": "cipher", "reasoning_content": "secret-one", "summary": [{"type": "summary_text", "text": "official-one"}]},
+                {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "visible"}], "encrypted_content": "cipher-array", "reasoning_content": "secret-two", "summary": [{"type": "summary_text", "text": "official-two"}]},
+                {"type": "reasoning", "content": [], "encrypted_content": "cipher", "reasoning_content": "secret-three", "summary": [{"type": "summary_text", "text": "official-three"}]},
+                {"type": "reasoning", "id": "item_foreign", "content": null, "encrypted_content": null, "summary": [{"type": "summary_text", "text": "foreign-summary"}]},
+                {"type": "function_call", "call_id": "call-1", "name": "lookup"},
+                {"type": "message", "role": "user", "content": "after"}
+            ]
+        })
+    }
+
+    #[test]
+    fn open_ai_opaque_removes_foreign_summary_only_reasoning() {
+        let mut actual = json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "before"},
+                {"type": "reasoning", "id": "item_foreign", "content": null, "encrypted_content": null, "summary": [{"type": "summary_text", "text": "foreign-summary"}]},
+                {"type": "message", "role": "user", "content": "after"}
+            ]
+        });
+        normalize_responses_reasoning_policy(
+            &mut actual,
+            ResponsesReasoningPolicy::OpenAiOpaque,
+            "relay-a",
+        );
+        assert_eq!(
+            actual["input"],
+            json!([
+                {"type": "message", "role": "user", "content": "before"},
+                {"type": "message", "role": "user", "content": "after"}
+            ])
+        );
+    }
+
+    #[test]
+    fn foreign_item_ids_are_normalized_by_responses_item_type() {
+        let mut actual = json!({
+            "input": [
+                {"type": "message", "id": "item_message", "role": "user", "content": "before"},
+                {"type": "function_call", "id": "item_function", "call_id": "call-1", "name": "lookup"},
+                {"type": "custom_tool_call", "id": "item_custom", "call_id": "call-2", "name": "exec", "input": "pwd"}
+            ]
+        });
+        // R07 统一规则：按生产管线顺序调用；custom_tool_call 只由专用规范化处理，
+        // item_ 前缀得到 ctc_，不再出现两套规则叠加的 ctc_ct_。
+        normalize_responses_item_ids(&mut actual);
+        normalize_responses_custom_tool_call_ids(&mut actual);
+        assert_eq!(
+            actual["input"],
+            json!([
+                {"type": "message", "id": "msg_message", "role": "user", "content": "before"},
+                {"type": "function_call", "id": "fc_function", "call_id": "call-1", "name": "lookup"},
+                {"type": "custom_tool_call", "id": "ctc_custom", "call_id": "call-2", "name": "exec", "input": "pwd"}
+            ])
+        );
+    }
+
+    #[test]
+    fn reasoning_item_ids_are_normalized_to_rs_prefix() {
+        let mut actual = json!({
+            "input": [
+                {"type": "message", "id": "item_message", "role": "user", "content": "before"},
+                {"type": "reasoning", "id": "item_reasoning", "summary": [{"type": "summary_text", "text": "glm-thought"}]}
+            ]
+        });
+        normalize_responses_item_ids(&mut actual);
+        assert_eq!(
+            actual["input"],
+            json!([
+                {"type": "message", "id": "msg_message", "role": "user", "content": "before"},
+                {"type": "reasoning", "id": "rs_reasoning", "summary": [{"type": "summary_text", "text": "glm-thought"}]}
+            ])
+        );
+    }
+
+    #[test]
+    fn open_ai_opaque_normalizes_function_id_and_preserves_call_pairing() {
+        let mut actual = json!({
+            "input": [
+                {"type": "message", "id": "item_msg", "role": "user", "content": "before"},
+                {"type": "reasoning", "id": "item_reasoning", "content": null, "encrypted_content": null, "summary": [{"type": "summary_text", "text": "foreign-summary"}]},
+                {"type": "function_call", "id": "item_call", "call_id": "call_foreign", "name": "lookup"},
+                {"type": "function_call_output", "id": "item_output", "call_id": "call_foreign", "output": "done"}
+            ]
+        });
+        normalize_responses_reasoning_policy(
+            &mut actual,
+            ResponsesReasoningPolicy::OpenAiOpaque,
+            "relay-a",
+        );
+        normalize_responses_item_ids(&mut actual);
+        assert_eq!(
+            actual["input"],
+            json!([
+                {"type": "message", "id": "msg_msg", "role": "user", "content": "before"},
+                {"type": "function_call", "id": "fc_call", "call_id": "call_foreign", "name": "lookup"},
+                {"type": "function_call_output", "id": "item_output", "call_id": "call_foreign", "output": "done"}
+            ])
+        );
+    }
+
+    #[test]
+    fn missing_policy_defaults_to_passthrough_and_serializes_camel_case() {
+        let profile: crate::settings::RelayProfile = serde_json::from_value(json!({
+            "id": "relay",
+            "name": "Relay"
+        }))
+        .unwrap();
+        assert_eq!(
+            profile.responses_reasoning_policy,
+            ResponsesReasoningPolicy::Passthrough
+        );
+        assert_eq!(
+            serde_json::to_value(profile).unwrap()["responsesReasoningPolicy"],
+            "passthrough"
+        );
+    }
+
+    #[test]
+    fn passthrough_preserves_reasoning_items_and_order() {
+        let mut actual = request();
+        normalize_responses_reasoning_policy(
+            &mut actual,
+            ResponsesReasoningPolicy::Passthrough,
+            "relay-a",
+        );
+        assert_eq!(actual, request());
+    }
+
+    #[test]
+    fn open_ai_opaque_removes_plaintext_reasoning_and_preserves_summary() {
+        let mut actual = request();
+        normalize_responses_reasoning_policy(
+            &mut actual,
+            ResponsesReasoningPolicy::OpenAiOpaque,
+            "relay-a",
+        );
+
+        assert_eq!(
+            actual["input"],
+            json!([
+                {"type": "message", "role": "user", "content": "before"},
+                {"type": "reasoning", "content": [], "encrypted_content": "cipher", "summary": [{"type": "summary_text", "text": "official-one"}]},
+                {"type": "reasoning", "content": [], "encrypted_content": "cipher-array", "summary": [{"type": "summary_text", "text": "official-two"}]},
+                {"type": "reasoning", "content": [], "encrypted_content": "cipher", "summary": [{"type": "summary_text", "text": "official-three"}]},
+                {"type": "function_call", "call_id": "call-1", "name": "lookup"},
+                {"type": "message", "role": "user", "content": "after"}
+            ])
+        );
+    }
+
+    #[test]
+    fn open_ai_opaque_retains_object_array_content_as_one_item_before_clearing() {
+        let content = json!([
+            {
+                "type": "reasoning_text",
+                "text": "a deliberately long reasoning summary that still counts as one item"
+            }
+        ]);
+        assert_eq!(responses_reasoning_content_length(Some(&content)), 1);
+        assert!(content_is_non_empty(Some(&content)));
+
+        let mut actual = json!({
+            "input": [{
+                "type": "reasoning",
+                "content": content,
+                "encrypted_content": "cipher",
+                "reasoning_content": "plaintext",
+                "summary": [{"type": "summary_text", "text": "official"}]
+            }]
+        });
+        normalize_responses_reasoning_policy(
+            &mut actual,
+            ResponsesReasoningPolicy::OpenAiOpaque,
+            "relay-a",
+        );
+        assert_eq!(actual["input"].as_array().unwrap().len(), 1);
+        assert_eq!(actual["input"][0]["content"], json!([]));
+        assert_eq!(
+            actual["input"][0]["summary"],
+            json!([{"type": "summary_text", "text": "official"}])
+        );
+        assert!(actual["input"][0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn passthrough_preserves_reasoning_content_and_summary() {
+        let mut actual = request();
+        normalize_responses_reasoning_policy(
+            &mut actual,
+            ResponsesReasoningPolicy::Passthrough,
+            "relay-a",
+        );
+        assert_eq!(actual["input"][1]["reasoning_content"], json!("secret-one"));
+        assert_eq!(
+            actual["input"][1]["summary"],
+            json!([{"type": "summary_text", "text": "official-one"}])
+        );
+    }
+
+    #[test]
+    fn strip_removes_all_reasoning_but_keeps_tools_and_order() {
+        let mut actual = request();
+        normalize_responses_reasoning_policy(
+            &mut actual,
+            ResponsesReasoningPolicy::Strip,
+            "relay-a",
+        );
+        assert_eq!(
+            actual["input"],
+            json!([
+                {"type": "message", "role": "user", "content": "before"},
+                {"type": "function_call", "call_id": "call-1", "name": "lookup"},
+                {"type": "message", "role": "user", "content": "after"}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_policy_is_not_applied_to_chat_completions() {
+        let relay = crate::settings::RelayProfile {
+            protocol: RelayProtocol::ChatCompletions,
+            responses_reasoning_policy: ResponsesReasoningPolicy::Strip,
+            base_url: "https://relay.example/v1".to_string(),
+            ..Default::default()
+        };
+        let (_, actual, wire_api, _, _) = upstream_request_parts(&relay, request(), "/responses")
+            .await
+            .unwrap();
+        assert!(matches!(wire_api, UpstreamWireApi::ChatCompletions));
+        assert!(
+            actual["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| {
+                    message
+                        .get("reasoning_content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| text.contains("secret-one"))
+                })
+        );
+    }
+
+    #[test]
+    fn candidates_can_normalize_independently_without_leaking_content_changes() {
+        let mut first = request();
+        normalize_responses_reasoning_policy(
+            &mut first,
+            ResponsesReasoningPolicy::Strip,
+            "relay-strip",
+        );
+        let mut second = request();
+        normalize_responses_reasoning_policy(
+            &mut second,
+            ResponsesReasoningPolicy::OpenAiOpaque,
+            "relay-opaque",
+        );
+
+        assert_eq!(first["input"].as_array().unwrap().len(), 3);
+        assert_eq!(second["input"][1]["content"], json!([]));
+        assert_eq!(second["input"][2]["content"], json!([]));
+    }
+
+    #[test]
+    fn reasoning_diagnostic_detail_is_redacted() {
+        let detail = responses_reasoning_normalization_detail(
+            4,
+            12,
+            true,
+            "content_cleared_and_reasoning_content_removed",
+            ResponsesReasoningPolicy::OpenAiOpaque,
+            "relay-a",
+        );
+        assert_eq!(
+            detail,
+            json!({
+                "index": 4,
+                "contentLength": 12,
+                "encryptedContentPresent": true,
+                "action": "content_cleared_and_reasoning_content_removed",
+                "policy": "openAiOpaque",
+                "relay": "relay-a"
+            })
+        );
+        let serialized = detail.to_string();
+        assert!(!serialized.contains("visible"));
+        assert!(!serialized.contains("cipher"));
+        assert!(!serialized.contains("sk-"));
+    }
+}
+
+/// 2026-09-16 审查回归测试（R04/R06/R07）。
+/// 这些测试断言修复后的契约；加入时先在未修复代码上跑红，作为修复前证据。
+#[cfg(test)]
+mod review_20260916_regression {
+    use super::*;
+
+    // T01 / R04：namespace 子工具重组时必须保留显式行为字段。
+    #[test]
+    fn review_namespace_function_preserves_explicit_fields() {
+        let mut body = json!({"tools": [{
+            "type": "namespace", "name": "fs", "description": "File operations", "tools": [{
+                "type": "function", "name": "inspect", "strict": false,
+                "defer_loading": true, "allowed_callers": ["direct"],
+                "async": false,
+                "output_schema": {"type": "object"},
+                "parameters": {"type": "object", "properties": {}},
+                "x_fixture_extension": {"keep": true}
+            }]
+        }]});
+        let map = flatten_responses_tool_namespaces(&mut body).unwrap();
+        let tool = &body["tools"][0];
+        assert_eq!(tool["name"], json!("fs__inspect"));
+        assert_eq!(tool["type"], json!("function"));
+        assert_eq!(tool.get("strict"), Some(&json!(false)), "顶层 strict 不能丢");
+        assert_eq!(tool.get("defer_loading"), Some(&json!(true)));
+        assert_eq!(tool["allowed_callers"], json!(["direct"]));
+        assert_eq!(tool.get("async"), Some(&json!(false)));
+        assert_eq!(tool["output_schema"], json!({"type": "object"}));
+        assert_eq!(
+            tool["x_fixture_extension"],
+            json!({"keep": true}),
+            "未知字段不能因转换器不认识就删除"
+        );
+        assert_eq!(
+            map.get("fs__inspect"),
+            Some(&("fs".to_string(), "inspect".to_string()))
+        );
+    }
+
+    // T06a / R06：schema 示例里的"调用样子"是业务数据，不能按 type 全树改写。
+    #[test]
+    fn review_schema_examples_are_not_protocol_items() {
+        let example = json!({
+            "type": "function_call", "namespace": "business",
+            "name": "record", "arguments": "{}"
+        });
+        let mut body = json!({"tools": [{
+            "type": "function", "name": "validate_document", "strict": false,
+            "parameters": {"type": "object", "examples": [example.clone()]}
+        }]});
+        let _map = flatten_responses_tool_namespaces(&mut body).unwrap();
+        assert_eq!(
+            body["tools"][0]["parameters"]["examples"][0],
+            example,
+            "parameters 中的示例数据必须逐字段保持原样"
+        );
+    }
+
+    // T06b / R06：JSON 响应里的 metadata 不是真实调用，恢复器不能改写。
+    #[test]
+    fn review_response_metadata_is_not_a_tool_call() {
+        let metadata = json!({
+            "fixture": {"type": "function_call", "name": "fs__inspect", "note": "data"}
+        });
+        let response = json!({
+            "metadata": metadata.clone(),
+            "output": [{
+                "type": "function_call", "name": "fs__inspect",
+                "call_id": "call_keep", "arguments": "{}"
+            }]
+        });
+        let map = BTreeMap::from([
+            ("fs__inspect".to_string(), ("fs".to_string(), "inspect".to_string()))
+        ]);
+        let restored: Value = serde_json::from_slice(&restore_responses_tool_namespace_json(
+            &serde_json::to_vec(&response).unwrap(),
+            &map,
+        ))
+        .unwrap();
+        assert_eq!(restored["output"][0]["namespace"], json!("fs"));
+        assert_eq!(restored["output"][0]["name"], json!("inspect"));
+        assert_eq!(restored["output"][0]["call_id"], json!("call_keep"));
+        assert_eq!(
+            restored["metadata"], metadata,
+            "metadata 里的同名 JSON 是数据，不能被恢复器改写"
+        );
+    }
+
+    // I01 / R07：custom_tool_call 的 item_ ID 只允许一条权威规范化规则，不能叠加出 ctc_ct_。
+    #[test]
+    fn review_custom_item_normalization_has_one_canonical_rule() {
+        let original = json!({"input": [{
+            "type": "custom_tool_call", "id": "item_demo",
+            "name": "exec", "call_id": "call_keep", "input": "echo fixture"
+        }]});
+        let mut body = original.clone();
+        normalize_responses_item_ids(&mut body);
+        normalize_responses_custom_tool_call_ids(&mut body);
+        assert_eq!(
+            body["input"][0]["id"],
+            json!("ctc_demo"),
+            "与既有专用规则保持一致：item_demo -> ctc_demo，不能变成 ctc_ct_demo"
+        );
+        assert_eq!(body["input"][0]["call_id"], json!("call_keep"));
+        let once = body.clone();
+        normalize_responses_item_ids(&mut body);
+        normalize_responses_custom_tool_call_ids(&mut body);
+        assert_eq!(body, once, "规范化必须幂等");
+        assert_eq!(
+            original["input"][0]["id"],
+            json!("item_demo"),
+            "原始输入不能被原地修改"
+        );
+    }
+
+    // I02 / R07：原生 ct_ id 与既有 ctc_ id 不被统一风格二次改写。
+    #[test]
+    fn review_native_and_canonical_custom_ids_stay_untouched() {
+        let mut body = json!({"input": [
+            {"type": "custom_tool_call", "id": "ct_native", "name": "exec", "input": "a"},
+            {"type": "custom_tool_call", "id": "ctc_canonical", "name": "exec", "input": "b"}
+        ]});
+        normalize_responses_item_ids(&mut body);
+        normalize_responses_custom_tool_call_ids(&mut body);
+        assert_eq!(body["input"][0]["id"], json!("ct_native"));
+        assert_eq!(body["input"][1]["id"], json!("ctc_canonical"));
+    }
+
+    // R08：passthrough 策略跳过全部结构改写，但模型别名仍按显式配置执行。
+    #[tokio::test]
+    async fn review_passthrough_policy_skips_structural_rewrites_but_keeps_alias() {
+        use crate::settings::{RelayModelAlias, ResponsesWirePolicy};
+        let request = json!({
+            "model": "logical-model",
+            "tools": [{
+                "type": "namespace", "name": "fs", "tools": [
+                    {"type": "function", "name": "inspect", "strict": false, "parameters": {"type": "object"}}
+                ]
+            }],
+            "input": [
+                {"type": "custom_tool_call", "id": "item_demo", "name": "exec", "call_id": "call_keep", "input": "pwd"},
+                {"type": "reasoning", "content": [{"type": "summary_text", "text": "keep-me"}]}
+            ]
+        });
+        let relay = crate::settings::RelayProfile {
+            base_url: "https://example.invalid/v1".to_string(),
+            model_aliases: vec![RelayModelAlias {
+                alias: "logical-model".to_string(),
+                model: "physical-model".to_string(),
+            }],
+            responses_wire_policy: ResponsesWirePolicy::Passthrough,
+            responses_reasoning_policy: ResponsesReasoningPolicy::Strip,
+            ..Default::default()
+        };
+        let (endpoint, wire, wire_api, namespace_tools, _) =
+            upstream_request_parts(&relay, request, "/responses").await.unwrap();
+        assert!(matches!(wire_api, UpstreamWireApi::Responses));
+        assert_eq!(
+            endpoint, "https://example.invalid/v1/responses",
+            "别名解析与 URL 组装不受透传策略影响"
+        );
+        assert!(
+            namespace_tools.is_empty(),
+            "透传策略下不执行 namespace 扁平化"
+        );
+        assert_eq!(
+            wire["tools"][0]["type"], json!("namespace"),
+            "namespace 声明按原样透传"
+        );
+        assert_eq!(wire["tools"][0]["tools"][0]["name"], json!("inspect"));
+        assert_eq!(
+            wire["input"][0]["id"], json!("item_demo"),
+            "透传策略下不做 item ID 规范化"
+        );
+        assert_eq!(
+            wire["model"], json!("physical-model"),
+            "模型别名仍按显式配置执行"
+        );
+        let reasoning = &wire["input"][1];
+        assert_eq!(
+            reasoning["content"][0]["text"], json!("keep-me"),
+            "透传策略下 reasoning 不做有损清理"
+        );
+    }
+
+    // T12 / R04+R05：同一转换执行两次必须幂等：不重复加前缀、不重复追加工具。
+    #[test]
+    fn review_tool_flattening_is_idempotent() {
+        let mut body = json!({"tools": [{
+            "type": "namespace", "name": "fs", "tools": [
+                {"type": "function", "name": "inspect", "strict": false, "parameters": {"type": "object"}}
+            ]
+        }]});
+        let map_once = flatten_responses_tool_namespaces(&mut body).unwrap();
+        let once = body.clone();
+        let map_twice = flatten_responses_tool_namespaces(&mut body).unwrap();
+        assert_eq!(body, once, "重复扁平化不能改变结果（无重复前缀/重复工具）");
+        // 已扁平化的请求里不再有 namespace 声明，恢复映射为空是正确语义：
+        // 恢复关系只对同一次编码生成的扁平名成立。
+        assert!(map_twice.is_empty());
+    }
+}
+

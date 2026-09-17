@@ -30,3 +30,6 @@ pnpm-workspace.yaml
 plan.md
 plan_v2.md
 
+
+# 本地修复工作区：脱敏日志、live 测试隔离设置与工具，不入库
+.review-local/

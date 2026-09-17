@@ -5,6 +5,7 @@ import test from "node:test";
 import {
   findRelayModelRouteIssue,
   modelRouteSaveRequiresRestart,
+  normalizeRelayModelRoutes,
   PROTOCOL_PROXY_BASE_URL,
   settingsRequireLocalHelper,
   type RelayModelRouteProfile,
@@ -179,4 +180,23 @@ test("disabled provider switching never rewrites live config for a first route",
   ], { relayProfilesEnabled: false });
 
   assert.equal(modelRouteSaveRequiresRestart(before, after, profile("source").baseUrl), false);
+});
+
+test("model route normalization preserves timed forwarding state", () => {
+  assert.deepEqual(
+    normalizeRelayModelRoutes([{
+      model: "gpt-5.6-terra",
+      targetRelayId: "glm",
+      targetModel: "glm-5.3",
+      enabled: false,
+      restoreAt: 1_800_000,
+    }]),
+    [{
+      model: "gpt-5.6-terra",
+      targetRelayId: "glm",
+      targetModel: "glm-5.3",
+      enabled: false,
+      restoreAt: 1_800_000,
+    }],
+  );
 });
