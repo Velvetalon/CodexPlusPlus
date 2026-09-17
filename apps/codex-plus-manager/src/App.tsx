@@ -298,6 +298,7 @@ export type RelayProfile = {
   protocol: RelayProtocol;
   responsesReasoningPolicy: ResponsesReasoningPolicy;
   responsesWirePolicy: ResponsesWirePolicy;
+  customToolsAsFunctions?: boolean;
   nativeAgentInterop: NativeAgentInterop;
   relayMode: RelayMode;
   sessionProvider?: RelaySessionProvider;
@@ -8010,7 +8011,8 @@ function RelayProfileDetail({
   const validationError = relaySessionProviderValidation(draft)
     ?? (isAggregateRelayProfile(draft)
       ? aggregateRelayProfileValidation(draft)
-      : relayModelRoutesSettingsValidation(validationSettings));
+      : relayModelRoutesSettingsValidation(validationSettings))
+    ?? customAdapterPolicyConflict(draft);
   const draftWithModelRows = () => {
     const serializedRows = serializeModelWindowRows(modelWindowRows);
     return {
@@ -9006,6 +9008,36 @@ function RelayProfileEditor({
                     : t("仅 Responses API 生效。")}
                 </p>
               </Field>
+              <label className="switch-row compact relay-switch-row relay-field-custom-tools-as-functions">
+                <input
+                  checked={profile.customToolsAsFunctions === true}
+                  disabled={profile.protocol !== "responses"}
+                  onChange={(event) =>
+                    updateDraft({ customToolsAsFunctions: event.currentTarget.checked })
+                  }
+                  type="checkbox"
+                />
+                <span className="relay-switch-copy">
+                  <strong>{t("Custom 工具转 Function")}</strong>
+                  <small>
+                    {profile.protocol !== "responses"
+                      ? t("仅 Responses API 生效。")
+                      : t("适用于不完整支持 custom 工具的上游。将 custom 工具包装为包含 input 字符串的 function，返回时还原为 custom 调用；不会更换供应商或模型。")}
+                  </small>
+                </span>
+                <ToggleVisual />
+              </label>
+              {profile.protocol === "responses" && profile.customToolsAsFunctions === true ? (
+                profile.responsesWirePolicy === "passthrough" ? (
+                  <p className="field-hint warn">
+                    {t("配置冲突：Custom 工具转 Function 与结构透传互斥，保存后请求会被拒绝。请关闭其中一项。")}
+                  </p>
+                ) : (
+                  <p className="field-hint">
+                    {t("启用后工具输入字符串可往返保留，但原 custom 语法约束可能退化为文字指导和本地校验；流式工具参数将在完整校验后交付，可能略晚显示。")}
+                  </p>
+                )
+              ) : null}
               <Field className="relay-field-context-window" label={t("上下文大小")}>
                 <Input
                   inputMode="numeric"
@@ -11542,6 +11574,7 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
             protocol: "responses" as RelayProtocol,
             responsesReasoningPolicy: "passthrough" as ResponsesReasoningPolicy,
             responsesWirePolicy: "compatible" as ResponsesWirePolicy,
+            customToolsAsFunctions: false,
             nativeAgentInterop: "auto" as NativeAgentInterop,
             relayMode: "official" as RelayMode,
             sessionProvider: "custom" as RelaySessionProvider,
@@ -11618,6 +11651,18 @@ function inputToCodexExtraArgs(value: string) {
   return value === "" ? [] : value.split(/\r?\n/);
 }
 
+/// C03：passthrough 与 Custom-as-Function 互斥；保存前显式拦截，不静默忽略。
+function customAdapterPolicyConflict(profile: RelayProfile): string | null {
+  if (
+    profile.protocol === "responses" &&
+    profile.customToolsAsFunctions === true &&
+    profile.responsesWirePolicy === "passthrough"
+  ) {
+    return "「Custom 工具转 Function」与「结构透传」互斥：请关闭其中一项。";
+  }
+  return null;
+}
+
 function normalizeRelayProfile(profile: RelayProfile): RelayProfile {
   const legacyMixedApi = profile.relayMode === "mixedApi";
   if (profile.relayMode === "aggregate" || profile.aggregate) {
@@ -11666,6 +11711,7 @@ function normalizeRelayProfile(profile: RelayProfile): RelayProfile {
     protocol: profile.protocol === "chatCompletions" ? "chatCompletions" : "responses",
     responsesReasoningPolicy: normalizeResponsesReasoningPolicy(profile.responsesReasoningPolicy),
     responsesWirePolicy: normalizeResponsesWirePolicy(profile.responsesWirePolicy),
+    customToolsAsFunctions: profile.customToolsAsFunctions === true,
     nativeAgentInterop: normalizeNativeAgentInterop(profile.nativeAgentInterop),
     relayMode,
     sessionProvider: relaySessionProvider(profile),
@@ -12515,6 +12561,7 @@ function createRelayProfile(settings: BackendSettings): RelayProfile {
     protocol: "responses" as RelayProtocol,
     responsesReasoningPolicy: "passthrough" as ResponsesReasoningPolicy,
     responsesWirePolicy: "compatible" as ResponsesWirePolicy,
+    customToolsAsFunctions: false,
     nativeAgentInterop: "auto" as NativeAgentInterop,
     relayMode: "official" as RelayMode,
     sessionProvider: "custom" as RelaySessionProvider,
