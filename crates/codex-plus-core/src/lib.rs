@@ -3,6 +3,7 @@ pub mod app_paths;
 pub mod assets;
 pub mod bridge;
 pub mod ccs_import;
+pub mod custom_tool_adapter;
 pub mod cdp;
 pub mod codex_app_state;
 pub mod codex_home;
