@@ -40,6 +40,11 @@ pub struct RelayProfile {
     pub responses_reasoning_policy: ResponsesReasoningPolicy,
     #[serde(rename = "responsesWirePolicy", default)]
     pub responses_wire_policy: ResponsesWirePolicy,
+    /// Custom-as-Function 双向适配开关（默认关闭）。缺失字段的旧 profile 反序列化
+    /// 为 false，原有行为完全不变；始终序列化，保证 CLI provider-update 的
+    /// 允许字段检查能看到它。
+    #[serde(rename = "customToolsAsFunctions", default)]
+    pub custom_tools_as_functions: bool,
     #[serde(rename = "nativeAgentInterop", default)]
     pub native_agent_interop: NativeAgentInterop,
     #[serde(rename = "relayMode", default)]
@@ -250,6 +255,7 @@ impl Default for RelayProfile {
             protocol: RelayProtocol::Responses,
             responses_reasoning_policy: ResponsesReasoningPolicy::default(),
             responses_wire_policy: ResponsesWirePolicy::default(),
+            custom_tools_as_functions: false,
             native_agent_interop: NativeAgentInterop::default(),
             relay_mode: RelayMode::Official,
             official_mix_api_key: false,
@@ -788,7 +794,8 @@ impl BackendSettings {
                 protocol: RelayProtocol::Responses,
                 responses_reasoning_policy: ResponsesReasoningPolicy::default(),
                 responses_wire_policy: ResponsesWirePolicy::default(),
-            native_agent_interop: NativeAgentInterop::default(),
+                custom_tools_as_functions: false,
+                native_agent_interop: NativeAgentInterop::default(),
                 relay_mode: RelayMode::MixedApi,
                 official_mix_api_key: true,
                 no_auth: false,
@@ -867,6 +874,7 @@ impl BackendSettings {
             protocol: RelayProtocol::Responses,
             responses_reasoning_policy: ResponsesReasoningPolicy::default(),
             responses_wire_policy: ResponsesWirePolicy::default(),
+            custom_tools_as_functions: false,
             native_agent_interop: NativeAgentInterop::default(),
             relay_mode: RelayMode::Official,
             official_mix_api_key: false,
@@ -2500,6 +2508,34 @@ mod tests {
 
         let saved = serde_json::to_value(passthrough).unwrap();
         assert_eq!(saved["responsesWirePolicy"], "passthrough");
+    }
+
+    // Custom-as-Function 开关：缺失字段默认 false（旧 profile 行为不变），
+    // true/false round-trip 一致，且字段始终序列化以便 CLI provider-update 识别。
+    #[test]
+    fn relay_profile_custom_tools_as_functions_roundtrip() {
+        let missing: RelayProfile =
+            serde_json::from_str(r#"{ "id":"relay-a", "name":"A" }"#).unwrap();
+        assert!(
+            !missing.custom_tools_as_functions,
+            "旧 profile 缺失字段时适配器必须关闭"
+        );
+
+        let enabled: RelayProfile = serde_json::from_str(
+            r#"{ "id":"relay-a", "name":"A", "customToolsAsFunctions":true }"#,
+        )
+        .unwrap();
+        assert!(enabled.custom_tools_as_functions);
+        let saved = serde_json::to_value(enabled).unwrap();
+        assert_eq!(saved["customToolsAsFunctions"], true);
+
+        let disabled: RelayProfile = serde_json::from_str(
+            r#"{ "id":"relay-a", "name":"A", "customToolsAsFunctions":false }"#,
+        )
+        .unwrap();
+        assert!(!disabled.custom_tools_as_functions);
+        let saved_disabled = serde_json::to_value(disabled).unwrap();
+        assert_eq!(saved_disabled["customToolsAsFunctions"], false);
     }
 
     #[test]

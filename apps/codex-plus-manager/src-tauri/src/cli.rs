@@ -676,4 +676,25 @@ mod tests {
             ResponsesReasoningPolicy::Strip
         );
     }
+
+    // C02：CLI provider-update 必须接受 customToolsAsFunctions（字段始终序列化，
+    // 旧 profile 缺字段也能被允许字段检查识别），true/false 都能写回。
+    #[test]
+    fn provider_update_accepts_custom_tools_as_functions() {
+        let profile = RelayProfile::default();
+        let mut next = serde_json::to_value(&profile).unwrap();
+        let patch = json!({"customToolsAsFunctions": true});
+
+        for key in patch.as_object().unwrap().keys() {
+            assert!(next.get(key).is_some(), "provider-update rejected {key}");
+        }
+        merge_object(&mut next, &patch);
+        let enabled: RelayProfile = serde_json::from_value(next).unwrap();
+        assert!(enabled.custom_tools_as_functions);
+
+        let mut next = serde_json::to_value(&enabled).unwrap();
+        merge_object(&mut next, &json!({"customToolsAsFunctions": false}));
+        let disabled: RelayProfile = serde_json::from_value(next).unwrap();
+        assert!(!disabled.custom_tools_as_functions);
+    }
 }

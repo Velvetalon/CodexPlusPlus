@@ -149,6 +149,7 @@ pub fn relay_profile_from_ccs(
         protocol: provider.protocol,
         responses_reasoning_policy: Default::default(),
         responses_wire_policy: Default::default(),
+        custom_tools_as_functions: false,
         native_agent_interop: Default::default(),
         relay_mode: RelayMode::PureApi,
         official_mix_api_key: false,
