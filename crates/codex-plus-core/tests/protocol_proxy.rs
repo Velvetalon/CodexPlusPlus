@@ -1,3 +1,4 @@
+use codex_plus_core::launcher::{DefaultLaunchHooks, LaunchHooks};
 use codex_plus_core::protocol_proxy::{
     ChatSseToResponsesConverter, audio_transcriptions_url, chat_completion_to_response,
     chat_completion_to_response_with_request, chat_completions_url, chat_sse_to_responses_sse,
@@ -3598,4 +3599,939 @@ async fn aggregate_fallback_leaves_original_request_json_unmodified() {
             && !serialized.contains("encrypted"),
         "原始请求不能被候选改写污染：{serialized}"
     );
+}
+
+// ===========================================================================
+// Custom-as-Function 双向适配器（customToolsAsFunctions，默认关闭）
+// ===========================================================================
+
+/// 可指定响应的 JSON 请求捕获（供 fallback 与响应还原测试复用）。
+async fn capture_json_request_and_respond(
+    listener: tokio::net::TcpListener,
+    response: String,
+) -> (String, serde_json::Value) {
+    let (mut stream, _) = listener.accept().await.unwrap();
+    let mut buffer = Vec::new();
+    let mut chunk = [0; 4096];
+    let (header_end, content_length) = loop {
+        let read = stream.read(&mut chunk).await.unwrap();
+        assert!(read > 0, "request closed before headers completed");
+        buffer.extend_from_slice(&chunk[..read]);
+        let Some(header_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let headers = String::from_utf8_lossy(&buffer[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+            })
+            .unwrap_or(0);
+        break (header_end + 4, content_length);
+    };
+    while buffer.len() < header_end + content_length {
+        let read = stream.read(&mut chunk).await.unwrap();
+        assert!(read > 0, "request closed before body completed");
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+    let headers = String::from_utf8_lossy(&buffer[..header_end - 4]).to_string();
+    let body = serde_json::from_slice(&buffer[header_end..header_end + content_length]).unwrap();
+    stream.write_all(response.as_bytes()).await.unwrap();
+    (headers, body)
+}
+
+/// canonical custom fixture：namespace 内 custom + 普通 function、顶层 custom、
+/// 一轮 custom 调用/结果历史、tool_choice 指向 namespace custom。
+fn custom_adapter_request_fixture() -> serde_json::Value {
+    json!({
+        "model": "review-model",
+        "stream": false,
+        "tool_choice": { "type": "custom", "namespace": "functions", "name": "review_echo" },
+        "tools": [
+            {
+                "type": "namespace", "name": "functions", "tools": [
+                    {
+                        "type": "custom", "name": "review_echo",
+                        "description": "Echo exact input; this is a safe test tool, not a shell.",
+                        "format": { "type": "text" }
+                    },
+                    {
+                        "type": "function", "name": "review_wait",
+                        "description": "A normal function control tool.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": { "token": { "type": "string" } },
+                            "required": ["token"],
+                            "additionalProperties": false
+                        },
+                        "strict": false
+                    }
+                ]
+            },
+            {
+                "type": "custom", "name": "review_echo",
+                "description": "Top-level echo tool with the same client name.",
+                "format": { "type": "text" }
+            }
+        ],
+        "input": [
+            { "type": "message", "role": "user", "content": "Use review_echo with the exact test input requested by the harness." },
+            {
+                "type": "custom_tool_call", "id": "ctc_hist1", "call_id": "call_hist1",
+                "name": "review_echo",
+                "input": "第一行\n  第二行\\路径\"引号\"  "
+            },
+            {
+                "type": "custom_tool_call_output", "call_id": "call_hist1",
+                "output": "工具结果占位"
+            }
+        ]
+    })
+}
+
+fn http_json_response(status_line: &str, body: &serde_json::Value) -> String {
+    let text = body.to_string();
+    format!(
+        "{status_line}\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{text}",
+        text.len()
+    )
+}
+
+/// C01（回归护栏）：开关关闭时 wire 保持 custom 原形，普通请求不受影响。
+#[tokio::test]
+async fn custom_adapter_off_keeps_custom_wire_form() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(capture_json_request_once(listener));
+    let settings = BackendSettings {
+        active_relay_id: "adapter-off".to_string(),
+        relay_profiles: vec![RelayProfile {
+            id: "adapter-off".to_string(),
+            name: "off".to_string(),
+            base_url: format!("http://{addr}/v1"),
+            api_key: "sk-test".to_string(),
+            protocol: RelayProtocol::Responses,
+            relay_mode: RelayMode::PureApi,
+            custom_tools_as_functions: false,
+            ..RelayProfile::default()
+        }],
+        ..BackendSettings::default()
+    };
+
+    let request = custom_adapter_request_fixture();
+    let original = request.clone();
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+    let (_, body) = server.await.unwrap();
+
+    // namespace 扁平化后 custom 仍是 custom；普通 function 原样。
+    let wire_tools = body["tools"].as_array().unwrap();
+    let echo = wire_tools
+        .iter()
+        .find(|tool| tool["name"] == "functions__review_echo")
+        .expect("namespace custom 应被扁平化保留");
+    assert_eq!(echo["type"], "custom", "关闭开关时不得包装成 function");
+    assert_eq!(echo["format"]["type"], "text");
+    // 历史 custom 调用保持原类型（仅做 ID 规范化）。
+    let history_call = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["call_id"] == "call_hist1")
+        .unwrap();
+    assert_eq!(history_call["type"], "custom_tool_call");
+    assert_eq!(history_call["input"], "第一行\n  第二行\\路径\"引号\"  ");
+    // 原始请求未被原地改写（H07）。
+    assert_eq!(request, original);
+}
+
+/// Q01/Q02/Q05/H01/H02（开关开启，Responses 上游）：声明/历史/tool_choice
+/// 全部按统一计划包装，普通 function 与顶层身份不受影响，原始请求不改写。
+#[tokio::test]
+async fn custom_adapter_on_wraps_declarations_history_and_tool_choice() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(capture_json_request_once(listener));
+    let settings = BackendSettings {
+        active_relay_id: "adapter-on".to_string(),
+        relay_profiles: vec![RelayProfile {
+            id: "adapter-on".to_string(),
+            name: "on".to_string(),
+            base_url: format!("http://{addr}/v1"),
+            api_key: "sk-test".to_string(),
+            protocol: RelayProtocol::Responses,
+            relay_mode: RelayMode::PureApi,
+            custom_tools_as_functions: true,
+            ..RelayProfile::default()
+        }],
+        ..BackendSettings::default()
+    };
+
+    let request = custom_adapter_request_fixture();
+    let original = request.clone();
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+    let (_, body) = server.await.unwrap();
+
+    let wire_tools = body["tools"].as_array().unwrap();
+    let echo = wire_tools
+        .iter()
+        .find(|tool| tool["name"] == "functions__review_echo")
+        .expect("namespace custom 必须以扁平 function 形式发送");
+    assert_eq!(echo["type"], "function");
+    assert_eq!(echo["strict"], json!(false));
+    assert_eq!(echo["parameters"]["type"], "object");
+    assert_eq!(echo["parameters"]["properties"]["input"]["type"], "string");
+    assert_eq!(echo["parameters"]["required"], json!(["input"]));
+    assert_eq!(echo["parameters"]["additionalProperties"], json!(false));
+    assert!(
+        echo["description"]
+            .as_str()
+            .unwrap()
+            .contains("Echo exact input"),
+        "原描述必须并入包装描述"
+    );
+
+    let wait = wire_tools
+        .iter()
+        .find(|tool| tool["name"] == "functions__review_wait")
+        .expect("普通 function 保持扁平名发送");
+    assert_eq!(wait["type"], "function");
+    assert!(wait.get("strict").is_none() || wait["strict"] == json!(false));
+    assert!(
+        wait["parameters"]["properties"]["token"].is_object(),
+        "普通 function 的参数 schema 不得被适配器改写"
+    );
+
+    let top = wire_tools
+        .iter()
+        .find(|tool| tool["name"] == "review_echo" && tool["type"] == "function")
+        .expect("顶层 custom 以原 wire 名包装");
+    assert_eq!(top["parameters"]["required"], json!(["input"]));
+
+    let items = body["input"].as_array().unwrap();
+    let history_call = items
+        .iter()
+        .find(|item| item["call_id"] == "call_hist1")
+        .unwrap();
+    assert_eq!(history_call["type"], "function_call");
+    assert_eq!(history_call["name"], "review_echo", "历史调用按客户端原名包装");
+    assert_eq!(history_call["id"], "ctc_hist1", "item id 保持既有规范化结果");
+    let arguments = history_call["arguments"].as_str().unwrap();
+    let decoded: serde_json::Value = serde_json::from_str(arguments).unwrap();
+    assert_eq!(
+        decoded["input"],
+        "第一行\n  第二行\\路径\"引号\"  ",
+        "装箱只包一层 JSON，input 字符串逐字符保留"
+    );
+    let history_output = items
+        .iter()
+        .find(|item| item["call_id"] == "call_hist1" && item["type"] == "function_call_output")
+        .expect("结果与调用一起转换");
+    assert_eq!(history_output["output"], "工具结果占位", "output 不做二次封装");
+
+    assert_eq!(
+        body["tool_choice"],
+        json!({ "type": "function", "name": "functions__review_echo" })
+    );
+    assert_eq!(request, original, "原始请求对象不得被原地改写");
+}
+
+/// J01/J03/J06 + §10.4（JSON 返回入口，端到端）：function_call 精确还原为
+/// custom_tool_call，普通 function 不动，回显 tools/tool_choice 还原为客户端视图。
+#[tokio::test]
+async fn custom_adapter_json_response_restores_custom_tool_call_end_to_end() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let upstream_response = json!({
+        "id": "resp_adapter",
+        "object": "response",
+        "status": "completed",
+        "output": [
+            {
+                "type": "function_call", "id": "fc_ns", "call_id": "call_ns",
+                "name": "functions__review_echo",
+                "arguments": serde_json::to_string(&json!({ "input": "line1\r\nline2 \"quoted\" 🧪" })).unwrap(),
+                "status": "completed"
+            },
+            {
+                "type": "function_call", "id": "fc_plain", "call_id": "call_plain",
+                "name": "functions__review_wait",
+                "arguments": serde_json::to_string(&json!({ "token": "t" })).unwrap(),
+                "status": "completed"
+            },
+            {
+                "type": "function_call", "id": "fc_top", "call_id": "call_top",
+                "name": "review_echo",
+                "arguments": serde_json::to_string(&json!({ "input": "" })).unwrap(),
+                "status": "completed"
+            }
+        ],
+        "tools": [
+            { "type": "function", "name": "functions__review_echo", "description": "wrapped" },
+            { "type": "function", "name": "review_echo", "description": "wrapped-top" }
+        ],
+        "tool_choice": { "type": "function", "name": "functions__review_echo" }
+    });
+    let server = tokio::spawn(capture_json_request_and_respond(
+        listener,
+        http_json_response("HTTP/1.1 200 OK", &upstream_response),
+    ));
+
+    let settings = json!({
+        "relayProfiles": [{
+            "id": "adapter-json",
+            "name": "adapter",
+            "baseUrl": format!("http://{addr}/v1"),
+            "upstreamBaseUrl": format!("http://{addr}/v1"),
+            "apiKey": "sk-test",
+            "protocol": "responses",
+            "relayMode": "pureApi",
+            "customToolsAsFunctions": true
+        }],
+        "activeRelayId": "adapter-json"
+    });
+    std::fs::write(
+        temp.path().join("settings.json"),
+        serde_json::to_vec_pretty(&settings).unwrap(),
+    )
+    .unwrap();
+    let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
+
+    let request = json!({
+        "model": "review-model",
+        "stream": false,
+        "tools": [
+            {
+                "type": "namespace", "name": "functions", "tools": [
+                    { "type": "custom", "name": "review_echo", "description": "Echo tool.", "format": { "type": "text" } },
+                    { "type": "function", "name": "review_wait", "parameters": { "type": "object", "properties": { "token": { "type": "string" } } } }
+                ]
+            },
+            { "type": "custom", "name": "review_echo", "description": "Top-level echo tool with the same client name.", "format": { "type": "text" } }
+        ],
+        "input": [{ "type": "message", "role": "user", "content": "go" }]
+    });
+    let response = codex_plus_core::protocol_proxy::handle_responses_proxy_request(
+        &request.to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status, "200 OK");
+    let _ = server.await.unwrap();
+
+    let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    let output = body["output"].as_array().unwrap();
+
+    assert_eq!(output[0]["type"], "custom_tool_call");
+    assert_eq!(output[0]["name"], "review_echo");
+    assert_eq!(output[0]["namespace"], "functions");
+    assert_eq!(output[0]["id"], "ctc_ns");
+    assert_eq!(output[0]["call_id"], "call_ns");
+    assert_eq!(
+        output[0]["input"],
+        "line1\r\nline2 \"quoted\" 🧪",
+        "input 解码后必须逐字符相等"
+    );
+    assert!(output[0].get("arguments").is_none(), "function 专属字段必须移除");
+
+    assert_eq!(output[1]["type"], "function_call", "普通 function 不误转");
+    // 既有 namespace 还原管线把扁平名恢复为客户端视图（原名 + namespace 字段）。
+    assert_eq!(output[1]["name"], "review_wait");
+    assert_eq!(output[1]["namespace"], "functions");
+    assert_eq!(output[1]["arguments"], "{\"token\":\"t\"}");
+
+    assert_eq!(output[2]["type"], "custom_tool_call");
+    assert!(output[2].get("namespace").is_none(), "顶层 custom 不携带 namespace");
+    assert_eq!(output[2]["input"], "", "合法空串不得被丢弃");
+
+    let echoed_tools = body["tools"].as_array().unwrap();
+    assert_eq!(echoed_tools[0]["type"], "custom", "回显声明还原为 custom");
+    assert_eq!(echoed_tools[0]["name"], "review_echo");
+    assert_eq!(body["tool_choice"], json!({ "type": "custom", "namespace": "functions", "name": "review_echo" }));
+}
+
+/// C03 / §4.3：passthrough + 开关是配置冲突，发送前显式失败，上游收到 0 个请求。
+#[tokio::test]
+async fn custom_adapter_conflicts_with_passthrough_and_fails_before_upstream() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    // 非阻塞探测：若适配器错误地把请求发往上游，accept 会立即成功。
+    let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+
+    let settings = json!({
+        "relayProfiles": [{
+            "id": "adapter-conflict",
+            "name": "conflict",
+            "baseUrl": format!("http://{addr}/v1"),
+            "upstreamBaseUrl": format!("http://{addr}/v1"),
+            "apiKey": "sk-test",
+            "protocol": "responses",
+            "relayMode": "pureApi",
+            "responsesWirePolicy": "passthrough",
+            "customToolsAsFunctions": true
+        }],
+        "activeRelayId": "adapter-conflict"
+    });
+    std::fs::write(
+        temp.path().join("settings.json"),
+        serde_json::to_vec_pretty(&settings).unwrap(),
+    )
+    .unwrap();
+    let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
+
+    let request = custom_adapter_request_fixture();
+    // 缓冲入口把错误作为 Err 传播（launcher 层渲染为 502 + 错误体）。
+    let error = codex_plus_core::protocol_proxy::handle_responses_proxy_request(
+        &request.to_string(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("CUSTOM_ADAPTER_POLICY_CONFLICT"),
+        "错误必须携带类型化错误码：{error}"
+    );
+    probe.set_nonblocking(true).unwrap();
+    assert!(probe.accept().is_err(), "冲突请求不得发往上游");
+}
+
+/// §9.3：开关开启时依赖服务端会话状态的请求必须显式报不支持。
+#[tokio::test]
+async fn custom_adapter_rejects_server_state_references() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    // 非阻塞探测：若适配器错误地把请求发往上游，accept 会立即成功。
+    let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+
+    let settings = json!({
+        "relayProfiles": [{
+            "id": "adapter-ref",
+            "name": "ref",
+            "baseUrl": format!("http://{addr}/v1"),
+            "upstreamBaseUrl": format!("http://{addr}/v1"),
+            "apiKey": "sk-test",
+            "protocol": "responses",
+            "relayMode": "pureApi",
+            "customToolsAsFunctions": true
+        }],
+        "activeRelayId": "adapter-ref"
+    });
+    std::fs::write(
+        temp.path().join("settings.json"),
+        serde_json::to_vec_pretty(&settings).unwrap(),
+    )
+    .unwrap();
+    let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
+
+    let request = json!({
+        "model": "review-model",
+        "previous_response_id": "resp_prev",
+        "tools": [{ "type": "custom", "name": "review_echo" }],
+        "input": [{ "type": "message", "role": "user", "content": "continue" }]
+    });
+    let error = codex_plus_core::protocol_proxy::handle_responses_proxy_request(
+        &request.to_string(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("CUSTOM_ADAPTER_STATE_REFERENCE_UNSUPPORTED"),
+        "服务端引用必须显式报不支持：{error}"
+    );
+    probe.set_nonblocking(true).unwrap();
+    assert!(probe.accept().is_err(), "带服务端引用的请求不得发往上游");
+}
+
+/// F01（候选隔离）：A 开关开 → 429 → B 开关关。A 看到 function 包装，
+/// B 看到该协议本来应有的 custom 形态，互不污染。
+#[tokio::test]
+async fn custom_adapter_fallback_from_enabled_to_disabled_is_isolated() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let first = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let first_addr = first.local_addr().unwrap();
+    let second = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let second_addr = second.local_addr().unwrap();
+    let first_server = tokio::spawn(capture_json_request_and_respond(
+        first,
+        "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 13\r\ncontent-type: application/json\r\n\r\n{\"error\":429}".to_string(),
+    ));
+    let second_server = tokio::spawn(capture_json_request_once(second));
+
+    let mut settings = aggregate_proxy_settings(
+        "adapter-iso-ab",
+        format!("http://{first_addr}/v1"),
+        format!("http://{second_addr}/v1"),
+    );
+    settings.relay_profiles[0].custom_tools_as_functions = true;
+    for relay in settings.relay_profiles.iter_mut().take(2) {
+        relay.relay_mode = RelayMode::PureApi;
+        relay.no_auth = true;
+        relay.api_key.clear();
+    }
+
+    let request = custom_adapter_request_fixture();
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+
+    let (_, first_body) = first_server.await.unwrap();
+    let a_echo = first_body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "functions__review_echo")
+        .unwrap();
+    assert_eq!(a_echo["type"], "function", "A（开关开）必须看到 function 包装");
+
+    let (_, second_body) = second_server.await.unwrap();
+    let b_echo = second_body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "functions__review_echo")
+        .unwrap();
+    assert_eq!(b_echo["type"], "custom", "B（开关关）必须保持 custom 形态");
+    let b_history = second_body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["call_id"] == "call_hist1")
+        .unwrap();
+    assert_eq!(b_history["type"], "custom_tool_call", "B 不继承 A 的历史转换");
+}
+
+/// F02（候选隔离反向）：A 开关关 → 429 → B 开关开。B 独立完成包装。
+#[tokio::test]
+async fn custom_adapter_fallback_from_disabled_to_enabled_is_isolated() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let first = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let first_addr = first.local_addr().unwrap();
+    let second = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let second_addr = second.local_addr().unwrap();
+    let first_server = tokio::spawn(capture_json_request_and_respond(
+        first,
+        "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 13\r\ncontent-type: application/json\r\n\r\n{\"error\":429}".to_string(),
+    ));
+    let second_server = tokio::spawn(capture_json_request_once(second));
+
+    let mut settings = aggregate_proxy_settings(
+        "adapter-iso-ba",
+        format!("http://{first_addr}/v1"),
+        format!("http://{second_addr}/v1"),
+    );
+    settings.relay_profiles[1].custom_tools_as_functions = true;
+    for relay in settings.relay_profiles.iter_mut().take(2) {
+        relay.relay_mode = RelayMode::PureApi;
+        relay.no_auth = true;
+        relay.api_key.clear();
+    }
+
+    let request = custom_adapter_request_fixture();
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+
+    let (_, first_body) = first_server.await.unwrap();
+    let a_echo = first_body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "functions__review_echo")
+        .unwrap();
+    assert_eq!(a_echo["type"], "custom", "A（开关关）保持 custom 形态");
+
+    let (_, second_body) = second_server.await.unwrap();
+    let b_echo = second_body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "functions__review_echo")
+        .unwrap();
+    assert_eq!(b_echo["type"], "function", "B（开关开）独立完成包装");
+    let b_history = second_body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["call_id"] == "call_hist1")
+        .unwrap();
+    assert_eq!(b_history["type"], "function_call", "B 独立转换历史");
+}
+
+/// P01（完整 SSE 缓冲入口）：受管调用按调用缓冲，完整校验后交付 custom 事件组；
+/// 普通事件原样流动，sequence_number 单调递增。
+#[tokio::test]
+async fn custom_adapter_buffered_sse_restores_custom_events() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let sse_body = format!(
+        "event: response.created\ndata: {}\n\n\
+         event: response.output_item.added\ndata: {}\n\n\
+         event: response.function_call_arguments.delta\ndata: {}\n\n\
+         event: response.function_call_arguments.done\ndata: {}\n\n\
+         event: response.output_item.done\ndata: {}\n\n\
+         event: response.completed\ndata: {}\n\n",
+        json!({ "type": "response.created", "response": { "id": "resp_sse" } }),
+        json!({ "type": "response.output_item.added", "output_index": 0, "item": { "id": "fc_9", "type": "function_call", "call_id": "call_sse", "name": "review_echo", "arguments": "" } }),
+        json!({ "type": "response.function_call_arguments.delta", "item_id": "fc_9", "output_index": 0, "delta": "{\"inp" }),
+        json!({ "type": "response.function_call_arguments.done", "item_id": "fc_9", "output_index": 0, "arguments": "{\"input\":\"流式 🧪\"}" }),
+        json!({ "type": "response.output_item.done", "output_index": 0, "item": { "id": "fc_9", "type": "function_call", "call_id": "call_sse", "name": "review_echo", "arguments": "{\"input\":\"流式 🧪\"}", "status": "completed" } }),
+        json!({ "type": "response.completed", "response": { "id": "resp_sse", "status": "completed", "output": [ { "type": "function_call", "id": "fc_9", "call_id": "call_sse", "name": "review_echo", "arguments": "{\"input\":\"流式 🧪\"}", "status": "completed" } ] } }),
+    );
+    let response_text = format!(
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: text/event-stream\r\n\r\n{sse_body}",
+        sse_body.len()
+    );
+    let listener2 = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let _ = listener2.local_addr().unwrap();
+    let server = tokio::spawn(capture_json_request_and_respond(listener, response_text));
+
+    let settings = json!({
+        "relayProfiles": [{
+            "id": "adapter-sse",
+            "name": "sse",
+            "baseUrl": format!("http://{addr}/v1"),
+            "upstreamBaseUrl": format!("http://{addr}/v1"),
+            "apiKey": "sk-test",
+            "protocol": "responses",
+            "relayMode": "pureApi",
+            "customToolsAsFunctions": true
+        }],
+        "activeRelayId": "adapter-sse"
+    });
+    std::fs::write(
+        temp.path().join("settings.json"),
+        serde_json::to_vec_pretty(&settings).unwrap(),
+    )
+    .unwrap();
+    let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
+
+    let request = json!({
+        "model": "review-model",
+        "stream": true,
+        "tools": [{ "type": "custom", "name": "review_echo", "description": "Echo tool." }],
+        "input": [{ "type": "message", "role": "user", "content": "go" }]
+    });
+    let response = codex_plus_core::protocol_proxy::handle_responses_proxy_request(
+        &request.to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status, "200 OK");
+    let _ = server.await.unwrap();
+
+    let text = String::from_utf8(response.body).unwrap();
+    assert!(
+        text.contains("response.custom_tool_call_input.delta"),
+        "必须交付 custom input delta 事件：{text}"
+    );
+    assert!(text.contains("response.custom_tool_call_input.done"));
+    assert!(text.contains("\"input\":\"流式 🧪\""));
+    assert!(
+        !text.contains("response.function_call_arguments"),
+        "受管调用的 function arguments 事件必须被吸收"
+    );
+    assert!(text.contains("\"call_id\":\"call_sse\""));
+    // sequence_number 单调。
+    let mut sequences = Vec::new();
+    for frame in text.split("\n\n") {
+        if let Some(data) = frame.lines().find_map(|line| line.strip_prefix("data: ")) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
+                if let Some(sequence) = value.get("sequence_number").and_then(|v| v.as_u64()) {
+                    sequences.push(sequence);
+                }
+            }
+        }
+    }
+    let mut sorted = sequences.clone();
+    sorted.sort();
+    assert_eq!(sequences, sorted, "sequence_number 必须单调递增");
+}
+
+/// P02（Chat 上游 + 开关开启，端到端）：namespace custom 被包装为扁平 function
+/// 发送，响应还原为带 namespace 的 custom_tool_call；顶层 custom 走既有转换。
+#[tokio::test]
+async fn custom_adapter_chat_upstream_restores_namespace_custom_end_to_end() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let chat_response = json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "review-model",
+        "choices": [{
+            "index": 0,
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_chat1",
+                    "type": "function",
+                    "function": {
+                        "name": "functions__review_echo",
+                        "arguments": serde_json::to_string(&json!({ "input": "chat 🧪" })).unwrap()
+                    }
+                }]
+            }
+        }]
+    });
+    let server = tokio::spawn(capture_json_request_and_respond(
+        listener,
+        http_json_response("HTTP/1.1 200 OK", &chat_response),
+    ));
+
+    let settings = json!({
+        "relayProfiles": [{
+            "id": "adapter-chat",
+            "name": "chat",
+            "baseUrl": format!("http://{addr}/v1"),
+            "upstreamBaseUrl": format!("http://{addr}/v1"),
+            "apiKey": "sk-test",
+            "protocol": "chatCompletions",
+            "relayMode": "pureApi",
+            "customToolsAsFunctions": true
+        }],
+        "activeRelayId": "adapter-chat"
+    });
+    std::fs::write(
+        temp.path().join("settings.json"),
+        serde_json::to_vec_pretty(&settings).unwrap(),
+    )
+    .unwrap();
+    let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
+
+    let request = json!({
+        "model": "review-model",
+        "stream": false,
+        "tools": [{
+            "type": "namespace", "name": "functions", "tools": [
+                { "type": "custom", "name": "review_echo", "description": "Echo tool." }
+            ]
+        }],
+        "input": [{ "type": "message", "role": "user", "content": "go" }]
+    });
+    let response = codex_plus_core::protocol_proxy::handle_responses_proxy_request(
+        &request.to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status, "200 OK");
+
+    let (_, upstream_request) = server.await.unwrap();
+    let chat_tools = upstream_request["tools"].as_array().unwrap();
+    let echo = chat_tools
+        .iter()
+        .find(|tool| tool["function"]["name"] == "functions__review_echo")
+        .expect("namespace custom 必须被包装为扁平 chat function");
+    assert_eq!(echo["type"], "function");
+    assert_eq!(echo["function"]["parameters"]["properties"]["input"]["type"], "string");
+
+    let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    let item = body["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "custom_tool_call")
+        .expect("chat function_call 必须还原为 custom_tool_call");
+    assert_eq!(item["name"], "review_echo");
+    assert_eq!(item["namespace"], "functions");
+    assert_eq!(item["input"], "chat 🧪");
+    assert_eq!(item["call_id"], "call_chat1");
+}
+
+/// P01-3（真实 socket 流式入口）：helper 端口 → 协议代理 → mock 上游分多次写入；
+/// 客户端边读边收，受管调用在校验后以 custom 事件组交付，上游收到 function 包装。
+#[tokio::test]
+async fn custom_adapter_real_socket_streaming_delivers_custom_events() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+
+    // mock 上游：捕获请求并分 3 片写 SSE（在帧中间切开）。
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    let upstream_server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let (header_end, content_length) = loop {
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "upstream closed before headers");
+            buffer.extend_from_slice(&chunk[..read]);
+            let Some(header_end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&buffer[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                })
+                .unwrap_or(0);
+            break (header_end + 4, content_length);
+        };
+        while buffer.len() < header_end + content_length {
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "upstream closed before body");
+            buffer.extend_from_slice(&chunk[..read]);
+        }
+        let request_body: serde_json::Value =
+            serde_json::from_slice(&buffer[header_end..header_end + content_length]).unwrap();
+
+        let sse_body = format!(
+            "event: response.created\ndata: {}\n\n\
+             event: response.output_item.added\ndata: {}\n\n\
+             event: response.function_call_arguments.delta\ndata: {}\n\n\
+             event: response.function_call_arguments.done\ndata: {}\n\n\
+             event: response.output_item.done\ndata: {}\n\n\
+             event: response.completed\ndata: {}\n\n",
+            json!({ "type": "response.created", "response": { "id": "resp_sock" } }),
+            json!({ "type": "response.output_item.added", "output_index": 0, "item": { "id": "fc_s1", "type": "function_call", "call_id": "call_sock", "name": "review_echo", "arguments": "" } }),
+            json!({ "type": "response.function_call_arguments.delta", "item_id": "fc_s1", "output_index": 0, "delta": "{\"inp" }),
+            json!({ "type": "response.function_call_arguments.done", "item_id": "fc_s1", "output_index": 0, "arguments": "{\"input\":\"socket 流式 🧪\"}" }),
+            json!({ "type": "response.output_item.done", "output_index": 0, "item": { "id": "fc_s1", "type": "function_call", "call_id": "call_sock", "name": "review_echo", "arguments": "{\"input\":\"socket 流式 🧪\"}", "status": "completed" } }),
+            json!({ "type": "response.completed", "response": { "id": "resp_sock", "status": "completed", "output": [ { "type": "function_call", "id": "fc_s1", "call_id": "call_sock", "name": "review_echo", "arguments": "{\"input\":\"socket 流式 🧪\"}", "status": "completed" } ] } }),
+        );
+        let mut response = format!(
+            "HTTP/1.1 200 OK
+content-length: {}
+content-type: text/event-stream
+
+",
+            sse_body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(sse_body.as_bytes());
+        let bytes = &response[..];
+        let (mid1, mid2) = (bytes.len() / 3, 2 * bytes.len() / 3);
+        stream.write_all(&bytes[..mid1]).await.unwrap();
+        stream.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        stream.write_all(&bytes[mid1..mid2]).await.unwrap();
+        stream.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        stream.write_all(&bytes[mid2..]).await.unwrap();
+        stream.flush().await.unwrap();
+        // 保持连接片刻再关闭，避免客户端读到 RST。
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        request_body
+    });
+
+    let settings = json!({
+        "relayProfiles": [{
+            "id": "adapter-sock",
+            "name": "sock",
+            "baseUrl": format!("http://{upstream_addr}/v1"),
+            "upstreamBaseUrl": format!("http://{upstream_addr}/v1"),
+            "apiKey": "sk-test",
+            "protocol": "responses",
+            "relayMode": "pureApi",
+            "customToolsAsFunctions": true
+        }],
+        "activeRelayId": "adapter-sock"
+    });
+    std::fs::write(
+        temp.path().join("settings.json"),
+        serde_json::to_vec_pretty(&settings).unwrap(),
+    )
+    .unwrap();
+    let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
+
+    let helper_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let helper_port = helper_listener.local_addr().unwrap().port();
+    drop(helper_listener);
+    let hooks = DefaultLaunchHooks::default();
+    hooks.start_helper(helper_port).await.unwrap();
+
+    let request_body = json!({
+        "model": "review-model",
+        "stream": true,
+        "tools": [{ "type": "custom", "name": "review_echo", "description": "Echo tool." }],
+        "input": [{ "type": "message", "role": "user", "content": "go" }]
+    })
+    .to_string();
+    // 用 tokio 客户端：#[tokio::test] 默认单线程 runtime，
+    // 阻塞式 std 读会饿死 helper 协程造成死锁。
+    let mut client = tokio::net::TcpStream::connect(("127.0.0.1", helper_port))
+        .await
+        .unwrap();
+    let http_request = format!(
+        "POST /v1/responses HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        request_body.len(),
+        request_body
+    );
+    client.write_all(http_request.as_bytes()).await.unwrap();
+
+    let mut received = Vec::new();
+    let mut reads = 0usize;
+    loop {
+        let mut chunk = [0u8; 2048];
+        let read = tokio::time::timeout(Duration::from_secs(20), client.read(&mut chunk)).await;
+        match read {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => {
+                reads += 1;
+                received.extend_from_slice(&chunk[..n]);
+            }
+            _ => break,
+        }
+    }
+    drop(client);
+    hooks.shutdown_helper(helper_port).await;
+    let upstream_request = upstream_server.await.unwrap();
+
+    let text = String::from_utf8_lossy(&received).to_string();
+    assert!(
+        text.contains("200 OK"),
+        "应返回 200 SSE 响应：{text}"
+    );
+    assert!(
+        text.contains("response.custom_tool_call_input.delta"),
+        "客户端必须收到 custom input delta：{text}"
+    );
+    assert!(text.contains("response.custom_tool_call_input.done"));
+    assert!(text.contains("\"input\":\"socket 流式 🧪\""));
+    assert!(
+        !text.contains("response.function_call_arguments"),
+        "受管调用的 wire 事件不得泄漏给客户端"
+    );
+    assert!(
+        reads >= 2,
+        "SSE 必须分多次读入（reads={reads}），客户端边读边收"
+    );
+
+    // 上游收到的是 function 包装。
+    let wire_tools = upstream_request["tools"].as_array().unwrap();
+    assert_eq!(wire_tools[0]["type"], "function");
+    assert_eq!(wire_tools[0]["parameters"]["properties"]["input"]["type"], "string");
 }
