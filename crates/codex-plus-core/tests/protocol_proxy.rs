@@ -3687,6 +3687,7 @@ fn custom_adapter_request_fixture() -> serde_json::Value {
             },
             {
                 "type": "custom_tool_call_output", "call_id": "call_hist1",
+                "id": "ctco_hist1",
                 "output": "工具结果占位"
             }
         ]
@@ -3826,7 +3827,11 @@ async fn custom_adapter_on_wraps_declarations_history_and_tool_choice() {
         .unwrap();
     assert_eq!(history_call["type"], "function_call");
     assert_eq!(history_call["name"], "review_echo", "历史调用按客户端原名包装");
-    assert_eq!(history_call["id"], "ctc_hist1", "item id 保持既有规范化结果");
+    assert_eq!(
+        history_call["id"],
+        "fc_hist1",
+        "包装为 function_call 后 item id 必须符合上游 fc_ 前缀校验"
+    );
     let arguments = history_call["arguments"].as_str().unwrap();
     let decoded: serde_json::Value = serde_json::from_str(arguments).unwrap();
     assert_eq!(
@@ -3838,6 +3843,11 @@ async fn custom_adapter_on_wraps_declarations_history_and_tool_choice() {
         .iter()
         .find(|item| item["call_id"] == "call_hist1" && item["type"] == "function_call_output")
         .expect("结果与调用一起转换");
+    assert_eq!(
+        history_output["id"],
+        "fco_hist1",
+        "包装输出也必须符合上游 function_call_output 的 fco_ 前缀校验"
+    );
     assert_eq!(history_output["output"], "工具结果占位", "output 不做二次封装");
 
     assert_eq!(
@@ -4269,6 +4279,104 @@ async fn custom_adapter_buffered_sse_restores_custom_events() {
     let mut sorted = sequences.clone();
     sorted.sort();
     assert_eq!(sequences, sorted, "sequence_number 必须单调递增");
+}
+
+/// P02（Chat 上游 + 开关开启，端到端）：namespace custom 被包装为扁平 function
+/// 兼容网关省略 reasoning item 的 summary 注册（真实 UnoRouter/GPT-5.6-Luna 形状）时，
+/// 缓冲入口必须先补齐 item 与 summary 注册，否则 Codex 会报
+/// ReasoningSummaryDelta without active item 并丢掉整轮输出。
+#[tokio::test]
+async fn responses_reasoning_frames_register_summary_before_delta_end_to_end() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let sse_body = format!(
+        "event: response.created\ndata: {}\n\n\
+         event: response.output_item.added\ndata: {}\n\n\
+         event: response.reasoning_summary_text.delta\ndata: {}\n\n\
+         event: response.output_item.done\ndata: {}\n\n\
+         event: response.completed\ndata: {}\n\n",
+        json!({ "type": "response.created", "response": { "id": "resp_reason" } }),
+        json!({ "type": "response.output_item.added", "output_index": 0, "item": { "id": "chatcmpl-x_reasoning_0", "type": "reasoning", "status": "in_progress" } }),
+        json!({ "type": "response.reasoning_summary_text.delta", "item_id": "chatcmpl-x_reasoning_0", "output_index": 0, "delta": "thinking" }),
+        json!({ "type": "response.output_item.done", "output_index": 0, "item": { "id": "chatcmpl-x_reasoning_0", "type": "reasoning", "status": "completed" } }),
+        json!({ "type": "response.completed", "response": { "id": "resp_reason", "status": "completed", "output": [] } }),
+    );
+    let response_text = format!(
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: text/event-stream\r\n\r\n{sse_body}",
+        sse_body.len()
+    );
+    let server = tokio::spawn(capture_json_request_and_respond(listener, response_text));
+
+    let settings = json!({
+        "relayProfiles": [{
+            "id": "reasoning-sse",
+            "name": "sse",
+            "baseUrl": format!("http://{addr}/v1"),
+            "upstreamBaseUrl": format!("http://{addr}/v1"),
+            "apiKey": "sk-test",
+            "protocol": "responses",
+            "relayMode": "pureApi"
+        }],
+        "activeRelayId": "reasoning-sse"
+    });
+    std::fs::write(
+        temp.path().join("settings.json"),
+        serde_json::to_vec_pretty(&settings).unwrap(),
+    )
+    .unwrap();
+    let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
+
+    let request = json!({
+        "model": "review-model",
+        "stream": true,
+        "input": [{ "type": "message", "role": "user", "content": "go" }]
+    });
+    let response =
+        codex_plus_core::protocol_proxy::handle_responses_proxy_request(&request.to_string())
+            .await
+            .unwrap();
+    assert_eq!(response.status, "200 OK");
+    let _ = server.await.unwrap();
+
+    let text = String::from_utf8(response.body).unwrap();
+    let kinds: Vec<String> = text
+        .split("\n\n")
+        .filter_map(|frame| {
+            frame
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        })
+        .filter_map(|value| {
+            value
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    let delta_at = kinds
+        .iter()
+        .position(|kind| kind == "response.reasoning_summary_text.delta")
+        .expect("delta 必须存在");
+    let part_added_at = kinds
+        .iter()
+        .position(|kind| kind == "response.reasoning_summary_part.added")
+        .expect("summary 注册帧必须被补齐");
+    let item_added_at = kinds
+        .iter()
+        .position(|kind| kind == "response.output_item.added")
+        .expect("reasoning item 注册帧必须存在");
+    assert!(
+        item_added_at < part_added_at && part_added_at < delta_at,
+        "注册顺序必须是 item.added → part.added → delta，实际 {kinds:?}"
+    );
+    assert!(
+        text.contains("\"summary\":[]"),
+        "reasoning item 必须带 summary 字段：{text}"
+    );
 }
 
 /// P02（Chat 上游 + 开关开启，端到端）：namespace custom 被包装为扁平 function

@@ -1836,6 +1836,224 @@ impl ResponsesNamespaceSseRewriter {
     }
 }
 
+/// 上游 Responses 兼容网关（Chat Completions 转 Responses）常在 reasoning item 上
+/// 省略 `summary` 字段，也不发 `response.reasoning_summary_part.added`，直接开始
+/// `response.reasoning_summary_text.delta`。Codex 的 Responses 解析器要求 item 已注册
+/// summary（或存在 part.added），否则报 `ReasoningSummaryDelta without active item`
+/// 并中止整个采样轮次，表现为子任务返回空内容。这里按协议补齐最小结构：item 带空
+/// summary 数组，并在首个 summary 事件前补发 added/part.added。属于通用兼容，
+/// 不绑定端点或模型；字段齐全的上游流不受影响。
+#[derive(Default)]
+pub struct ResponsesReasoningSseRewriter {
+    buffer: Vec<u8>,
+    seen_items: BTreeSet<String>,
+    announced: BTreeSet<String>,
+}
+
+impl ResponsesReasoningSseRewriter {
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.buffer.extend_from_slice(bytes);
+        let mut output = Vec::new();
+        loop {
+            let lf = self
+                .buffer
+                .windows(2)
+                .position(|window| window == b"\n\n")
+                .map(|index| index + 2);
+            let crlf = self
+                .buffer
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|index| index + 4);
+            let Some(end) = lf.into_iter().chain(crlf).min() else {
+                break;
+            };
+            let frame: Vec<u8> = self.buffer.drain(..end).collect();
+            output.extend(self.rewrite_frame(&frame));
+        }
+        output
+    }
+
+    pub fn finish(&mut self) -> Vec<u8> {
+        self.finish_with_truncation().0
+    }
+
+    /// 收尾与 namespace 侧一致：完整但缺结尾空行的最后一帧照常处理，
+    /// 无法解析的半帧丢弃并报告截断。
+    pub fn finish_with_truncation(&mut self) -> (Vec<u8>, bool) {
+        let buffer = std::mem::take(&mut self.buffer);
+        if buffer.is_empty() {
+            return (Vec::new(), false);
+        }
+        let text = match std::str::from_utf8(&buffer) {
+            Ok(text) => text,
+            Err(_) => return (Vec::new(), true),
+        };
+        let data = sse_data_payload(text);
+        if data.trim().is_empty() {
+            return (Vec::new(), true);
+        }
+        match serde_json::from_str::<Value>(&data) {
+            Ok(_) => (self.rewrite_frame(&buffer), false),
+            Err(_) => (Vec::new(), true),
+        }
+    }
+
+    fn rewrite_frame(&mut self, frame: &[u8]) -> Vec<u8> {
+        let Ok(text) = std::str::from_utf8(frame) else {
+            return frame.to_vec();
+        };
+        let data = sse_data_payload(text);
+        let Ok(mut value) = serde_json::from_str::<Value>(&data) else {
+            return frame.to_vec();
+        };
+        let kind = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        match kind.as_str() {
+            "response.output_item.added" => {
+                if value.pointer("/item/type").and_then(Value::as_str) != Some("reasoning") {
+                    return frame.to_vec();
+                }
+                let patched = ensure_reasoning_summary_field(&mut value);
+                let item_id = value
+                    .pointer("/item/id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if !item_id.is_empty() {
+                    self.seen_items.insert(item_id);
+                }
+                // 合规上游已带 summary 时逐字节透传，不做无谓重排。
+                if patched {
+                    rewrite_frame_payload(text, &value)
+                } else {
+                    frame.to_vec()
+                }
+            }
+            // 合规上游自行发送的 part.added：记录后透传，后续不再补发。
+            "response.reasoning_summary_part.added" => {
+                if let Some(item_id) = value.get("item_id").and_then(Value::as_str) {
+                    self.announced.insert(item_id.to_string());
+                }
+                frame.to_vec()
+            }
+            "response.reasoning_summary_text.delta" | "response.reasoning_summary_text.done" => {
+                let item_id = value
+                    .get("item_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let mut output = Vec::new();
+                if !item_id.is_empty() && self.announced.insert(item_id.clone()) {
+                    let output_index =
+                        value.get("output_index").cloned().unwrap_or(Value::from(0));
+                    if !self.seen_items.contains(&item_id) {
+                        output.extend(reasoning_item_added_frame(&item_id, &output_index));
+                    }
+                    output.extend(reasoning_part_added_frame(&item_id, &output_index));
+                }
+                output.extend(rewrite_frame_payload(text, &value));
+                output
+            }
+            "response.output_item.done" => {
+                if value.pointer("/item/type").and_then(Value::as_str) != Some("reasoning") {
+                    return frame.to_vec();
+                }
+                if ensure_reasoning_summary_field(&mut value) {
+                    rewrite_frame_payload(text, &value)
+                } else {
+                    frame.to_vec()
+                }
+            }
+            _ => frame.to_vec(),
+        }
+    }
+}
+
+/// 取出 SSE 帧里的 data 负载（多行按协议用换行拼接）。
+fn sse_data_payload(text: &str) -> String {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(|line| line.strip_prefix(' ').unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 用改写后的 JSON 替换帧内 data 行，保留 event 行与原始换行风格。
+fn rewrite_frame_payload(text: &str, value: &Value) -> Vec<u8> {
+    let mut output = String::new();
+    let mut wrote_data = false;
+    for line in text.split_inclusive('\n') {
+        if line.starts_with("data:") {
+            if !wrote_data {
+                output.push_str("data: ");
+                output.push_str(&value.to_string());
+                output.push_str(if line.ends_with("\r\n") { "\r\n" } else { "\n" });
+                wrote_data = true;
+            }
+        } else {
+            output.push_str(line);
+        }
+    }
+    output.into_bytes()
+}
+
+/// 上游 reasoning item 缺 `summary` 时补空数组，避免 Codex 判定 item 未注册。
+/// 返回是否真的改写了内容；未改动时调用方应逐字节透传原帧。
+fn ensure_reasoning_summary_field(value: &mut Value) -> bool {
+    if let Some(item) = value.get_mut("item").and_then(Value::as_object_mut) {
+        if item.get("summary").and_then(Value::as_array).is_none() {
+            item.insert("summary".to_string(), json!([]));
+            return true;
+        }
+    }
+    false
+}
+
+fn reasoning_item_added_frame(item_id: &str, output_index: &Value) -> Vec<u8> {
+    sse_frame_bytes(
+        "response.output_item.added",
+        &json!({
+            "type": "response.output_item.added",
+            "output_index": output_index,
+            "item": {
+                "id": item_id,
+                "type": "reasoning",
+                "status": "in_progress",
+                "summary": []
+            }
+        }),
+    )
+}
+
+fn reasoning_part_added_frame(item_id: &str, output_index: &Value) -> Vec<u8> {
+    sse_frame_bytes(
+        "response.reasoning_summary_part.added",
+        &json!({
+            "type": "response.reasoning_summary_part.added",
+            "item_id": item_id,
+            "output_index": output_index,
+            "summary_index": 0,
+            "part": { "type": "summary_text", "text": "" }
+        }),
+    )
+}
+
+fn sse_frame_bytes(event: &str, payload: &Value) -> Vec<u8> {
+    let mut output = String::new();
+    output.push_str("event: ");
+    output.push_str(event);
+    output.push('\n');
+    output.push_str("data: ");
+    output.push_str(&payload.to_string());
+    output.push('\n');
+    output.push('\n');
+    output.into_bytes()
+}
+
 fn upstream_request_builder(
     client: reqwest::Client,
     endpoint: &str,
@@ -1940,14 +2158,17 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
                 native_agent_plaintext.then(crate::native_agents::NativeAgentSseRewriter::default);
             let mut namespace_rewriter =
                 ResponsesNamespaceSseRewriter::new(upstream.namespace_tools.clone());
+            let mut reasoning_rewriter = ResponsesReasoningSseRewriter::default();
             let mut namespace_output = namespace_rewriter.push_bytes(&custom_output);
             namespace_output.extend(namespace_rewriter.finish());
+            let mut reasoning_output = reasoning_rewriter.push_bytes(&namespace_output);
+            reasoning_output.extend(reasoning_rewriter.finish());
             let body = if let Some(rewriter) = &mut native_rewriter {
-                let mut output = rewriter.push_bytes(&namespace_output);
+                let mut output = rewriter.push_bytes(&reasoning_output);
                 output.extend(rewriter.finish());
                 output
             } else {
-                namespace_output
+                reasoning_output
             };
             body
         } else {
@@ -5929,6 +6150,160 @@ mod glm_additional_tools_tests {
 mod responses_reasoning_policy_tests {
     use super::*;
 
+    fn parse_frames(bytes: &[u8]) -> Vec<Value> {
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        text.split("\n\n")
+            .filter_map(|frame| {
+                let data = sse_data_payload(frame);
+                if data.trim().is_empty() {
+                    return None;
+                }
+                serde_json::from_str::<Value>(&data).ok()
+            })
+            .collect()
+    }
+
+    fn frame(kind: &str, payload: Value) -> Vec<u8> {
+        sse_frame_bytes(kind, &payload)
+    }
+
+    /// 上游兼容网关省略 reasoning item 的 summary 注册，Codex 会报
+    /// ReasoningSummaryDelta without active item 并丢掉整轮输出。
+    #[test]
+    fn reasoning_rewriter_registers_summary_before_delta() {
+        let mut rewriter = ResponsesReasoningSseRewriter::default();
+        let mut output = Vec::new();
+        output.extend(rewriter.push_bytes(&frame(
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"id": "chatcmpl-1_reasoning_0", "type": "reasoning", "status": "in_progress"}
+            }),
+        )));
+        output.extend(rewriter.push_bytes(&frame(
+            "response.reasoning_summary_text.delta",
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "chatcmpl-1_reasoning_0",
+                "output_index": 0,
+                "delta": "think"
+            }),
+        )));
+        output.extend(rewriter.finish());
+        let frames = parse_frames(&output);
+        let kinds: Vec<&str> = frames
+            .iter()
+            .map(|value| value["type"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "response.output_item.added",
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_text.delta"
+            ],
+            "reasoning item 必须先注册 summary，再发 delta"
+        );
+        assert_eq!(
+            frames[0]["item"]["summary"],
+            json!([]),
+            "added item 必须带 summary 字段"
+        );
+    }
+
+    /// 已经自行发送 part.added 的上游不得被重复注入，且帧内容逐字节不变。
+    #[test]
+    fn reasoning_rewriter_does_not_duplicate_existing_part_added() {
+        let added = frame(
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"id": "rs_1", "type": "reasoning", "status": "in_progress", "summary": []}
+            }),
+        );
+        let part = frame(
+            "response.reasoning_summary_part.added",
+            json!({
+                "type": "response.reasoning_summary_part.added",
+                "item_id": "rs_1",
+                "output_index": 0,
+                "summary_index": 0,
+                "part": {"type": "summary_text", "text": ""}
+            }),
+        );
+        let delta = frame(
+            "response.reasoning_summary_text.delta",
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "rs_1",
+                "output_index": 0,
+                "delta": "hi"
+            }),
+        );
+        let mut rewriter = ResponsesReasoningSseRewriter::default();
+        let mut output = Vec::new();
+        for input in [&added, &part, &delta] {
+            output.extend(rewriter.push_bytes(input));
+        }
+        output.extend(rewriter.finish());
+        assert_eq!(
+            output,
+            [added, part, delta].concat(),
+            "合规上游的三个帧必须原样透传，不得插入任何补发帧"
+        );
+    }
+
+    /// 非 reasoning 帧必须逐字节透传。
+    #[test]
+    fn reasoning_rewriter_passes_other_frames_untouched() {
+        let raw = frame(
+            "response.output_text.delta",
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": "msg_1",
+                "output_index": 1,
+                "delta": "hello"
+            }),
+        );
+        let mut rewriter = ResponsesReasoningSseRewriter::default();
+        let mut output = rewriter.push_bytes(&raw);
+        output.extend(rewriter.finish());
+        assert_eq!(output, raw);
+    }
+
+    /// 上游连 output_item.added 都省略、直接发 delta 时，必须补齐 item 注册。
+    #[test]
+    fn reasoning_rewriter_synthesizes_missing_item_added() {
+        let mut rewriter = ResponsesReasoningSseRewriter::default();
+        let mut output = rewriter.push_bytes(&frame(
+            "response.reasoning_summary_text.delta",
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "chatcmpl-2_reasoning_0",
+                "output_index": 0,
+                "delta": "thinking"
+            }),
+        ));
+        output.extend(rewriter.finish());
+        let frames = parse_frames(&output);
+        let kinds: Vec<&str> = frames
+            .iter()
+            .map(|value| value["type"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "response.output_item.added",
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_text.delta"
+            ],
+            "缺失 added 时也必须先注册 item 与 summary"
+        );
+        assert_eq!(frames[0]["item"]["type"], json!("reasoning"));
+    }
+
     fn request() -> Value {
         json!({
             "model": "gpt-5.4",
@@ -6427,4 +6802,3 @@ mod review_20260916_regression {
         assert!(map_twice.is_empty());
     }
 }
-
