@@ -2428,6 +2428,226 @@ async fn responses_proxy_merges_duplicate_custom_tool_outputs() {
     );
 }
 
+async fn read_json_http_request(stream: &mut tokio::net::TcpStream) -> serde_json::Value {
+    let mut buffer = Vec::new();
+    let mut chunk = [0; 4096];
+    let (header_end, content_length) = loop {
+        let read = stream.read(&mut chunk).await.unwrap();
+        assert!(read > 0, "request closed before headers completed");
+        buffer.extend_from_slice(&chunk[..read]);
+        let Some(header_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let headers = String::from_utf8_lossy(&buffer[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+            })
+            .unwrap_or(0);
+        break (header_end + 4, content_length);
+    };
+    while buffer.len() < header_end + content_length {
+        let read = stream.read(&mut chunk).await.unwrap();
+        assert!(read > 0, "request closed before body completed");
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+    serde_json::from_slice(&buffer[header_end..header_end + content_length]).unwrap()
+}
+
+/// 依次回放给定响应；序列用尽后再等一小段时间，把多余的请求也记录下来，
+/// 让"不应该重试"的断言能明确失败而不是只在连接层面报错。
+async fn capture_json_requests_respond_sequence(
+    listener: tokio::net::TcpListener,
+    responses: Vec<String>,
+) -> Vec<serde_json::Value> {
+    let mut captured = Vec::new();
+    for response in responses {
+        let Ok(Ok((mut stream, _))) =
+            tokio::time::timeout(Duration::from_secs(10), listener.accept()).await
+        else {
+            break;
+        };
+        captured.push(read_json_http_request(&mut stream).await);
+        stream.write_all(response.as_bytes()).await.unwrap();
+        let _ = stream.shutdown().await;
+    }
+    if let Ok(Ok((mut stream, _))) =
+        tokio::time::timeout(Duration::from_millis(400), listener.accept()).await
+    {
+        captured.push(read_json_http_request(&mut stream).await);
+        let _ = stream
+            .write_all(
+                b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 2\r\ncontent-type: application/json\r\n\r\n{}",
+            )
+            .await;
+    }
+    captured
+}
+
+fn error_response(status_line: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status_line}\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
+fn ok_response(body: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
+#[tokio::test]
+async fn responses_proxy_retries_without_encrypted_reasoning_when_upstream_rejects_blob() {
+    let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let encrypted_error = r#"{"error":{"message":"The encrypted content for item rs_blob could not be verified. Reason: Encrypted content could not be decrypted or parsed.","type":"invalid_request_error","code":"invalid_encrypted_content"}}"#;
+    let retry_success = r#"{"id":"resp_retry_ok","object":"response"}"#;
+    let server = tokio::spawn(capture_json_requests_respond_sequence(
+        target,
+        vec![
+            error_response("400 Bad Request", encrypted_error),
+            ok_response(retry_success),
+        ],
+    ));
+    let request = json!({
+        "model": "gpt-5.6-luna",
+        "input": [
+            {"type": "message", "id": "msg_keep", "role": "user", "content": "continue"},
+            {
+                "type": "reasoning",
+                "id": "rs_blob",
+                "summary": [{"type": "summary_text", "text": "previous thinking"}],
+                "encrypted_content": "opaque-blob"
+            },
+            {"type": "function_call", "id": "fc_keep", "call_id": "call_keep", "name": "lookup", "arguments": "{}"},
+            {"type": "function_call_output", "id": "fco_keep", "call_id": "call_keep", "output": "done"}
+        ],
+        "stream": false
+    });
+    let settings = model_route_settings("gpt-5.6-luna", "", format!("http://{target_addr}/v1"));
+
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    let body = result.response.bytes().await.unwrap();
+
+    assert_eq!(result.status_code, 200);
+    assert_eq!(body.as_ref(), retry_success.as_bytes());
+    let captured = server.await.unwrap();
+    assert_eq!(
+        captured.len(),
+        2,
+        "命中 encrypted content 校验失败后必须重试一次"
+    );
+    let first_items = captured[0]["input"].as_array().unwrap();
+    let second_items = captured[1]["input"].as_array().unwrap();
+    assert!(
+        first_items
+            .iter()
+            .any(|item| item["type"] == "reasoning"
+                && item["encrypted_content"] == "opaque-blob"),
+        "首个请求必须保留原始 encrypted reasoning"
+    );
+    assert!(
+        !second_items.iter().any(|item| item["type"] == "reasoning"),
+        "重试请求必须去掉无法解密的 reasoning 项"
+    );
+    for item_type in ["message", "function_call", "function_call_output"] {
+        let before = first_items
+            .iter()
+            .find(|item| item["type"] == item_type)
+            .unwrap();
+        let after = second_items
+            .iter()
+            .find(|item| item["type"] == item_type)
+            .unwrap();
+        assert_eq!(before, after, "{item_type} 之外的改写不允许发生");
+    }
+}
+
+#[tokio::test]
+async fn responses_proxy_keeps_original_error_when_retry_predicate_does_not_match() {
+    let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let upstream_error = r#"{"error":{"message":"unknown tool: lookup","type":"invalid_request_error"}}"#;
+    let server = tokio::spawn(capture_json_requests_respond_sequence(
+        target,
+        vec![error_response("400 Bad Request", upstream_error)],
+    ));
+    let request = json!({
+        "model": "gpt-5.6-luna",
+        "input": [
+            {"type": "message", "id": "msg_keep", "role": "user", "content": "continue"},
+            {
+                "type": "reasoning",
+                "id": "rs_blob",
+                "summary": [{"type": "summary_text", "text": "previous thinking"}],
+                "encrypted_content": "opaque-blob"
+            }
+        ],
+        "stream": false
+    });
+    let settings = model_route_settings("gpt-5.6-luna", "", format!("http://{target_addr}/v1"));
+
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    let body = result.response.bytes().await.unwrap();
+
+    assert_eq!(result.status_code, 400);
+    assert_eq!(body.as_ref(), upstream_error.as_bytes());
+    assert_eq!(result.content_type, "application/json");
+    let captured = server.await.unwrap();
+    assert_eq!(captured.len(), 1, "非 encrypted-content 错误不允许重试");
+}
+
+#[tokio::test]
+async fn responses_proxy_does_not_retry_without_encrypted_reasoning_in_request() {
+    let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let upstream_error =
+        r#"{"error":{"message":"encrypted content could not be parsed","code":"invalid_encrypted_content"}}"#;
+    let server = tokio::spawn(capture_json_requests_respond_sequence(
+        target,
+        vec![error_response("400 Bad Request", upstream_error)],
+    ));
+    let request = json!({
+        "model": "gpt-5.6-luna",
+        "input": [{"type": "message", "id": "msg_keep", "role": "user", "content": "continue"}],
+        "stream": false
+    });
+    let settings = model_route_settings("gpt-5.6-luna", "", format!("http://{target_addr}/v1"));
+
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    let body = result.response.bytes().await.unwrap();
+
+    assert_eq!(result.status_code, 400);
+    assert_eq!(body.as_ref(), upstream_error.as_bytes());
+    let captured = server.await.unwrap();
+    assert_eq!(
+        captured.len(),
+        1,
+        "请求里没有 encrypted reasoning 时不得触发重试"
+    );
+}
+
 #[tokio::test]
 async fn model_route_preserves_responses_compact_endpoint() {
     let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))

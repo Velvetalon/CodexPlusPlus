@@ -72,3 +72,47 @@ into the msg_ / fc_ / fco_ namespaces.
 
 The live proxy must be restarted to pick the binaries up; a running instance keeps
 the image it was started with.
+
+## Follow-up: encrypted reasoning retry (same day)
+
+Symptom: a thread became permanently unusable with an upstream 400
+"The encrypted content for item rs_905140f8752c46cfa4049cf31f7d9768 could not be
+verified. Reason: Encrypted content could not be decrypted or parsed."
+(code invalid_encrypted_content). The relay serving that thread is the OpenAI
+account bridge (relay "OpenAI账号中转", http://127.0.0.1:8787/v1/responses), whose
+reasoning policy keeps items carrying encrypted_content and drops the rest, so the
+unverifiable blob was replayed on every attempt and the turn died before any token
+was produced.
+
+Not a regression of the sanitizer build: the diagnostic log
+(<codex-home>/.codex-session-delete/codex-plus.log) shows the first rejection at
+11:38:58Z served by pid 59568 - the previous proxy image - while the rebuilt proxy
+(pid 50864) only started at 11:40:38Z. The rejected reasoning id already existed
+verbatim in the rollout (recorded 09:29:08Z), so id rewriting never touched it, and
+encrypted_content is not modified by the proxy.
+
+Root cause: encrypted reasoning blobs are only portable inside the account that
+issued them. When the account behind an account-pool relay rotates (or the blob
+ages out), replaying that history is rejected wholesale.
+
+Change: open_responses_proxy_request_with_settings_and_user_agent now buffers a 400
+response body when the request carried encrypted reasoning items, and if the body
+reports an encrypted-content verification failure (invalid_encrypted_content, or
+"encrypted content" together with could not be / decrypt / parsed) it retries the
+same relay once with every reasoning item that carries a non-empty
+encrypted_content removed. Other 400s are returned untouched through a rebuilt
+response (same status, content-type and body bytes). The retry happens at most once
+per relay attempt, is logged as protocol_proxy.encrypted_reasoning_retry, and does
+not mutate the caller's request JSON.
+
+Verification: cargo test -p codex-plus-core --test protocol_proxy => 107 passed,
+0 failed, 1 ignored; cargo test -p codex-plus-core --lib => 380 passed. New socket
+tests cover the successful retry (two upstream requests, second without encrypted
+reasoning, other items byte-identical), the untouched-error path (exactly one
+upstream request, original 400 body and content-type), and the "request has no
+encrypted reasoning" guard.
+
+Build: dist/windows/app/codex-plus-plus.exe sha256
+E2E58B1F2DFE5050A0854E420B774B094C04E43EA680C750742371C2DC8338E0,
+dist/windows/app/codex-plus-plus-manager.exe sha256
+D811E4D1463E63AEF79AFABA35A9833789A35BBABFA6901A976DF2A5D604DD5B.

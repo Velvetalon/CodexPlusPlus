@@ -36,6 +36,9 @@ const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
     "user",
 ];
 const ERROR_BODY_PREVIEW_LIMIT: usize = 1024;
+/// 账号池轮换后 encrypted reasoning 失配时，错误体要整块还原给客户端；
+/// 这个上限只是防止异常供应商返回超大 body 的安全阀（正常错误体只有几 KB）。
+const ENCRYPTED_REASONING_ERROR_BODY_LIMIT: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChatReasoningStyle {
@@ -670,7 +673,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             && crate::native_agents::interop_enabled(&relay)
             && crate::native_agents::prepare_request(&mut attempt_body);
         let (endpoint, upstream_body, wire_api, namespace_tools, custom_adapter) =
-            upstream_request_parts(&relay, attempt_body, request_path).await?;
+            upstream_request_parts(&relay, attempt_body.clone(), request_path).await?;
         let has_more_candidates = attempt + 1 < relay_count;
         let header_timeout = response_header_timeout(is_stream);
         let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -693,7 +696,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 }))
             }),
         );
-        let upstream = match send_upstream_request_for_responses(
+        let mut upstream = match send_upstream_request_for_responses(
             upstream_request_builder(
                 crate::http_client::proxied_client(&effective_user_agent(
                     &relay.user_agent,
@@ -743,6 +746,87 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 });
             }
         };
+        let mut endpoint = endpoint;
+        let mut wire_api = wire_api;
+        let mut namespace_tools = namespace_tools;
+        let mut custom_adapter = custom_adapter;
+        // 账号池/中转账号轮换后，历史里携带 encrypted_content 的 reasoning 已经无法被
+        // 上游解密；这类 400 会在同一会话里反复出现，直接把整个对话打死。先缓冲错误体，
+        // 命中后去掉这些 reasoning 项，用同一供应商重试一次。
+        if relay.protocol == RelayProtocol::Responses
+            && upstream.status().as_u16() == 400
+            && has_encrypted_reasoning(&attempt_body)
+        {
+            let original_status = upstream.status();
+            let original_content_type = upstream
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let error_body =
+                read_response_body_capped(upstream, ENCRYPTED_REASONING_ERROR_BODY_LIMIT).await?;
+            if error_mentions_encrypted_content(&String::from_utf8_lossy(&error_body)) {
+                let mut sanitized_body = attempt_body.clone();
+                let removed = strip_encrypted_reasoning(&mut sanitized_body);
+                if removed > 0 {
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "protocol_proxy.encrypted_reasoning_retry",
+                        json!({
+                            "relayId": relay.id,
+                            "relayName": relay.name,
+                            "endpoint": endpoint,
+                            "wireApi": wire_api,
+                            "stream": is_stream,
+                            "attempt": attempt + 1,
+                            "statusCode": original_status.as_u16(),
+                            "removedReasoningItems": removed
+                        }),
+                    );
+                    let (
+                        retry_endpoint,
+                        retry_body,
+                        retry_wire_api,
+                        retry_namespace_tools,
+                        retry_adapter,
+                    ) = upstream_request_parts(&relay, sanitized_body, request_path).await?;
+                    endpoint = retry_endpoint;
+                    wire_api = retry_wire_api;
+                    namespace_tools = retry_namespace_tools;
+                    custom_adapter = retry_adapter;
+                    // 首个请求已经拿到响应，说明链路是通的；重试阶段的传输失败直接报错，
+                    // 不再切换候选，避免同一轮对话被重复计费两次。
+                    upstream = send_upstream_request_for_responses(
+                        upstream_request_builder(
+                            crate::http_client::proxied_client(&effective_user_agent(
+                                &relay.user_agent,
+                                original_user_agent,
+                            ))?,
+                            &endpoint,
+                            &relay,
+                            is_stream,
+                            &retry_body,
+                        ),
+                        is_stream,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "供应商「{}」在移除 encrypted reasoning 后重试失败，endpoint: {}",
+                            relay.name, endpoint
+                        )
+                    })?;
+                } else {
+                    upstream = rebuild_upstream_response(
+                        original_status,
+                        original_content_type,
+                        error_body,
+                    )?;
+                }
+            } else {
+                upstream =
+                    rebuild_upstream_response(original_status, original_content_type, error_body)?;
+            }
+        }
         let status_code = upstream.status().as_u16();
         let entered_cooldown_or_regular_failure =
             crate::relay_rotation::record_relay_request_outcome(
@@ -3335,6 +3419,70 @@ fn upstream_error_parts(
 
 fn truncate_error_preview(input: &str) -> String {
     input.chars().take(ERROR_BODY_PREVIEW_LIMIT).collect()
+}
+
+fn is_encrypted_reasoning_item(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("reasoning")
+        && item
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+}
+
+fn has_encrypted_reasoning(body: &Value) -> bool {
+    body.get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|items| items.iter().any(is_encrypted_reasoning_item))
+}
+
+fn strip_encrypted_reasoning(body: &mut Value) -> usize {
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let before = items.len();
+    items.retain(|item| !is_encrypted_reasoning_item(item));
+    before.saturating_sub(items.len())
+}
+
+fn error_mentions_encrypted_content(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("invalid_encrypted_content")
+        || (lower.contains("encrypted content")
+            && (lower.contains("could not be")
+                || lower.contains("decrypt")
+                || lower.contains("parsed")))
+}
+
+async fn read_response_body_capped(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> anyhow::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.is_empty() {
+            continue;
+        }
+        let remaining = limit.saturating_sub(body.len());
+        if chunk.len() >= remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// 未命中重试条件时把已读出的上游响应原样还原，保持非重试路径的行为不变。
+fn rebuild_upstream_response(
+    status: reqwest::StatusCode,
+    content_type: Option<String>,
+    body: Vec<u8>,
+) -> anyhow::Result<reqwest::Response> {
+    let mut builder = http::Response::builder().status(status);
+    if let Some(content_type) = content_type {
+        builder = builder.header(reqwest::header::CONTENT_TYPE, content_type);
+    }
+    Ok(reqwest::Response::from(builder.body(body)?))
 }
 
 fn normalize_responses_custom_tool_call_ids_with_policy(body: &mut Value, strict_prefixes: bool) {
