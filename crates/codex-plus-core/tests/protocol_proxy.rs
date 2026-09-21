@@ -16,8 +16,8 @@ use codex_plus_core::relay_config::test_relay_profile;
 use codex_plus_core::relay_rotation::priority_fallback_cooldown_status;
 use codex_plus_core::settings::{
     AggregateRelayMember, AggregateRelayProfile, AggregateRelayStrategy, BackendSettings,
-    NativeAgentInterop, RelayMode, RelayModelRoute, RelayProfile, RelayProtocol, RelaySessionProvider,
-    ResponsesReasoningPolicy,
+    NativeAgentInterop, RelayMode, RelayModelRoute, RelayProfile, RelayProtocol,
+    RelaySessionProvider, ResponsesReasoningPolicy,
 };
 use serde_json::json;
 use std::io::{Read, Write};
@@ -3297,7 +3297,9 @@ fn empty_image_url_is_dropped_rather_than_forwarded() {
 #[tokio::test]
 async fn namespace_flatten_conflict_with_top_level_tool_fails_closed_before_upstream() {
     let _lock = settings_path_test_lock().lock().unwrap();
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let mut received = 0usize;
@@ -3342,7 +3344,10 @@ async fn namespace_flatten_conflict_with_top_level_tool_fails_closed_before_upst
     );
     server.abort();
     let received = server.await.unwrap_or(0);
-    assert_eq!(received, 0, "冲突请求不能发往上游（实际收到 {received} 个请求）");
+    assert_eq!(
+        received, 0,
+        "冲突请求不能发往上游（实际收到 {received} 个请求）"
+    );
 }
 
 // A01 / R03：候选 A（native interop on）429 后失败转移到候选 B（interop off）时，
@@ -3350,9 +3355,13 @@ async fn namespace_flatten_conflict_with_top_level_tool_fails_closed_before_upst
 #[tokio::test]
 async fn aggregate_fallback_does_not_inherit_first_candidate_native_agent_rewrites() {
     let _lock = settings_path_test_lock().lock().unwrap();
-    let first = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let first = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let first_addr = first.local_addr().unwrap();
-    let second = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let second = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let second_addr = second.local_addr().unwrap();
     let first_server = tokio::spawn(capture_request_and_respond_once(
         first,
@@ -3407,7 +3416,8 @@ async fn aggregate_fallback_does_not_inherit_first_candidate_native_agent_rewrit
         "候选 B（interop off）不能继承候选 A 的 collaboration 别名改写，实际 tools: {tools:?}"
     );
     assert_eq!(
-        tools[0]["name"], json!("collaboration__spawn_agent"),
+        tools[0]["name"],
+        json!("collaboration__spawn_agent"),
         "候选 B 按自己的策略执行通用扁平化（无原生别名）"
     );
     let message_property = tools
@@ -3429,9 +3439,13 @@ async fn aggregate_fallback_does_not_inherit_first_candidate_native_agent_rewrit
 #[tokio::test]
 async fn aggregate_fallback_second_candidate_applies_its_own_native_prep_and_restore() {
     let _lock = settings_path_test_lock().lock().unwrap();
-    let first = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let first = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let first_addr = first.local_addr().unwrap();
-    let second = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let second = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let second_addr = second.local_addr().unwrap();
     let first_server = tokio::spawn(capture_request_and_respond_once(
         first,
@@ -3489,9 +3503,13 @@ async fn aggregate_fallback_second_candidate_applies_its_own_native_prep_and_res
 #[tokio::test]
 async fn aggregate_fallback_resolves_each_candidate_model_alias_independently() {
     let _lock = settings_path_test_lock().lock().unwrap();
-    let first = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let first = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let first_addr = first.local_addr().unwrap();
-    let second = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let second = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let second_addr = second.local_addr().unwrap();
     let first_server = tokio::spawn(capture_request_and_respond_once(
         first,
@@ -3544,9 +3562,13 @@ async fn aggregate_fallback_resolves_each_candidate_model_alias_independently() 
 #[tokio::test]
 async fn aggregate_fallback_leaves_original_request_json_unmodified() {
     let _lock = settings_path_test_lock().lock().unwrap();
-    let first = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let first = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let first_addr = first.local_addr().unwrap();
-    let second = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let second = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let second_addr = second.local_addr().unwrap();
     let first_server = tokio::spawn(capture_request_and_respond_once(
         first,
@@ -3706,7 +3728,9 @@ fn http_json_response(status_line: &str, body: &serde_json::Value) -> String {
 #[tokio::test]
 async fn custom_adapter_off_keeps_custom_wire_form() {
     let _lock = settings_path_test_lock().lock().unwrap();
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(capture_json_request_once(listener));
     let settings = BackendSettings {
@@ -3758,7 +3782,9 @@ async fn custom_adapter_off_keeps_custom_wire_form() {
 #[tokio::test]
 async fn custom_adapter_on_wraps_declarations_history_and_tool_choice() {
     let _lock = settings_path_test_lock().lock().unwrap();
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(capture_json_request_once(listener));
     let settings = BackendSettings {
@@ -3826,17 +3852,18 @@ async fn custom_adapter_on_wraps_declarations_history_and_tool_choice() {
         .find(|item| item["call_id"] == "call_hist1")
         .unwrap();
     assert_eq!(history_call["type"], "function_call");
-    assert_eq!(history_call["name"], "review_echo", "历史调用按客户端原名包装");
     assert_eq!(
-        history_call["id"],
-        "fc_hist1",
+        history_call["name"], "review_echo",
+        "历史调用按客户端原名包装"
+    );
+    assert_eq!(
+        history_call["id"], "fc_hist1",
         "包装为 function_call 后 item id 必须符合上游 fc_ 前缀校验"
     );
     let arguments = history_call["arguments"].as_str().unwrap();
     let decoded: serde_json::Value = serde_json::from_str(arguments).unwrap();
     assert_eq!(
-        decoded["input"],
-        "第一行\n  第二行\\路径\"引号\"  ",
+        decoded["input"], "第一行\n  第二行\\路径\"引号\"  ",
         "装箱只包一层 JSON，input 字符串逐字符保留"
     );
     let history_output = items
@@ -3844,11 +3871,13 @@ async fn custom_adapter_on_wraps_declarations_history_and_tool_choice() {
         .find(|item| item["call_id"] == "call_hist1" && item["type"] == "function_call_output")
         .expect("结果与调用一起转换");
     assert_eq!(
-        history_output["id"],
-        "fco_hist1",
+        history_output["id"], "fco_hist1",
         "包装输出也必须符合上游 function_call_output 的 fco_ 前缀校验"
     );
-    assert_eq!(history_output["output"], "工具结果占位", "output 不做二次封装");
+    assert_eq!(
+        history_output["output"], "工具结果占位",
+        "output 不做二次封装"
+    );
 
     assert_eq!(
         body["tool_choice"],
@@ -3857,13 +3886,80 @@ async fn custom_adapter_on_wraps_declarations_history_and_tool_choice() {
     assert_eq!(request, original, "原始请求对象不得被原地改写");
 }
 
+/// 官方 DeepSeek 的 profile 默认未打开 customToolsAsFunctions，但其 Responses
+/// 端点不接受 Code Mode 的 custom 工具。代理必须自动复用同一双向 function 适配，
+/// 同时把历史 message id 修成 Responses 要求的 msg_ 命名空间。
+#[tokio::test]
+async fn official_deepseek_auto_wraps_custom_tools_and_normalizes_history_ids() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(capture_json_request_once(listener));
+    let settings = BackendSettings {
+        active_relay_id: "official-deepseek".to_string(),
+        relay_profiles: vec![RelayProfile {
+            id: "official-deepseek".to_string(),
+            name: "DeepSeek".to_string(),
+            base_url: format!("http://{addr}/v1"),
+            upstream_base_url: "https://api.deepseek.com/".to_string(),
+            config_contents: format!(
+                "model = \"deepseek-v4-flash\"\nmodel_provider = \"custom\"\n\n[model_providers.custom]\nwire_api = \"responses\"\nbase_url = \"http://{addr}/v1\"\n"
+            ),
+            api_key: "sk-test".to_string(),
+            protocol: RelayProtocol::Responses,
+            relay_mode: RelayMode::PureApi,
+            custom_tools_as_functions: false,
+            ..RelayProfile::default()
+        }],
+        ..BackendSettings::default()
+    };
+
+    let mut request = custom_adapter_request_fixture();
+    request["input"][0]["id"] = json!("chatcmpl-202609200918258761407968268d9d6WGd5KQKm_msg_0");
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+    let (_, body) = server.await.unwrap();
+
+    let message = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "message")
+        .unwrap();
+    assert!(
+        message["id"].as_str().unwrap().starts_with("msg_"),
+        "官方 DeepSeek 不接受 chatcmpl_*_msg_* 历史 id"
+    );
+    let echo = body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "functions__review_echo")
+        .unwrap();
+    assert_eq!(echo["type"], "function");
+    let history_call = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["call_id"] == "call_hist1")
+        .unwrap();
+    assert_eq!(history_call["type"], "function_call");
+    assert!(history_call["id"].as_str().unwrap().starts_with("fc_"));
+}
+
 /// J01/J03/J06 + §10.4（JSON 返回入口，端到端）：function_call 精确还原为
 /// custom_tool_call，普通 function 不动，回显 tools/tool_choice 还原为客户端视图。
 #[tokio::test]
 async fn custom_adapter_json_response_restores_custom_tool_call_end_to_end() {
     let _lock = settings_path_test_lock().lock().unwrap();
     let temp = tempfile::tempdir().unwrap();
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
 
     let upstream_response = json!({
@@ -3935,11 +4031,10 @@ async fn custom_adapter_json_response_restores_custom_tool_call_end_to_end() {
         ],
         "input": [{ "type": "message", "role": "user", "content": "go" }]
     });
-    let response = codex_plus_core::protocol_proxy::handle_responses_proxy_request(
-        &request.to_string(),
-    )
-    .await
-    .unwrap();
+    let response =
+        codex_plus_core::protocol_proxy::handle_responses_proxy_request(&request.to_string())
+            .await
+            .unwrap();
     assert_eq!(response.status, "200 OK");
     let _ = server.await.unwrap();
 
@@ -3952,11 +4047,13 @@ async fn custom_adapter_json_response_restores_custom_tool_call_end_to_end() {
     assert_eq!(output[0]["id"], "ctc_ns");
     assert_eq!(output[0]["call_id"], "call_ns");
     assert_eq!(
-        output[0]["input"],
-        "line1\r\nline2 \"quoted\" 🧪",
+        output[0]["input"], "line1\r\nline2 \"quoted\" 🧪",
         "input 解码后必须逐字符相等"
     );
-    assert!(output[0].get("arguments").is_none(), "function 专属字段必须移除");
+    assert!(
+        output[0].get("arguments").is_none(),
+        "function 专属字段必须移除"
+    );
 
     assert_eq!(output[1]["type"], "function_call", "普通 function 不误转");
     // 既有 namespace 还原管线把扁平名恢复为客户端视图（原名 + namespace 字段）。
@@ -3965,13 +4062,19 @@ async fn custom_adapter_json_response_restores_custom_tool_call_end_to_end() {
     assert_eq!(output[1]["arguments"], "{\"token\":\"t\"}");
 
     assert_eq!(output[2]["type"], "custom_tool_call");
-    assert!(output[2].get("namespace").is_none(), "顶层 custom 不携带 namespace");
+    assert!(
+        output[2].get("namespace").is_none(),
+        "顶层 custom 不携带 namespace"
+    );
     assert_eq!(output[2]["input"], "", "合法空串不得被丢弃");
 
     let echoed_tools = body["tools"].as_array().unwrap();
     assert_eq!(echoed_tools[0]["type"], "custom", "回显声明还原为 custom");
     assert_eq!(echoed_tools[0]["name"], "review_echo");
-    assert_eq!(body["tool_choice"], json!({ "type": "custom", "namespace": "functions", "name": "review_echo" }));
+    assert_eq!(
+        body["tool_choice"],
+        json!({ "type": "custom", "namespace": "functions", "name": "review_echo" })
+    );
 }
 
 /// C03 / §4.3：passthrough + 开关是配置冲突，发送前显式失败，上游收到 0 个请求。
@@ -3979,7 +4082,9 @@ async fn custom_adapter_json_response_restores_custom_tool_call_end_to_end() {
 async fn custom_adapter_conflicts_with_passthrough_and_fails_before_upstream() {
     let _lock = settings_path_test_lock().lock().unwrap();
     let temp = tempfile::tempdir().unwrap();
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
     // 非阻塞探测：若适配器错误地把请求发往上游，accept 会立即成功。
@@ -4008,11 +4113,10 @@ async fn custom_adapter_conflicts_with_passthrough_and_fails_before_upstream() {
 
     let request = custom_adapter_request_fixture();
     // 缓冲入口把错误作为 Err 传播（launcher 层渲染为 502 + 错误体）。
-    let error = codex_plus_core::protocol_proxy::handle_responses_proxy_request(
-        &request.to_string(),
-    )
-    .await
-    .unwrap_err();
+    let error =
+        codex_plus_core::protocol_proxy::handle_responses_proxy_request(&request.to_string())
+            .await
+            .unwrap_err();
     assert!(
         error.to_string().contains("CUSTOM_ADAPTER_POLICY_CONFLICT"),
         "错误必须携带类型化错误码：{error}"
@@ -4026,7 +4130,9 @@ async fn custom_adapter_conflicts_with_passthrough_and_fails_before_upstream() {
 async fn custom_adapter_rejects_server_state_references() {
     let _lock = settings_path_test_lock().lock().unwrap();
     let temp = tempfile::tempdir().unwrap();
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
     // 非阻塞探测：若适配器错误地把请求发往上游，accept 会立即成功。
@@ -4058,13 +4164,14 @@ async fn custom_adapter_rejects_server_state_references() {
         "tools": [{ "type": "custom", "name": "review_echo" }],
         "input": [{ "type": "message", "role": "user", "content": "continue" }]
     });
-    let error = codex_plus_core::protocol_proxy::handle_responses_proxy_request(
-        &request.to_string(),
-    )
-    .await
-    .unwrap_err();
+    let error =
+        codex_plus_core::protocol_proxy::handle_responses_proxy_request(&request.to_string())
+            .await
+            .unwrap_err();
     assert!(
-        error.to_string().contains("CUSTOM_ADAPTER_STATE_REFERENCE_UNSUPPORTED"),
+        error
+            .to_string()
+            .contains("CUSTOM_ADAPTER_STATE_REFERENCE_UNSUPPORTED"),
         "服务端引用必须显式报不支持：{error}"
     );
     probe.set_nonblocking(true).unwrap();
@@ -4076,9 +4183,13 @@ async fn custom_adapter_rejects_server_state_references() {
 #[tokio::test]
 async fn custom_adapter_fallback_from_enabled_to_disabled_is_isolated() {
     let _lock = settings_path_test_lock().lock().unwrap();
-    let first = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let first = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let first_addr = first.local_addr().unwrap();
-    let second = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let second = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let second_addr = second.local_addr().unwrap();
     let first_server = tokio::spawn(capture_json_request_and_respond(
         first,
@@ -4111,7 +4222,10 @@ async fn custom_adapter_fallback_from_enabled_to_disabled_is_isolated() {
         .iter()
         .find(|tool| tool["name"] == "functions__review_echo")
         .unwrap();
-    assert_eq!(a_echo["type"], "function", "A（开关开）必须看到 function 包装");
+    assert_eq!(
+        a_echo["type"], "function",
+        "A（开关开）必须看到 function 包装"
+    );
 
     let (_, second_body) = second_server.await.unwrap();
     let b_echo = second_body["tools"]
@@ -4127,16 +4241,23 @@ async fn custom_adapter_fallback_from_enabled_to_disabled_is_isolated() {
         .iter()
         .find(|item| item["call_id"] == "call_hist1")
         .unwrap();
-    assert_eq!(b_history["type"], "custom_tool_call", "B 不继承 A 的历史转换");
+    assert_eq!(
+        b_history["type"], "custom_tool_call",
+        "B 不继承 A 的历史转换"
+    );
 }
 
 /// F02（候选隔离反向）：A 开关关 → 429 → B 开关开。B 独立完成包装。
 #[tokio::test]
 async fn custom_adapter_fallback_from_disabled_to_enabled_is_isolated() {
     let _lock = settings_path_test_lock().lock().unwrap();
-    let first = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let first = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let first_addr = first.local_addr().unwrap();
-    let second = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let second = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let second_addr = second.local_addr().unwrap();
     let first_server = tokio::spawn(capture_json_request_and_respond(
         first,
@@ -4194,7 +4315,9 @@ async fn custom_adapter_fallback_from_disabled_to_enabled_is_isolated() {
 async fn custom_adapter_buffered_sse_restores_custom_events() {
     let _lock = settings_path_test_lock().lock().unwrap();
     let temp = tempfile::tempdir().unwrap();
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
 
     let sse_body = format!(
@@ -4215,7 +4338,9 @@ async fn custom_adapter_buffered_sse_restores_custom_events() {
         "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: text/event-stream\r\n\r\n{sse_body}",
         sse_body.len()
     );
-    let listener2 = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listener2 = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let _ = listener2.local_addr().unwrap();
     let server = tokio::spawn(capture_json_request_and_respond(listener, response_text));
 
@@ -4245,11 +4370,10 @@ async fn custom_adapter_buffered_sse_restores_custom_events() {
         "tools": [{ "type": "custom", "name": "review_echo", "description": "Echo tool." }],
         "input": [{ "type": "message", "role": "user", "content": "go" }]
     });
-    let response = codex_plus_core::protocol_proxy::handle_responses_proxy_request(
-        &request.to_string(),
-    )
-    .await
-    .unwrap();
+    let response =
+        codex_plus_core::protocol_proxy::handle_responses_proxy_request(&request.to_string())
+            .await
+            .unwrap();
     assert_eq!(response.status, "200 OK");
     let _ = server.await.unwrap();
 
@@ -4289,7 +4413,9 @@ async fn custom_adapter_buffered_sse_restores_custom_events() {
 async fn responses_reasoning_frames_register_summary_before_delta_end_to_end() {
     let _lock = settings_path_test_lock().lock().unwrap();
     let temp = tempfile::tempdir().unwrap();
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
 
     let sse_body = format!(
@@ -4385,7 +4511,9 @@ async fn responses_reasoning_frames_register_summary_before_delta_end_to_end() {
 async fn custom_adapter_chat_upstream_restores_namespace_custom_end_to_end() {
     let _lock = settings_path_test_lock().lock().unwrap();
     let temp = tempfile::tempdir().unwrap();
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
 
     let chat_response = json!({
@@ -4445,11 +4573,10 @@ async fn custom_adapter_chat_upstream_restores_namespace_custom_end_to_end() {
         }],
         "input": [{ "type": "message", "role": "user", "content": "go" }]
     });
-    let response = codex_plus_core::protocol_proxy::handle_responses_proxy_request(
-        &request.to_string(),
-    )
-    .await
-    .unwrap();
+    let response =
+        codex_plus_core::protocol_proxy::handle_responses_proxy_request(&request.to_string())
+            .await
+            .unwrap();
     assert_eq!(response.status, "200 OK");
 
     let (_, upstream_request) = server.await.unwrap();
@@ -4459,7 +4586,10 @@ async fn custom_adapter_chat_upstream_restores_namespace_custom_end_to_end() {
         .find(|tool| tool["function"]["name"] == "functions__review_echo")
         .expect("namespace custom 必须被包装为扁平 chat function");
     assert_eq!(echo["type"], "function");
-    assert_eq!(echo["function"]["parameters"]["properties"]["input"]["type"], "string");
+    assert_eq!(
+        echo["function"]["parameters"]["properties"]["input"]["type"],
+        "string"
+    );
 
     let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
     let item = body["output"]
@@ -4482,7 +4612,9 @@ async fn custom_adapter_real_socket_streaming_delivers_custom_events() {
     let temp = tempfile::tempdir().unwrap();
 
     // mock 上游：捕获请求并分 3 片写 SSE（在帧中间切开）。
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let upstream_addr = listener.local_addr().unwrap();
     let upstream_server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
@@ -4619,10 +4751,7 @@ content-type: text/event-stream
     let upstream_request = upstream_server.await.unwrap();
 
     let text = String::from_utf8_lossy(&received).to_string();
-    assert!(
-        text.contains("200 OK"),
-        "应返回 200 SSE 响应：{text}"
-    );
+    assert!(text.contains("200 OK"), "应返回 200 SSE 响应：{text}");
     assert!(
         text.contains("response.custom_tool_call_input.delta"),
         "客户端必须收到 custom input delta：{text}"
@@ -4641,7 +4770,10 @@ content-type: text/event-stream
     // 上游收到的是 function 包装。
     let wire_tools = upstream_request["tools"].as_array().unwrap();
     assert_eq!(wire_tools[0]["type"], "function");
-    assert_eq!(wire_tools[0]["parameters"]["properties"]["input"]["type"], "string");
+    assert_eq!(
+        wire_tools[0]["parameters"]["properties"]["input"]["type"],
+        "string"
+    );
 }
 
 // ===========================================================================
@@ -4703,10 +4835,18 @@ impl AbRecord {
 }
 
 fn ab_env(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|value| !value.trim().is_empty())
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
-fn ab_parse_sse_calls(text: &str) -> (Option<serde_json::Value>, Option<serde_json::Value>, Option<serde_json::Value>) {
+fn ab_parse_sse_calls(
+    text: &str,
+) -> (
+    Option<serde_json::Value>,
+    Option<serde_json::Value>,
+    Option<serde_json::Value>,
+) {
     // 返回（最后一个 custom_tool_call done item、function_call done item、usage）
     let mut custom_item = None;
     let mut function_item = None;
@@ -4721,8 +4861,13 @@ fn ab_parse_sse_calls(text: &str) -> (Option<serde_json::Value>, Option<serde_js
         if value.get("type").and_then(serde_json::Value::as_str) == Some("response.completed") {
             usage = value.pointer("/response/usage").cloned();
         }
-        if value.get("type").and_then(serde_json::Value::as_str) == Some("response.output_item.done") {
-            let item = value.get("item").cloned().unwrap_or(serde_json::Value::Null);
+        if value.get("type").and_then(serde_json::Value::as_str)
+            == Some("response.output_item.done")
+        {
+            let item = value
+                .get("item")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
             match item.get("type").and_then(serde_json::Value::as_str) {
                 Some("custom_tool_call") => custom_item = Some(item),
                 Some("function_call") => function_item = Some(item),
@@ -4733,7 +4878,13 @@ fn ab_parse_sse_calls(text: &str) -> (Option<serde_json::Value>, Option<serde_js
     (custom_item, function_item, usage)
 }
 
-fn ab_json_calls(body: &serde_json::Value) -> (Option<serde_json::Value>, Option<serde_json::Value>, Option<serde_json::Value>) {
+fn ab_json_calls(
+    body: &serde_json::Value,
+) -> (
+    Option<serde_json::Value>,
+    Option<serde_json::Value>,
+    Option<serde_json::Value>,
+) {
     let mut custom_item = None;
     let mut function_item = None;
     if let Some(items) = body.get("output").and_then(serde_json::Value::as_array) {
@@ -4754,8 +4905,8 @@ async fn live_ab_custom_tools_as_functions_via_production_proxy() {
     let Some(settings_template) = ab_env("CODEXPLUS_AB_SETTINGS") else {
         panic!("缺少 CODEXPLUS_AB_SETTINGS（隔离设置模板路径）");
     };
-    let output_dir = ab_env("CODEXPLUS_AB_OUTPUT")
-        .unwrap_or_else(|| ".review-local/ab/results".to_string());
+    let output_dir =
+        ab_env("CODEXPLUS_AB_OUTPUT").unwrap_or_else(|| ".review-local/ab/results".to_string());
     std::fs::create_dir_all(&output_dir).unwrap();
     let models: Vec<String> = ab_env("CODEXPLUS_AB_MODELS")
         .unwrap_or_else(|| "coding-glm-5.3-flash".to_string())
@@ -4842,17 +4993,13 @@ async fn live_ab_custom_tools_as_functions_via_production_proxy() {
                 // 结构体序列化丢掉 skip_serializing 字段。
                 let mut arm_settings = template.clone();
                 arm_settings["relayProfiles"][0]["customToolsAsFunctions"] = json!(flag);
-                arm_settings["activeRelayId"] =
-                    arm_settings["relayProfiles"][0]["id"].clone();
+                arm_settings["activeRelayId"] = arm_settings["relayProfiles"][0]["id"].clone();
                 let arm_file = std::env::temp_dir().join(format!(
                     "codexplus-ab-{}-{}-{}.json",
                     run_id, model_index, arm_name
                 ));
-                std::fs::write(
-                    &arm_file,
-                    serde_json::to_vec_pretty(&arm_settings).unwrap(),
-                )
-                .unwrap();
+                std::fs::write(&arm_file, serde_json::to_vec_pretty(&arm_settings).unwrap())
+                    .unwrap();
                 let _guard = SettingsPathGuard::set(arm_file.clone());
 
                 let request = json!({
@@ -4988,8 +5135,8 @@ async fn live_ab_custom_tools_as_functions_via_production_proxy() {
                     let (custom, function, usage) = ab_parse_sse_calls(&text);
                     (custom, function, usage)
                 } else {
-                    let body: serde_json::Value = serde_json::from_slice(&response.body)
-                        .unwrap_or(serde_json::Value::Null);
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&response.body).unwrap_or(serde_json::Value::Null);
                     ab_json_calls(&body)
                 };
 
@@ -5018,13 +5165,20 @@ async fn live_ab_custom_tools_as_functions_via_production_proxy() {
                     continue;
                 };
 
-                let call_type = item.get("type").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+                let call_type = item
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
                 let call_id = item
                     .get("call_id")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                let input = item.get("input").and_then(serde_json::Value::as_str).unwrap_or_default();
+                let input = item
+                    .get("input")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
                 let exact = call_type == "custom_tool_call" && input == vector.as_str();
 
                 // synthetic 执行器：只做字符串验收，不触 shell。
@@ -5067,7 +5221,11 @@ async fn live_ab_custom_tools_as_functions_via_production_proxy() {
                     note: if exact {
                         String::new()
                     } else {
-                        format!("input 不匹配（期待 {vector} 字符数 {}，实际 {}）", vector.chars().count(), input.chars().count())
+                        format!(
+                            "input 不匹配（期待 {vector} 字符数 {}，实际 {}）",
+                            vector.chars().count(),
+                            input.chars().count()
+                        )
                     },
                 });
 
@@ -5126,13 +5284,15 @@ async fn live_ab_custom_tools_as_functions_via_production_proxy() {
                 let latency = started.elapsed().as_millis();
                 let nonce_returned = match replay_response {
                     Ok(Ok(response)) => {
-                        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap_or(serde_json::Value::Null);
+                        let body: serde_json::Value = serde_json::from_slice(&response.body)
+                            .unwrap_or(serde_json::Value::Null);
                         let text = body["output"]
                             .as_array()
                             .unwrap_or(&Vec::new())
                             .iter()
                             .filter_map(|item| {
-                                item.pointer("/content/0/text").and_then(serde_json::Value::as_str)
+                                item.pointer("/content/0/text")
+                                    .and_then(serde_json::Value::as_str)
                             })
                             .collect::<Vec<_>>()
                             .join(" ");
@@ -5193,7 +5353,13 @@ async fn live_ab_custom_tools_as_functions_via_production_proxy() {
     for record in &records {
         println!(
             "[AB] {} model={} arm={} stream={} stage={} result={} note={}",
-            record.run_id, record.model, record.arm, record.stream, record.stage, record.result, record.note
+            record.run_id,
+            record.model,
+            record.arm,
+            record.stream,
+            record.stage,
+            record.result,
+            record.note
         );
     }
     // 测试本身不因业务失败而失败：证据以报告为准（§14.9 允许多种结论）。

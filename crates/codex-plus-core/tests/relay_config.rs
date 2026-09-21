@@ -4334,10 +4334,10 @@ experimental_bearer_token = "sk-deepseek"
         Some(true)
     );
     assert_eq!(parsed["features"]["unified_exec"].as_bool(), Some(true));
-    assert_eq!(parsed["features"]["code_mode_only"].as_bool(), Some(false));
+    assert_eq!(parsed["features"]["code_mode_only"].as_bool(), Some(true));
     assert_eq!(
         parsed["features"]["code_mode"]["enabled"].as_bool(),
-        Some(false)
+        Some(true)
     );
     assert_eq!(
         parsed["features"]["code_mode"]["direct_only_tool_namespaces"][0].as_str(),
@@ -4362,7 +4362,7 @@ experimental_bearer_token = "sk-deepseek"
     assert_eq!(model["slug"], "deepseek-v4-flash");
     assert_eq!(model["shell_type"], "shell_command");
     assert_eq!(model["apply_patch_tool_type"], "freeform");
-    assert!(model["tool_mode"].is_null());
+    assert_eq!(model["tool_mode"], "code_mode_only");
     assert_eq!(model["use_responses_lite"], false);
     assert_eq!(model["context_window"], 1_048_576);
     assert_eq!(model["effective_context_window_percent"], 95);
@@ -4396,15 +4396,61 @@ fn deepseek_responses_compatibility_preserves_inline_feature_tables() {
     let parsed: toml::Value = toml::from_str(&prepared).unwrap();
     assert_eq!(parsed["features"]["unified_exec"].as_bool(), Some(true));
     assert_eq!(parsed["features"]["goals"].as_bool(), Some(true));
-    assert_eq!(parsed["features"]["code_mode_only"].as_bool(), Some(false));
+    assert_eq!(parsed["features"]["code_mode_only"].as_bool(), Some(true));
     assert_eq!(
         parsed["features"]["code_mode"]["enabled"].as_bool(),
-        Some(false)
+        Some(true)
     );
     assert_eq!(
         parsed["features"]["code_mode"]["direct_only_tool_namespaces"][0].as_str(),
         Some("mcp__node_repl")
     );
+}
+
+#[test]
+fn official_deepseek_injects_execution_features_when_profile_has_none() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile = RelayProfile {
+        id: "deepseek-minimal".to_string(),
+        model: "deepseek-v4-flash".to_string(),
+        base_url: "https://api.deepseek.com/".to_string(),
+        upstream_base_url: "https://api.deepseek.com/".to_string(),
+        protocol: RelayProtocol::Responses,
+        relay_mode: RelayMode::PureApi,
+        config_contents: r#"model = "deepseek-v4-flash"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "https://api.deepseek.com/"
+"#
+        .to_string(),
+        model_list: "deepseek-v4-flash".to_string(),
+        ..RelayProfile::default()
+    };
+
+    apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    let parsed: toml::Value = toml::from_str(&config).unwrap();
+    assert_eq!(parsed["features"]["unified_exec"].as_bool(), Some(true));
+    assert_eq!(parsed["features"]["code_mode_only"].as_bool(), Some(true));
+    assert_eq!(
+        parsed["features"]["code_mode"]["enabled"].as_bool(),
+        Some(true)
+    );
+
+    let catalog: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            temp.path()
+                .join("model-catalogs")
+                .join("deepseek-minimal.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(catalog["models"][0]["tool_mode"], "code_mode_only");
 }
 
 #[test]
@@ -4446,10 +4492,10 @@ base_url = "https://api.deepseek.com/v1"
     )
     .unwrap();
     let parsed: toml::Value = toml::from_str(&prepared).unwrap();
-    assert_eq!(parsed["features"]["code_mode_only"].as_bool(), Some(false));
+    assert_eq!(parsed["features"]["code_mode_only"].as_bool(), Some(true));
     assert_eq!(
         parsed["features"]["code_mode"]["enabled"].as_bool(),
-        Some(false)
+        Some(true)
     );
 }
 

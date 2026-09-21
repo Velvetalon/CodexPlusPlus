@@ -1839,6 +1839,11 @@ fn apply_model_catalog_to_config(
         custom_responses.then_some(false),
         official_deepseek_responses,
     );
+    let catalog_json = if official_deepseek_responses {
+        force_code_mode_catalog_tool_mode(&catalog_json)
+    } else {
+        catalog_json
+    };
     std::fs::write(&catalog_path, catalog_json)?;
     let mut doc = parse_toml_document(&config_text)?;
     doc["model_catalog_json"] = toml_edit::value(catalog_relative);
@@ -1876,6 +1881,23 @@ fn deepseek_api_base_url(base_url: &str) -> bool {
     host == "deepseek.com" || host.ends_with(".deepseek.com")
 }
 
+fn force_code_mode_catalog_tool_mode(catalog_json: &str) -> String {
+    let Ok(mut catalog) = serde_json::from_str::<Value>(catalog_json) else {
+        return catalog_json.to_string();
+    };
+    if let Some(models) = catalog.get_mut("models").and_then(Value::as_array_mut) {
+        for model in models {
+            if let Some(object) = model.as_object_mut() {
+                object.insert(
+                    "tool_mode".to_string(),
+                    Value::String("code_mode_only".to_string()),
+                );
+            }
+        }
+    }
+    serde_json::to_string_pretty(&catalog).unwrap_or_else(|_| catalog_json.to_string())
+}
+
 pub fn apply_deepseek_responses_compatibility(
     profile: &RelayProfile,
     config_text: &str,
@@ -1894,7 +1916,8 @@ pub fn apply_deepseek_responses_compatibility(
         .get_mut("features")
         .and_then(Item::as_table_like_mut)
         .expect("features table-like item was created above");
-    features.insert("code_mode_only", toml_edit::value(false));
+    features.insert("unified_exec", toml_edit::value(true));
+    features.insert("code_mode_only", toml_edit::value(true));
     if features
         .get("code_mode")
         .and_then(Item::as_table_like)
@@ -1906,7 +1929,7 @@ pub fn apply_deepseek_responses_compatibility(
         .get_mut("code_mode")
         .and_then(Item::as_table_like_mut)
         .expect("code_mode table-like item was created above")
-        .insert("enabled", toml_edit::value(false));
+        .insert("enabled", toml_edit::value(true));
     Ok(normalize_optional_toml(doc))
 }
 
