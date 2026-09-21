@@ -1900,11 +1900,65 @@ fn restore_responses_tool_namespace_item(
         return;
     }
     if let Some(name) = object.get("name").and_then(Value::as_str) {
-        if let Some((namespace, original_name)) = namespace_tools.get(name) {
+        let restored = namespace_tools
+            .get(name)
+            .cloned()
+            .or_else(|| restore_flat_collaboration_tool_name(name, namespace_tools));
+        if let Some((namespace, original_name)) = restored {
             object.insert("namespace".to_string(), json!(namespace));
             object.insert("name".to_string(), json!(original_name));
         }
     }
+}
+
+/// 多代理工具在客户端注册为 namespace=collaboration 的裸名（spawn_agent 等）。
+/// 兼容层把它们拍扁成 namespace__tool 之后，模型可能再套一层前缀，或者那一轮根本
+/// 没有建立映射表；此时只按精确 key 还原会漏掉，core 会直接报 unsupported call。
+const COLLABORATION_TOOL_NAMES: [&str; 6] = [
+    "spawn_agent",
+    "wait_agent",
+    "send_message",
+    "followup_task",
+    "list_agents",
+    "interrupt_agent",
+];
+const COLLABORATION_TOOL_SUFFIXES: [&[u8]; 6] = [
+    b"__spawn_agent",
+    b"__wait_agent",
+    b"__send_message",
+    b"__followup_task",
+    b"__list_agents",
+    b"__interrupt_agent",
+];
+const COLLABORATION_NAMESPACE: &str = "collaboration";
+
+fn is_collaboration_namespace_prefix(prefix: &str) -> bool {
+    let lower = prefix.trim().to_ascii_lowercase();
+    lower == COLLABORATION_NAMESPACE || lower.ends_with(COLLABORATION_NAMESPACE)
+}
+
+fn restore_flat_collaboration_tool_name(
+    name: &str,
+    namespace_tools: &BTreeMap<String, (String, String)>,
+) -> Option<(String, String)> {
+    let (prefix, tool) = name.rsplit_once("__")?;
+    if !is_collaboration_namespace_prefix(prefix) || !COLLABORATION_TOOL_NAMES.contains(&tool) {
+        return None;
+    }
+    // 同一轮请求里已经知道这个工具的命名空间时优先沿用，否则回落到注册命名空间。
+    let namespace = namespace_tools
+        .values()
+        .find(|(_, original)| original == tool)
+        .map(|(namespace, _)| namespace.clone())
+        .unwrap_or_else(|| COLLABORATION_NAMESPACE.to_string());
+    Some((namespace, tool.to_string()))
+}
+
+/// 映射表为空时的快速判定：只有真的出现拍扁的多代理工具名才做解析重排。
+fn contains_flat_collaboration_tool_name(bytes: &[u8]) -> bool {
+    COLLABORATION_TOOL_SUFFIXES
+        .iter()
+        .any(|needle| bytes.windows(needle.len()).any(|window| window == *needle))
 }
 
 pub fn restore_responses_tool_namespace_json(
@@ -1912,7 +1966,7 @@ pub fn restore_responses_tool_namespace_json(
     namespace_tools: &BTreeMap<String, (String, String)>,
 ) -> Vec<u8> {
     // R10：没有映射时按原样透传，不做无谓的解析重排。
-    if namespace_tools.is_empty() {
+    if namespace_tools.is_empty() && !contains_flat_collaboration_tool_name(bytes) {
         return bytes.to_vec();
     }
     let Ok(mut value) = serde_json::from_slice::<Value>(bytes) else {
@@ -1996,7 +2050,7 @@ impl ResponsesNamespaceSseRewriter {
     fn rewrite_frame(&self, frame: &[u8]) -> Vec<u8> {
         // R10：没有 namespace 映射时不做任何改写，按原样透传，
         // 不把每个 JSON frame 解析重排一遍。
-        if self.namespace_tools.is_empty() {
+        if self.namespace_tools.is_empty() && !contains_flat_collaboration_tool_name(frame) {
             return frame.to_vec();
         }
         let Ok(text) = std::str::from_utf8(frame) else {

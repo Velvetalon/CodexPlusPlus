@@ -9,6 +9,7 @@ use codex_plus_core::protocol_proxy::{
     open_responses_proxy_request_with_settings,
     open_responses_proxy_request_with_settings_for_path, responses_compact_url,
     responses_error_from_upstream, responses_to_chat_completions,
+    restore_responses_tool_namespace_json, ResponsesNamespaceSseRewriter,
     send_upstream_request_with_header_timeout, upstream_header_timeout, upstream_http_client,
     upstream_stream_header_timeout,
 };
@@ -2646,6 +2647,123 @@ async fn responses_proxy_does_not_retry_without_encrypted_reasoning_in_request()
         1,
         "请求里没有 encrypted reasoning 时不得触发重试"
     );
+}
+
+#[test]
+fn namespace_restore_recovers_prefixed_collaboration_tool_names_without_map() {
+    // 模型把多代理工具名再套一层前缀（历史里出现过的两种写法都要能还原），
+    // 而这一轮请求根本没有建立 namespace 映射表。
+    let body = json!({
+        "id": "resp_1",
+        "output": [
+            {
+                "type": "function_call",
+                "id": "fc_collab",
+                "call_id": "call_collab",
+                "name": "codexpp_native_collaboration__spawn_agent",
+                "arguments": "{}"
+            },
+            {
+                "type": "function_call",
+                "id": "fc_collab_plain",
+                "call_id": "call_collab_plain",
+                "name": "collaboration__wait_agent",
+                "arguments": "{}"
+            },
+            {
+                "type": "function_call",
+                "id": "fc_other",
+                "call_id": "call_other",
+                "name": "functions__exec",
+                "arguments": "{}"
+            },
+            {
+                "type": "function_call",
+                "id": "fc_foreign_ns",
+                "call_id": "call_foreign_ns",
+                "name": "other_namespace__spawn_agent",
+                "arguments": "{}"
+            }
+        ]
+    });
+    let namespaces = std::collections::BTreeMap::new();
+
+    let restored: serde_json::Value = serde_json::from_slice(
+        &restore_responses_tool_namespace_json(&serde_json::to_vec(&body).unwrap(), &namespaces),
+    )
+    .unwrap();
+
+    assert_eq!(restored["output"][0]["namespace"], "collaboration");
+    assert_eq!(restored["output"][0]["name"], "spawn_agent");
+    assert_eq!(restored["output"][1]["namespace"], "collaboration");
+    assert_eq!(restored["output"][1]["name"], "wait_agent");
+    // 其它命名空间的拍扁名和非多代理工具不得被改写。
+    assert_eq!(restored["output"][2]["name"], "functions__exec");
+    assert!(restored["output"][2].get("namespace").is_none());
+    assert_eq!(
+        restored["output"][3]["name"],
+        "other_namespace__spawn_agent"
+    );
+    assert!(restored["output"][3].get("namespace").is_none());
+}
+
+#[test]
+fn namespace_restore_keeps_exact_map_hits_authoritative() {
+    let body = json!({
+        "output": [
+            {
+                "type": "function_call",
+                "id": "fc_collab",
+                "call_id": "call_collab",
+                "name": "codexpp_native_collaboration__spawn_agent",
+                "arguments": "{}"
+            },
+            {
+                "type": "function_call",
+                "id": "fc_exact",
+                "call_id": "call_exact",
+                "name": "collaboration__spawn_agent",
+                "arguments": "{}"
+            }
+        ]
+    });
+    let mut namespaces = std::collections::BTreeMap::new();
+    namespaces.insert(
+        "collaboration__spawn_agent".to_string(),
+        ("collaboration".to_string(), "spawn_agent".to_string()),
+    );
+
+    let restored: serde_json::Value = serde_json::from_slice(
+        &restore_responses_tool_namespace_json(&serde_json::to_vec(&body).unwrap(), &namespaces),
+    )
+    .unwrap();
+
+    assert_eq!(restored["output"][0]["namespace"], "collaboration");
+    assert_eq!(restored["output"][0]["name"], "spawn_agent");
+    assert_eq!(restored["output"][1]["namespace"], "collaboration");
+    assert_eq!(restored["output"][1]["name"], "spawn_agent");
+}
+
+#[test]
+fn namespace_sse_rewriter_restores_prefixed_collaboration_call_without_map() {
+    let mut rewriter = ResponsesNamespaceSseRewriter::new(std::collections::BTreeMap::new());
+    let frame = concat!(
+        "event: response.output_item.done\n",
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",",
+        "\"id\":\"fc_1\",\"call_id\":\"call_1\",",
+        "\"name\":\"codexpp_native_collaboration__followup_task\",\"arguments\":\"{}\"}}\n\n"
+    );
+
+    let mut output = rewriter.push_bytes(frame.as_bytes());
+    output.extend(rewriter.finish());
+    let text = String::from_utf8(output).unwrap();
+
+    assert!(
+        text.contains("\"namespace\":\"collaboration\""),
+        "SSE 帧里的拍扁名必须还原: {text}"
+    );
+    assert!(text.contains("\"name\":\"followup_task\""));
+    assert!(!text.contains("codexpp_native_collaboration__followup_task"));
 }
 
 #[tokio::test]

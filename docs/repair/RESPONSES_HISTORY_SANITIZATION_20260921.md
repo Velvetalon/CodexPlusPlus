@@ -116,3 +116,46 @@ Build: dist/windows/app/codex-plus-plus.exe sha256
 E2E58B1F2DFE5050A0854E420B774B094C04E43EA680C750742371C2DC8338E0,
 dist/windows/app/codex-plus-plus-manager.exe sha256
 D811E4D1463E63AEF79AFABA35A9833789A35BBABFA6901A976DF2A5D604DD5B.
+
+## Follow-up: multi-agent tool name restore (same day)
+
+Symptom: sub-agent tools intermittently failed with
+"unsupported call: collaboration__spawn_agent", raised by
+codex_core::tools::router in the Codex core, so the whole sub-agent workflow
+stalled in that thread.
+
+Root cause: these tools are registered client-side as a namespace tool
+(namespace collaboration, tool spawn_agent). The Compatible wire path flattens
+namespace tools into a single flat function name (collaboration__spawn_agent) for
+upstreams that cannot express namespaces, and the response path has to restore the
+flat name before the client sees it. Restore only matched an exact key of the
+flattened-name map built from that request, so any other spelling the model chose
+(codexpp_native_collaboration__spawn_agent, or the flat name in a turn whose
+request carried no namespace map at all) leaked through unrepaired.
+
+Evidence: session rollout of 2026-09-21 records successful calls as
+function_call { namespace: collaboration, name: spawn_agent } while the failures
+are function_call { name: collaboration__spawn_agent } with no namespace; the
+desktop log records 33 plain spawn_agent dispatches (all fine) against 6
+collaboration__spawn_agent dispatches that all ended in the router error.
+
+Change: restore_responses_tool_namespace_item now falls back to a prefix-agnostic
+repair when the exact map lookup misses. A call name shaped <prefix>__<tool>,
+where the prefix is collaboration or ends with collaboration and the tool is one
+of spawn_agent / wait_agent / send_message / followup_task / list_agents /
+interrupt_agent, is rewritten to the registered namespace plus bare tool name
+(namespace taken from the request map when known, otherwise collaboration). Other
+namespaces and other tools are never touched. The empty-map fast path stays in
+place: restore only parses when the payload actually contains a flat multi-agent
+tool suffix.
+
+Verification: cargo test -p codex-plus-core --test protocol_proxy => 110 passed,
+0 failed, 1 ignored; cargo test -p codex-plus-core --lib => 380 passed. New tests
+cover both prefixed spellings with an empty map, that unrelated flat names
+(functions__exec, other_namespace__spawn_agent) stay untouched, that exact map hits
+remain authoritative, and that the SSE frame rewriter performs the same repair.
+
+Build: dist/windows/app/codex-plus-plus.exe sha256
+0D2EF44A3C091941EE56B54CF10CE8D3B2818E70ABCA88ACE7F40FD038C619A6,
+dist/windows/app/codex-plus-plus-manager.exe sha256
+F6540F5E9B00DB5DFF3512F134B0FA37E35FD74147D0D9DBDBCBA5C62B3F4212.
