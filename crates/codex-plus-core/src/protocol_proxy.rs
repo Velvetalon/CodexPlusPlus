@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::btree_map::Entry;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -1039,6 +1040,10 @@ async fn upstream_request_parts(
 
     let official_deepseek = crate::relay_config::uses_official_deepseek_responses(relay);
     let custom_tools_as_functions = relay.custom_tools_as_functions || official_deepseek;
+    // 客户端在流式 exec 输出被拆成多段时，会给同一个 call_id 写入多条 output 历史。
+    // 任何 Responses/ChatCompletions 上游都只接受每个 call 一条结果，这里先合并再发送；
+    // 这是历史合法性修复，不随 passthrough 策略关闭。
+    merge_duplicate_tool_outputs(&mut request_json);
 
     // Custom-as-Function 开关（默认关闭）：按候选 profile 冻结适配计划。
     // passthrough 组合是显式配置冲突，发送前报错而不是静默忽略。
@@ -1103,7 +1108,10 @@ async fn upstream_request_parts(
             relay.responses_reasoning_policy,
             &relay.id,
         );
-        normalize_responses_item_ids_with_policy(&mut body, official_deepseek);
+        // Strict Responses upstreams reject relay-generated ids that violate the
+        // item-type namespace, so Compatible requests get deterministic rewrites
+        // instead of forwarding chatcmpl-* history unchanged.
+        normalize_responses_item_ids_with_policy(&mut body, true);
         if crate::native_agents::interop_enabled(relay) {
             crate::native_agents::prepare_glm_messages(&mut body);
         }
@@ -1323,6 +1331,87 @@ fn normalize_responses_item_id(item: &mut Value, strict_prefixes: bool) {
         return;
     };
     item["id"] = json!(format!("{prefix}{suffix}"));
+}
+
+fn merge_duplicate_tool_outputs(body: &mut Value) {
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut output_indexes = BTreeMap::new();
+    let mut duplicates = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let matches_type = matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("function_call_output" | "custom_tool_call_output")
+        );
+        if !matches_type {
+            continue;
+        }
+        let Some(call_id) = item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .filter(|call_id| !call_id.is_empty())
+        else {
+            continue;
+        };
+        match output_indexes.entry(call_id.to_string()) {
+            Entry::Vacant(entry) => {
+                entry.insert(index);
+            }
+            Entry::Occupied(entry) => duplicates.push((*entry.get(), index)),
+        }
+    }
+    if duplicates.is_empty() {
+        return;
+    }
+    let duplicate_indexes: BTreeSet<_> = duplicates.iter().map(|(_, index)| *index).collect();
+    let mut merged_outputs = BTreeMap::new();
+    for &(kept_index, duplicate_index) in &duplicates {
+        let duplicate = items[duplicate_index].clone();
+        if let (Some(name), Value::Object(kept)) = (
+            duplicate.get("name").and_then(Value::as_str),
+            &mut items[kept_index],
+        ) {
+            kept.entry("name".to_string()).or_insert(json!(name));
+        }
+        let outputs = merged_outputs.entry(kept_index).or_insert_with(|| {
+            tool_output_parts(items[kept_index].get("output").unwrap_or(&Value::Null))
+        });
+        outputs.extend(tool_output_parts(
+            duplicate.get("output").unwrap_or(&Value::Null),
+        ));
+    }
+    let mut retained = Vec::with_capacity(items.len() - duplicate_indexes.len());
+    for (index, mut item) in items.drain(..).enumerate() {
+        if duplicate_indexes.contains(&index) {
+            continue;
+        }
+        if let Some(outputs) = merged_outputs.get(&index) {
+            item["output"] = merged_tool_output(item.get("output"), outputs.clone());
+        }
+        retained.push(item);
+    }
+    *items = retained;
+}
+
+fn tool_output_parts(output: &Value) -> Vec<Value> {
+    match output {
+        Value::Null => Vec::new(),
+        Value::Array(parts) => parts.clone(),
+        Value::String(text) => vec![json!({ "type": "input_text", "text": text })],
+        value => vec![json!({ "type": "input_text", "text": value.to_string() })],
+    }
+}
+
+fn merged_tool_output(original_output: Option<&Value>, outputs: Vec<Value>) -> Value {
+    if matches!(original_output, Some(Value::String(_))) && outputs.len() == 1 {
+        if let [Value::Object(part)] = &outputs[..] {
+            if part.get("type").and_then(Value::as_str) == Some("input_text") {
+                return part.get("text").cloned().unwrap_or_default();
+            }
+        }
+    }
+    Value::Array(outputs)
 }
 
 fn content_is_non_empty(content: Option<&Value>) -> bool {
@@ -6386,6 +6475,185 @@ mod responses_reasoning_policy_tests {
                 {"type": "message", "id": "msg_message", "role": "user", "content": "before"},
                 {"type": "function_call", "id": "fc_function", "call_id": "call-1", "name": "lookup"},
                 {"type": "custom_tool_call", "id": "ctc_custom", "call_id": "call-2", "name": "exec", "input": "pwd"}
+            ])
+        );
+    }
+
+    #[test]
+    fn duplicate_custom_tool_outputs_merge_in_first_position() {
+        let mut actual = json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "before"},
+                {
+                    "type": "custom_tool_call_output",
+                    "id": "ctco_first",
+                    "call_id": "call_duplicate",
+                    "output": "Script completed\nOutput:\n"
+                },
+                {"type": "message", "role": "user", "content": "between"},
+                {
+                    "type": "custom_tool_call_output",
+                    "id": "ctco_second",
+                    "call_id": "call_duplicate",
+                    "name": "exec",
+                    "output": "5610"
+                }
+            ]
+        });
+        merge_duplicate_tool_outputs(&mut actual);
+        assert_eq!(
+            actual["input"],
+            json!([
+                {"type": "message", "role": "user", "content": "before"},
+                {
+                    "type": "custom_tool_call_output",
+                    "id": "ctco_first",
+                    "call_id": "call_duplicate",
+                    "name": "exec",
+                    "output": [
+                        {"type": "input_text", "text": "Script completed\nOutput:\n"},
+                        {"type": "input_text", "text": "5610"}
+                    ]
+                },
+                {"type": "message", "role": "user", "content": "between"}
+            ])
+        );
+    }
+
+    #[test]
+    fn duplicate_plain_string_outputs_keep_both_texts() {
+        let mut actual = json!({
+            "input": [
+                {"type": "custom_tool_call_output", "call_id": "call_a", "output": "one"},
+                {"type": "custom_tool_call_output", "call_id": "call_a", "output": "two"}
+            ]
+        });
+        merge_duplicate_tool_outputs(&mut actual);
+        assert_eq!(
+            actual["input"][0]["output"],
+            json!([
+                {"type": "input_text", "text": "one"},
+                {"type": "input_text", "text": "two"}
+            ])
+        );
+        assert_eq!(actual["input"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn duplicate_array_and_string_outputs_keep_encounter_order() {
+        let mut actual = json!({
+            "input": [
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_a",
+                    "output": [{"type": "input_text", "text": "first"}]
+                },
+                {"type": "custom_tool_call_output", "call_id": "call_a", "output": "second"}
+            ]
+        });
+        merge_duplicate_tool_outputs(&mut actual);
+        assert_eq!(
+            actual["input"][0]["output"],
+            json!([
+                {"type": "input_text", "text": "first"},
+                {"type": "input_text", "text": "second"}
+            ])
+        );
+    }
+
+    #[test]
+    fn duplicate_function_call_outputs_merge_the_same_way() {
+        let mut actual = json!({
+            "input": [
+                {"type": "function_call_output", "id": "fco_a", "call_id": "call_a", "output": "first"},
+                {"type": "function_call_output", "id": "fco_b", "call_id": "call_a", "name": "lookup", "output": "second"},
+                {"type": "function_call_output", "id": "fco_c", "call_id": "call_b", "output": "other"}
+            ]
+        });
+        merge_duplicate_tool_outputs(&mut actual);
+        assert_eq!(
+            actual["input"],
+            json!([
+                {
+                    "type": "function_call_output",
+                    "id": "fco_a",
+                    "call_id": "call_a",
+                    "name": "lookup",
+                    "output": [
+                        {"type": "input_text", "text": "first"},
+                        {"type": "input_text", "text": "second"}
+                    ]
+                },
+                {"type": "function_call_output", "id": "fco_c", "call_id": "call_b", "output": "other"}
+            ])
+        );
+    }
+
+    #[test]
+    fn distinct_and_shapeless_tool_outputs_are_not_merged() {
+        let expected = json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "question"},
+                {"type": "custom_tool_call_output", "call_id": "", "output": "missing-call-id"},
+                {"type": "custom_tool_call_output", "call_id": "call_a", "output": "one"},
+                {"type": "custom_tool_call_output", "call_id": "call_b", "output": "two"},
+                {"type": "function_call", "call_id": "call_a", "name": "lookup"}
+            ]
+        });
+        let mut actual = expected.clone();
+        merge_duplicate_tool_outputs(&mut actual);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn three_way_duplicate_outputs_are_concatenated_once() {
+        let mut actual = json!({
+            "input": [
+                {"type": "custom_tool_call_output", "call_id": "call_a", "output": "one"},
+                {"type": "custom_tool_call_output", "call_id": "call_a", "output": "two"},
+                {"type": "custom_tool_call_output", "call_id": "call_a", "output": "three"}
+            ]
+        });
+        merge_duplicate_tool_outputs(&mut actual);
+        assert_eq!(
+            actual["input"][0]["output"],
+            json!([
+                {"type": "input_text", "text": "one"},
+                {"type": "input_text", "text": "two"},
+                {"type": "input_text", "text": "three"}
+            ])
+        );
+    }
+
+    #[test]
+    fn non_output_and_non_array_inputs_are_untouched() {
+        let string_input = json!({
+            "input": "not an item array"
+        });
+        let mut actual = string_input.clone();
+        merge_duplicate_tool_outputs(&mut actual);
+        assert_eq!(actual, string_input);
+
+        let missing_input = json!({ "model": "gpt-5.6-luna" });
+        actual = missing_input.clone();
+        merge_duplicate_tool_outputs(&mut actual);
+        assert_eq!(actual, missing_input);
+    }
+
+    #[test]
+    fn non_string_scalar_output_becomes_compact_json_text() {
+        let mut actual = json!({
+            "input": [
+                {"type": "function_call_output", "call_id": "call_a", "output": 42},
+                {"type": "function_call_output", "call_id": "call_a", "output": true}
+            ]
+        });
+        merge_duplicate_tool_outputs(&mut actual);
+        assert_eq!(
+            actual["input"][0]["output"],
+            json!([
+                {"type": "input_text", "text": "42"},
+                {"type": "input_text", "text": "true"}
             ])
         );
     }

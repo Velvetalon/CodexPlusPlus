@@ -2329,6 +2329,106 @@ async fn responses_proxy_normalizes_legacy_custom_tool_item_ids_only() {
 }
 
 #[tokio::test]
+async fn responses_proxy_normalizes_relay_ids_for_compatible_upstream() {
+    let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let target_server = tokio::spawn(capture_json_request_once(target));
+    let foreign_id = "chatcmpl-202609200918258761407968268d9d6WGd5KQKm_msg_0";
+    let request = json!({
+        "model": "gpt-5.6-luna",
+        "input": [
+            {
+                "type": "message",
+                "id": foreign_id,
+                "role": "user",
+                "content": "continue"
+            },
+            {
+                "type": "function_call",
+                "id": "chatcmpl-202609200918258761407968268d9d6WGd5KQKm_fc_1",
+                "call_id": "call_relay",
+                "name": "lookup"
+            },
+            {
+                "type": "function_call_output",
+                "id": "chatcmpl-202609200918258761407968268d9d6WGd5KQKm_fco_1",
+                "call_id": "call_relay",
+                "output": "done"
+            }
+        ],
+        "stream": false
+    });
+    let settings = model_route_settings("gpt-5.6-luna", "", format!("http://{target_addr}/v1"));
+
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+    let (_, upstream_body) = target_server.await.unwrap();
+
+    assert_eq!(upstream_body["input"][0]["id"], format!("msg_{foreign_id}"));
+    assert_eq!(
+        upstream_body["input"][1]["id"],
+        "fc_chatcmpl-202609200918258761407968268d9d6WGd5KQKm_fc_1"
+    );
+    assert_eq!(
+        upstream_body["input"][2]["id"],
+        "fco_chatcmpl-202609200918258761407968268d9d6WGd5KQKm_fco_1"
+    );
+}
+
+#[tokio::test]
+async fn responses_proxy_merges_duplicate_custom_tool_outputs() {
+    let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let target_server = tokio::spawn(capture_json_request_once(target));
+    let request = json!({
+        "model": "gpt-5.6-luna",
+        "input": [
+            {
+                "type": "custom_tool_call_output",
+                "id": "ctco_first",
+                "call_id": "call_duplicate",
+                "output": "Script completed"
+            },
+            {
+                "type": "custom_tool_call_output",
+                "id": "ctco_second",
+                "call_id": "call_duplicate",
+                "name": "exec",
+                "output": "5610"
+            }
+        ],
+        "stream": false
+    });
+    let settings = model_route_settings("gpt-5.6-luna", "", format!("http://{target_addr}/v1"));
+
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+    let (_, upstream_body) = target_server.await.unwrap();
+    let items = upstream_body["input"].as_array().unwrap();
+
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["type"], "custom_tool_call_output");
+    assert_eq!(items[0]["id"], "ctco_first");
+    assert_eq!(items[0]["call_id"], "call_duplicate");
+    assert_eq!(items[0]["name"], "exec");
+    assert_eq!(
+        items[0]["output"],
+        json!([
+            {"type": "input_text", "text": "Script completed"},
+            {"type": "input_text", "text": "5610"}
+        ])
+    );
+}
+
+#[tokio::test]
 async fn model_route_preserves_responses_compact_endpoint() {
     let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
