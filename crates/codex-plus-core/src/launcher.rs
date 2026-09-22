@@ -1116,6 +1116,8 @@ async fn handle_helper_connection(
     let raw_path = parts.next().unwrap_or_default();
     let path = raw_path.split('?').next().unwrap_or(raw_path);
     let request_user_agent = header_value_from_headers(&request_headers, "user-agent");
+    let request_session_id = header_value_from_headers(&request_headers, "session_id")
+        .or_else(|| header_value_from_headers(&request_headers, "x-opencode-session"));
     let request_content_type = header_value_from_headers(&request_headers, "content-type");
     let request_content_encoding = header_value_from_headers(&request_headers, "content-encoding");
     let remote_addr_text = remote_addr.map(|addr| addr.to_string());
@@ -1194,25 +1196,31 @@ async fn handle_helper_connection(
                 return Ok(());
             }
         };
-        return handle_protocol_proxy_connection(
-            &mut stream,
-            &request_body,
-            request_user_agent.as_deref(),
-            method,
-            path,
-            remote_addr_text,
+        return crate::protocol_proxy::with_request_session_id(
+            request_session_id.clone(),
+            handle_protocol_proxy_connection(
+                &mut stream,
+                &request_body,
+                request_user_agent.as_deref(),
+                method,
+                path,
+                remote_addr_text,
+            ),
         )
         .await;
     }
     let request_body = String::from_utf8_lossy(&request.body);
     if crate::protocol_proxy::is_chat_completions_proxy_path(path) && method == "POST" {
-        return handle_chat_completions_proxy_connection(
-            &mut stream,
-            &request_body,
-            request_user_agent.as_deref(),
-            method,
-            path,
-            remote_addr_text,
+        return crate::protocol_proxy::with_request_session_id(
+            request_session_id.clone(),
+            handle_chat_completions_proxy_connection(
+                &mut stream,
+                &request_body,
+                request_user_agent.as_deref(),
+                method,
+                path,
+                remote_addr_text,
+            ),
         )
         .await;
     }

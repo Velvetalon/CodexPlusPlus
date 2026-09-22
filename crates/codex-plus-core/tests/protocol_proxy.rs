@@ -11,7 +11,7 @@ use codex_plus_core::protocol_proxy::{
     responses_error_from_upstream, responses_to_chat_completions,
     restore_responses_tool_namespace_json, ResponsesNamespaceSseRewriter,
     send_upstream_request_with_header_timeout, upstream_header_timeout, upstream_http_client,
-    upstream_stream_header_timeout,
+    upstream_stream_header_timeout, with_request_session_id,
 };
 use codex_plus_core::relay_config::test_relay_profile;
 use codex_plus_core::relay_rotation::priority_fallback_cooldown_status;
@@ -2764,6 +2764,61 @@ fn namespace_sse_rewriter_restores_prefixed_collaboration_call_without_map() {
     );
     assert!(text.contains("\"name\":\"followup_task\""));
     assert!(!text.contains("codexpp_native_collaboration__followup_task"));
+}
+
+#[tokio::test]
+async fn upstream_request_sends_opencode_session_from_prompt_cache_key() {
+    let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let target_server = tokio::spawn(capture_json_request_once(target));
+    let request = json!({
+        "model": "gpt-5.6-luna",
+        "prompt_cache_key": "cache-abc-123",
+        "input": [{"type": "message", "role": "user", "content": "hi"}],
+        "stream": false
+    });
+    let settings = model_route_settings("gpt-5.6-luna", "", format!("http://{target_addr}/v1"));
+
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+    let (headers, _) = target_server.await.unwrap();
+    let lower = headers.to_ascii_lowercase();
+    assert!(
+        lower.contains("x-opencode-session: cache-abc-123"),
+        "OpenCode Go 需要 x-opencode-session，实到请求头: {headers}"
+    );
+}
+
+#[tokio::test]
+async fn request_session_id_header_wins_over_prompt_cache_key() {
+    let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let target_server = tokio::spawn(capture_json_request_once(target));
+    let request = json!({
+        "model": "gpt-5.6-luna",
+        "prompt_cache_key": "cache-abc-123",
+        "input": [{"type": "message", "role": "user", "content": "hi"}],
+        "stream": false
+    });
+    let settings = model_route_settings("gpt-5.6-luna", "", format!("http://{target_addr}/v1"));
+
+    let result = with_request_session_id(
+        Some("header-session-9".to_string()),
+        open_responses_proxy_request_with_settings(&request.to_string(), settings),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.status_code, 200);
+    let (headers, _) = target_server.await.unwrap();
+    let lower = headers.to_ascii_lowercase();
+    assert!(lower.contains("x-opencode-session: header-session-9"));
+    assert!(!lower.contains("x-opencode-session: cache-abc-123"));
 }
 
 #[tokio::test]
