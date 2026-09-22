@@ -1128,6 +1128,10 @@ async fn upstream_request_parts(
     // 任何 Responses/ChatCompletions 上游都只接受每个 call 一条结果，这里先合并再发送；
     // 这是历史合法性修复，不随 passthrough 策略关闭。
     merge_duplicate_tool_outputs(&mut request_json);
+    // 多代理消息投递路径会写入没有 call_id 的 function_call_output（Codex 客户端侧
+    // 的形状缺陷）。严格上游会直接 422 "input: missing field call_id" 把整个会话打死，
+    // chat 转换早已静默丢弃这类条目，Responses 路径也必须丢弃。
+    drop_tool_outputs_without_call_id(&mut request_json);
 
     // Custom-as-Function 开关（默认关闭）：按候选 profile 冻结适配计划。
     // passthrough 组合是显式配置冲突，发送前报错而不是静默忽略。
@@ -1415,6 +1419,30 @@ fn normalize_responses_item_id(item: &mut Value, strict_prefixes: bool) {
         return;
     };
     item["id"] = json!(format!("{prefix}{suffix}"));
+}
+
+/// 多代理消息投递会在历史里留下没有 call_id 的 function_call_output / custom_tool_call_output。
+/// Responses 上游要求每个 output 都带 call_id（实测 api.deepseek.com 直接返回
+/// 422 "Failed to deserialize ... input: missing field call_id"），而 chat 转换路径本来就
+/// 丢弃这类条目，所以这里统一在发送前剔除。
+fn drop_tool_outputs_without_call_id(body: &mut Value) -> usize {
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let before = items.len();
+    items.retain(|item| {
+        let is_output = matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("function_call_output" | "custom_tool_call_output")
+        );
+        if !is_output {
+            return true;
+        }
+        item.get("call_id")
+            .and_then(Value::as_str)
+            .is_some_and(|call_id| !call_id.is_empty())
+    });
+    before.saturating_sub(items.len())
 }
 
 fn merge_duplicate_tool_outputs(body: &mut Value) {
@@ -6679,6 +6707,42 @@ mod responses_reasoning_policy_tests {
                 {"type": "custom_tool_call", "id": "ctc_custom", "call_id": "call-2", "name": "exec", "input": "pwd"}
             ])
         );
+    }
+
+    #[test]
+    fn tool_outputs_without_call_id_are_dropped() {
+        let mut actual = json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "before"},
+                {
+                    "type": "function_call_output",
+                    "id": "fco_orphan",
+                    "name": "send_message_to_thread",
+                    "output": "subagent message"
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "id": "ctco_orphan",
+                    "output": "orphan"
+                },
+                {"type": "function_call", "id": "fc_ok", "call_id": "call_ok", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call_output", "id": "fco_ok", "call_id": "call_ok", "output": "done"},
+                {"type": "message", "role": "user", "content": "after"}
+            ]
+        });
+
+        assert_eq!(drop_tool_outputs_without_call_id(&mut actual), 2);
+        assert_eq!(
+            actual["input"],
+            json!([
+                {"type": "message", "role": "user", "content": "before"},
+                {"type": "function_call", "id": "fc_ok", "call_id": "call_ok", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call_output", "id": "fco_ok", "call_id": "call_ok", "output": "done"},
+                {"type": "message", "role": "user", "content": "after"}
+            ])
+        );
+        // 已经合法的历史必须保持原样（包括空 input / 非数组 input 的幂等性）。
+        assert_eq!(drop_tool_outputs_without_call_id(&mut actual), 0);
     }
 
     #[test]

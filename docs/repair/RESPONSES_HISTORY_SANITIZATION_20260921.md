@@ -159,3 +159,35 @@ Build: dist/windows/app/codex-plus-plus.exe sha256
 0D2EF44A3C091941EE56B54CF10CE8D3B2818E70ABCA88ACE7F40FD038C619A6,
 dist/windows/app/codex-plus-plus-manager.exe sha256
 F6540F5E9B00DB5DFF3512F134B0FA37E35FD74147D0D9DBDBCBA5C62B3F4212.
+
+## Follow-up: tool outputs without call_id (2026-09-22)
+
+Symptom: thread 01a0c78b died with 422 from the DeepSeek Responses endpoint -
+"Failed to deserialize the JSON body into the target type: input: missing field
+call_id at line 1 column 671252" - and every retry failed the same way.
+
+Root cause: the inter-agent message delivery path writes a function_call_output
+item without call_id into the client history. In the affected rollout the item
+appears right after a subagent message was delivered (item id fco_01a0c795-...,
+name send_message_to_thread, no call_id), and the strict DeepSeek endpoint rejects
+the whole request. Reproduced directly against api.deepseek.com/v1/responses: a
+body containing {"type":"function_call_output","name":"send_message_to_thread",
+"output":"hello"} without call_id returns 422 with exactly that message, while the
+same body with call_id passes that validation. The ChatCompletions converter
+already dropped such items; only the Responses path forwarded them verbatim.
+
+Change: drop_tool_outputs_without_call_id runs next to the duplicate-output
+merge in upstream_request_parts, before the Responses/ChatCompletions split, and
+removes function_call_output / custom_tool_call_output items whose call_id is
+missing or empty. Everything else in the history is untouched, and the payload is
+not re-serialized when no such item exists.
+
+Verification: cargo test -p codex-plus-core --test protocol_proxy => 111 passed,
+0 failed, 1 ignored; cargo test -p codex-plus-core --lib => 381 passed. New tests
+cover the drop helper (both item types, keeps valid outputs and messages) and a
+socket-level request that must reach the upstream without the orphan item.
+
+Build: dist/windows/app/codex-plus-plus.exe sha256
+20492411241768D42E762ACD4F454310FD4A22AC6599566CF809DAEA55DC609C,
+dist/windows/app/codex-plus-plus-manager.exe sha256
+FA6007D24DDC0FDA617CDAD4ECB6F7692D2B05857C02FC02F45429AE5FA58AF5.

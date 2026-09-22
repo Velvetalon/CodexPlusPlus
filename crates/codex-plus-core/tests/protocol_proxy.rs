@@ -2767,6 +2767,49 @@ fn namespace_sse_rewriter_restores_prefixed_collaboration_call_without_map() {
 }
 
 #[tokio::test]
+async fn responses_proxy_drops_tool_outputs_without_call_id() {
+    // 复现真实事故：多代理消息投递在历史里留下没有 call_id 的 function_call_output，
+    // 严格上游（api.deepseek.com/v1/responses）会整包 422 拒绝。
+    let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let target_server = tokio::spawn(capture_json_request_once(target));
+    let request = json!({
+        "model": "gpt-5.6-luna",
+        "input": [
+            {"type": "message", "id": "msg_keep", "role": "user", "content": "continue"},
+            {"type": "function_call", "id": "fc_ok", "call_id": "call_ok", "name": "wait", "arguments": "{}"},
+            {"type": "function_call_output", "id": "fco_ok", "call_id": "call_ok", "output": "done"},
+            {
+                "type": "function_call_output",
+                "id": "fco_orphan",
+                "name": "send_message_to_thread",
+                "output": "subagent message landed without a call id"
+            }
+        ],
+        "stream": false
+    });
+    let settings = model_route_settings("gpt-5.6-luna", "", format!("http://{target_addr}/v1"));
+
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+    let (_, upstream_body) = target_server.await.unwrap();
+    let items = upstream_body["input"].as_array().unwrap();
+
+    assert_eq!(items.len(), 3);
+    assert!(items.iter().all(|item| item["id"] != "fco_orphan"));
+    assert!(items.iter().all(|item| {
+        item["type"] != "function_call_output"
+            || item["call_id"].as_str().is_some_and(|value| !value.is_empty())
+    }));
+    assert_eq!(items[0]["id"], "msg_keep");
+    assert_eq!(items[2]["id"], "fco_ok");
+}
+
+#[tokio::test]
 async fn model_route_preserves_responses_compact_endpoint() {
     let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
