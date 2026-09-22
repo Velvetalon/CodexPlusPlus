@@ -347,6 +347,10 @@ pub struct UpstreamProxyResponse {
     /// 请求级 Custom-as-Function 适配计划；开关关闭时为 None，所有响应路径退回既有行为。
     pub custom_adapter: Option<crate::custom_tool_adapter::CustomToolAdapterPlan>,
     pub response: reqwest::Response,
+    /// 诊断日志用：真正接收本次请求的上游身份。
+    pub relay_id: String,
+    pub relay_name: String,
+    pub endpoint: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -868,6 +872,9 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 namespace_tools,
                 custom_adapter,
                 response: upstream,
+                relay_id: relay.id.clone(),
+                relay_name: relay.name.clone(),
+                endpoint: endpoint.clone(),
             });
         }
         let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -975,7 +982,7 @@ pub async fn open_models_proxy_request(
         &relay.user_agent,
         original_user_agent,
     ))?
-    .get(endpoint);
+    .get(endpoint.clone());
     let upstream = send_upstream_request(with_relay_auth(request, &relay)).await?;
     let status_code = upstream.status().as_u16();
     let content_type = upstream
@@ -984,7 +991,6 @@ pub async fn open_models_proxy_request(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/json; charset=utf-8")
         .to_string();
-
     Ok(UpstreamProxyResponse {
         status_code,
         is_stream: false,
@@ -994,6 +1000,9 @@ pub async fn open_models_proxy_request(
         namespace_tools: BTreeMap::new(),
         custom_adapter: None,
         response: upstream,
+        relay_id: relay.id.clone(),
+        relay_name: relay.name.clone(),
+        endpoint: endpoint.clone(),
     })
 }
 
@@ -1025,7 +1034,7 @@ pub async fn open_audio_transcriptions_proxy_request(
         &relay.user_agent,
         original_user_agent,
     ))?
-    .post(endpoint)
+    .post(endpoint.clone())
     .header(reqwest::header::CONTENT_TYPE, content_type)
     .body(body.to_vec());
     let upstream = send_upstream_request(with_relay_auth(request, &relay)).await?;
@@ -1036,7 +1045,6 @@ pub async fn open_audio_transcriptions_proxy_request(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/json; charset=utf-8")
         .to_string();
-
     Ok(UpstreamProxyResponse {
         status_code,
         is_stream: false,
@@ -1046,6 +1054,9 @@ pub async fn open_audio_transcriptions_proxy_request(
         namespace_tools: BTreeMap::new(),
         custom_adapter: None,
         response: upstream,
+        relay_id: relay.id.clone(),
+        relay_name: relay.name.clone(),
+        endpoint: endpoint.clone(),
     })
 }
 
@@ -1103,6 +1114,9 @@ pub async fn open_chat_completions_proxy_request(
         namespace_tools: BTreeMap::new(),
         custom_adapter: None,
         response: upstream,
+        relay_id: relay.id.clone(),
+        relay_name: relay.name.clone(),
+        endpoint: chat_completions_url(&relay.base_url),
     })
 }
 
@@ -2124,6 +2138,8 @@ pub struct ResponsesReasoningSseRewriter {
     buffer: Vec<u8>,
     seen_items: BTreeSet<String>,
     announced: BTreeSet<String>,
+    last_usage: Option<Value>,
+    saw_completed: bool,
 }
 
 impl ResponsesReasoningSseRewriter {
@@ -2152,6 +2168,14 @@ impl ResponsesReasoningSseRewriter {
 
     pub fn finish(&mut self) -> Vec<u8> {
         self.finish_with_truncation().0
+    }
+
+    pub fn last_usage(&self) -> Option<&Value> {
+        self.last_usage.as_ref()
+    }
+
+    pub fn saw_completed(&self) -> bool {
+        self.saw_completed
     }
 
     /// 收尾与 namespace 侧一致：完整但缺结尾空行的最后一帧照常处理，
@@ -2187,8 +2211,15 @@ impl ResponsesReasoningSseRewriter {
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or_default()
-            .to_string();
+        .to_string();
         match kind.as_str() {
+            "response.completed" | "response.incomplete" | "response.failed" => {
+                self.saw_completed = true;
+                if let Some(usage) = value.get("usage").filter(|usage| usage.is_object()) {
+                    self.last_usage = Some(usage.clone());
+                }
+                frame.to_vec()
+            }
             "response.output_item.added" => {
                 if value.pointer("/item/type").and_then(Value::as_str) != Some("reasoning") {
                     return frame.to_vec();

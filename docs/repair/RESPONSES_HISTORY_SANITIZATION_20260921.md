@@ -191,3 +191,26 @@ Build: dist/windows/app/codex-plus-plus.exe sha256
 20492411241768D42E762ACD4F454310FD4A22AC6599566CF809DAEA55DC609C,
 dist/windows/app/codex-plus-plus-manager.exe sha256
 FA6007D24DDC0FDA617CDAD4ECB6F7692D2B05857C02FC02F45429AE5FA58AF5.
+
+## Follow-up: upstream usage observability (2026-09-22)
+
+While comparing the official DeepSeek profile with the krill coding relay, local
+session token_count data showed krill caching only 11%-50% of a 390k-token agent
+history while the official profile commonly cached 98%+. The proxy previously had
+no upstream-side usage record, so billing claims could not be separated from
+request-shape differences.
+
+Change: UpstreamProxyResponse now carries the selected relay id/name/endpoint, and
+the Responses SSE pipeline records a protocol_proxy.upstream_stream_usage event
+after the stream completes. The event stores the usage object from the terminal
+response.completed / response.incomplete / response.failed frame, whether such a
+frame was seen, and the selected relay. This is observability only: request and
+response payloads are unchanged.
+
+Verification: cargo test -p codex-plus-core --test protocol_proxy => 111 passed,
+0 failed, 1 ignored; cargo test -p codex-plus-core --lib => 381 passed.
+
+Build: dist/windows/app/codex-plus-plus.exe sha256
+E1A3FF1B60FF67A7697BE0ED5980293EA214D19BDF8DA7B5676DA5227F08E5AC,
+dist/windows/app/codex-plus-plus-manager.exe sha256
+6D600B7BAF6700ED0AE9CE68BF40F7E470EB9ED7CF9A9FA6E84131EEA9ECCA47.

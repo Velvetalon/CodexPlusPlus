@@ -1622,6 +1622,9 @@ async fn handle_protocol_proxy_connection(
         stream.shutdown().await?;
         return Ok(());
     }
+    // 临时（只读）观测：把上游 SSE completed 帧里的 usage 记进诊断日志，便于对比
+    // DeepSeek 官方 / krill 两条链路的真实计费口径与缓存命中。
+    // TODO: 改 UpstreamProxyResponse 结构后从 open_* 返回正式 relay 元数据。
     if upstream.is_stream {
         write_http_stream_headers(stream, "200 OK", "text/event-stream; charset=utf-8").await?;
         if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
@@ -1705,6 +1708,17 @@ async fn handle_protocol_proxy_connection(
                 stream.shutdown().await?;
                 return Ok(());
             }
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "protocol_proxy.upstream_stream_usage",
+                json!({
+                    "relayId": upstream.relay_id,
+                    "relayName": upstream.relay_name,
+                    "endpoint": upstream.endpoint,
+                    "wireApi": "responses",
+                    "upstreamUsage": reasoning_agents.last_usage(),
+                    "sawCompleted": reasoning_agents.saw_completed()
+                }),
+            );
             if native_truncated || namespace_truncated || custom_truncated || reasoning_truncated {
                 // EOF 处半帧：丢弃并明确报告截断，不把截断当成正常完成。
                 let _ = crate::diagnostic_log::append_diagnostic_log(
