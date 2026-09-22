@@ -2317,53 +2317,7 @@ fn upstream_request_builder(
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .header(reqwest::header::CACHE_CONTROL, "no-cache");
     }
-    if let Some(session_id) = upstream_session_id(endpoint, upstream_body) {
-        builder = builder.header("x-opencode-session", session_id);
-    }
     builder.json(upstream_body)
-}
-
-tokio::task_local! {
-    /// Codex 客户端自带的会话 id（session_id / x-opencode-session 请求头）。
-    /// OpenCode Go 要求每个请求带 x-opencode-session 才能稳定路由与复用缓存，
-    /// 这里按任务透传，避免改动整条函数签名。
-    static REQUEST_SESSION_ID: String;
-}
-
-/// 在代理处理期间登记客户端会话 id，供上游请求头使用。
-pub async fn with_request_session_id<T>(
-    session_id: Option<String>,
-    future: impl std::future::Future<Output = T>,
-) -> T {
-    match session_id
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
-        Some(session_id) => REQUEST_SESSION_ID.scope(session_id, future).await,
-        None => future.await,
-    }
-}
-
-fn current_request_session_id() -> Option<String> {
-    REQUEST_SESSION_ID.try_with(|value| value.clone()).ok()
-}
-
-/// 会话 id 优先级：客户端请求头 > 请求体里的 prompt_cache_key（Codex 用它做会话级缓存键）。
-fn upstream_session_id(endpoint: &str, body: &Value) -> Option<String> {
-    let session_id = current_request_session_id().or_else(|| {
-        body.get("prompt_cache_key")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-    });
-    if session_id.is_none() && endpoint.contains("opencode.ai") {
-        let _ = crate::diagnostic_log::append_diagnostic_log(
-            "protocol_proxy.opencode_session_missing",
-            json!({ "endpoint": endpoint }),
-        );
-    }
-    session_id
 }
 
 fn validate_upstream(relay: &crate::settings::RelayProfile) -> anyhow::Result<()> {
