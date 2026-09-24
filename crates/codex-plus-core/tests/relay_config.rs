@@ -12,9 +12,10 @@ use codex_plus_core::relay_config::{
     relay_config_status_from_home, relay_profile_api_key, sanitize_common_config_contents,
     set_codex_goals_feature_in_home, strip_common_config_from_config,
     sync_live_config_context_entries, upsert_context_entry_in_common_config,
+    catalog_needs_code_mode,
 };
 use codex_plus_core::settings::{
-    RelayMode, RelayModelRoute, RelayProfile, RelayProtocol, RelaySessionProvider,
+    CatalogToolMode, RelayMode, RelayModelRoute, RelayProfile, RelayProtocol, RelaySessionProvider,
 };
 
 fn write_remote_plugin_marketplace_snapshot(home: &std::path::Path) {
@@ -4451,6 +4452,117 @@ base_url = "https://api.deepseek.com/"
     )
     .unwrap();
     assert_eq!(catalog["models"][0]["tool_mode"], "code_mode_only");
+}
+
+fn code_mode_catalog_profile(
+    id: &str,
+    custom_tools_as_functions: bool,
+    catalog_tool_mode: CatalogToolMode,
+) -> RelayProfile {
+    RelayProfile {
+        id: id.to_string(),
+        name: "Code mode relay".to_string(),
+        model: "gpt-6-luna".to_string(),
+        base_url: "https://relay.example/v1".to_string(),
+        upstream_base_url: "https://relay.example/v1".to_string(),
+        protocol: RelayProtocol::Responses,
+        relay_mode: RelayMode::PureApi,
+        custom_tools_as_functions,
+        catalog_tool_mode,
+        config_contents: r#"model = "gpt-6-luna"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "https://relay.example/v1"
+experimental_bearer_token = "sk-test"
+"#
+        .to_string(),
+        auth_contents: r#"{"OPENAI_API_KEY":"sk-test"}"#.to_string(),
+        // catalog 只在模型列表带窗口后缀时生成（见 apply_relay_profile_no_catalog_when_model_list_has_no_suffix）。
+        model_list: "gpt-6-luna[1M]".to_string(),
+        ..RelayProfile::default()
+    }
+}
+
+fn catalog_tool_mode_for(profile: &RelayProfile, home: &std::path::Path) -> serde_json::Value {
+    apply_relay_profile_files_to_home_with_context(home, profile, "").unwrap();
+    let catalog_path = home
+        .join("model-catalogs")
+        .join(format!("{}.json", profile.id));
+    serde_json::from_str(&std::fs::read_to_string(catalog_path).unwrap()).unwrap()
+}
+
+/// 包装开关必须同时决定 catalog 的 tool_mode：客户端保持 code-mode 才会声明 custom 工具，
+/// 代理才有东西可以包成 function。缺了后半截就会出现 `unsupported call: exec`。
+#[test]
+fn custom_tools_as_functions_stamps_code_mode_catalog() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile = code_mode_catalog_profile("relay-cm", true, CatalogToolMode::Auto);
+    let catalog = catalog_tool_mode_for(&profile, temp.path());
+    assert_eq!(catalog["models"][0]["tool_mode"], "code_mode_only");
+}
+
+#[test]
+fn catalog_tool_mode_auto_without_wrapping_stays_standard() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile = code_mode_catalog_profile("relay-std", false, CatalogToolMode::Auto);
+    let catalog = catalog_tool_mode_for(&profile, temp.path());
+    assert!(catalog["models"][0].get("tool_mode").is_none());
+}
+
+#[test]
+fn explicit_catalog_tool_mode_overrides_wrapping() {
+    let temp = tempfile::tempdir().unwrap();
+    let standard = code_mode_catalog_profile("relay-force-std", true, CatalogToolMode::Standard);
+    assert!(
+        catalog_tool_mode_for(&standard, temp.path())["models"][0]
+            .get("tool_mode")
+            .is_none()
+    );
+
+    let forced = code_mode_catalog_profile("relay-force-cm", false, CatalogToolMode::CodeModeOnly);
+    assert_eq!(
+        catalog_tool_mode_for(&forced, temp.path())["models"][0]["tool_mode"],
+        "code_mode_only"
+    );
+}
+
+/// 走 model route 时真正包装的是目标 relay，所以只要路由目标会包装，源 profile 也要 code-mode。
+#[test]
+fn catalog_needs_code_mode_follows_model_route_targets() {
+    let source = RelayProfile {
+        id: "source".to_string(),
+        model_routes: vec![RelayModelRoute {
+            model: "gpt-6-luna".to_string(),
+            target_relay_id: "target".to_string(),
+            target_model: "glm-5.3".to_string(),
+            enabled: true,
+            restore_at: None,
+        }],
+        ..RelayProfile::default()
+    };
+    let wrapping_target = RelayProfile {
+        id: "target".to_string(),
+        custom_tools_as_functions: true,
+        ..RelayProfile::default()
+    };
+    let plain_target = RelayProfile {
+        id: "target".to_string(),
+        ..RelayProfile::default()
+    };
+
+    assert!(catalog_needs_code_mode(
+        &source,
+        std::slice::from_ref(&wrapping_target)
+    ));
+    assert!(!catalog_needs_code_mode(
+        &source,
+        std::slice::from_ref(&plain_target)
+    ));
+    assert!(!catalog_needs_code_mode(&source, &[]));
 }
 
 #[test]

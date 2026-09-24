@@ -1839,7 +1839,10 @@ fn apply_model_catalog_to_config(
         custom_responses.then_some(false),
         official_deepseek_responses,
     );
-    let catalog_json = if official_deepseek_responses {
+    // 兼容契约的两半必须同时成立：代理把 custom 工具包成 function 发给上游（包装），
+    // 客户端就得保持 code-mode 继续声明 custom 工具（catalog 写 code_mode_only）。
+    // 缺失后者的表现是 harness 发出 exec，而客户端 router 只注册了 exec_command。
+    let catalog_json = if catalog_needs_code_mode(profile, &[]) {
         force_code_mode_catalog_tool_mode(&catalog_json)
     } else {
         catalog_json
@@ -1862,6 +1865,36 @@ pub(crate) fn uses_official_deepseek_responses(profile: &RelayProfile) -> bool {
     ]
     .iter()
     .any(|base_url| deepseek_api_base_url(base_url))
+}
+
+/// 该 profile 的模型目录是否需要写 `tool_mode = code_mode_only`。
+///
+/// auto 跟随「会不会做 custom→function 包装」：profile 自身开了包装、或路由到会包装的
+/// 目标 relay，都算。relays 传空切片时只看 profile 自身（核心 apply 路径没有全局设置）；
+/// manager 在应用前用同一函数把结果固化到 profile.catalog_tool_mode，从而覆盖路由场景。
+pub fn catalog_needs_code_mode(profile: &RelayProfile, relays: &[RelayProfile]) -> bool {
+    match profile.catalog_tool_mode {
+        crate::settings::CatalogToolMode::Auto => {
+            let own_wraps =
+                uses_official_deepseek_responses(profile) || profile.custom_tools_as_functions;
+            own_wraps
+                || profile
+                    .model_routes
+                    .iter()
+                    .filter(|route| route.enabled)
+                    .any(|route| {
+                        relays
+                            .iter()
+                            .find(|candidate| candidate.id == route.target_relay_id)
+                            .is_some_and(|target| {
+                                uses_official_deepseek_responses(target)
+                                    || target.custom_tools_as_functions
+                            })
+                    })
+        }
+        crate::settings::CatalogToolMode::CodeModeOnly => true,
+        crate::settings::CatalogToolMode::Standard => false,
+    }
 }
 
 fn deepseek_api_base_url(base_url: &str) -> bool {

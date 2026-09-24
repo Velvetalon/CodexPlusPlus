@@ -214,3 +214,43 @@ Build: dist/windows/app/codex-plus-plus.exe sha256
 E1A3FF1B60FF67A7697BE0ED5980293EA214D19BDF8DA7B5676DA5227F08E5AC,
 dist/windows/app/codex-plus-plus-manager.exe sha256
 6D600B7BAF6700ED0AE9CE68BF40F7E470EB9ED7CF9A9FA6E84131EEA9ECCA47.
+
+## Follow-up: catalog tool_mode merged into the wrapping switch (2026-09-24)
+
+Symptom: every `exec` call in Codex died with
+`codex_core::tools::router: unsupported call: exec`. First occurrence 2026-09-23
+02:07Z, 35 recorded failures, only in threads whose model resolved to a
+Codex++-synthetic slug (`deepseek-flash`, `glm-5.3*`, `gpt-6-*`).
+
+Evidence: a pass-through probe in front of the upstream captured the request the
+client actually sends - the tool list contains `exec_command`, `write_stdin`,
+`apply_patch`, the MCP/collaboration tools, and no `exec` at all. The agent
+harness still emits `exec`, and the router only registers what was declared.
+
+Root cause: the two halves of one compatibility contract were configured in
+different places. The proxy half is `RelayProfile::custom_tools_as_functions`
+(plus the implicit force for official DeepSeek); the client half is
+`tool_mode: code_mode_only` in the generated model catalog. The catalog only ever
+got that field for profiles detected as official DeepSeek
+(`force_code_mode_catalog_tool_mode`), and `model_suffix.rs` never writes it
+otherwise, so any other slug fell back to the standard (unified exec) tool set
+while the harness kept calling `exec`.
+
+Change: `RelayProfile` gains `catalogToolMode` (`auto` | `codeModeOnly` |
+`standard`, default `auto`). `relay_config::catalog_needs_code_mode` resolves
+`auto` to "profile wraps custom tools (official DeepSeek or customToolsAsFunctions)
+OR any enabled model route targets a relay that wraps", and the catalog generation
+stamps `tool_mode = code_mode_only` on that basis. The manager apply path and
+relay switch pre-resolve the value with the full relay list so route targets count;
+the explicit values let a profile opt out (e.g. upstreams that only accept the
+standard tool set).
+
+Verification: `cargo test -p codex-plus-core --test relay_config` => 148 passed
+(4 new: wrapping stamps code-mode, auto without wrapping stays standard, explicit
+override wins, route target drives the decision); `cargo test -p codex-plus-core
+--lib` => 381 passed; `cargo check -p codex-plus-manager --tests` clean.
+
+Build: dist/windows/app/codex-plus-plus.exe sha256
+F0C250DAFFB6B06441095C6E1ADDB4C7FC9B32A7101AF695C6F166E627905EF7,
+dist/windows/app/codex-plus-plus-manager.exe sha256
+0FAD3DC4C82EAF4328B3353BBA047DE0AE3A0542413AD06D81B210A4DA224301.

@@ -144,6 +144,12 @@ fn apply_selected_relay_profile(
     settings: &BackendSettings,
 ) -> anyhow::Result<RelaySwitchResult> {
     let relay = settings.active_relay_profile();
+    // catalog 的 tool_mode 与「是否包装 custom 工具」是同一个契约：这里把解析结果固化到
+    // profile，apply 阶段（拿不到全局设置）据此决定要不要写 code_mode_only。
+    let mut relay = relay;
+    if crate::relay_config::catalog_needs_code_mode(&relay, &settings.relay_profiles) {
+        relay.catalog_tool_mode = crate::settings::CatalogToolMode::CodeModeOnly;
+    }
     let common_config = relay_combined_common_config(settings);
     let result = if relay.relay_mode == RelayMode::Official && !relay.official_mix_api_key {
         let auth_contents =

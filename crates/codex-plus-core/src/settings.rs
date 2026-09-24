@@ -45,6 +45,12 @@ pub struct RelayProfile {
     /// 允许字段检查能看到它。
     #[serde(rename = "customToolsAsFunctions", default)]
     pub custom_tools_as_functions: bool,
+    /// 模型目录里的 tool_mode 由谁决定。customToolsAsFunctions 是把 custom 工具包成
+    /// function 发给上游（代理侧）；catalog 的 code_mode_only 是让客户端保持 code-mode、
+    /// 继续声明 custom 工具（客户端侧）。两者是同一个兼容契约的两半，默认由 auto 跟随
+    /// 包装开关（以及官方 DeepSeek 的强制包装）自动决定，需要时可用显式值覆盖。
+    #[serde(rename = "catalogToolMode", default)]
+    pub catalog_tool_mode: CatalogToolMode,
     #[serde(rename = "nativeAgentInterop", default)]
     pub native_agent_interop: NativeAgentInterop,
     #[serde(rename = "relayMode", default)]
@@ -256,6 +262,7 @@ impl Default for RelayProfile {
             responses_reasoning_policy: ResponsesReasoningPolicy::default(),
             responses_wire_policy: ResponsesWirePolicy::default(),
             custom_tools_as_functions: false,
+            catalog_tool_mode: CatalogToolMode::Auto,
             native_agent_interop: NativeAgentInterop::default(),
             relay_mode: RelayMode::Official,
             official_mix_api_key: false,
@@ -357,6 +364,29 @@ impl ResponsesWirePolicy {
         match self {
             Self::Compatible => "compatible",
             Self::Passthrough => "passthrough",
+        }
+    }
+}
+
+/// 模型目录的 tool_mode 策略。
+/// auto：跟随「是否会做 custom→function 包装」自动决定（默认）；
+/// codeModeOnly：强制客户端保持 code-mode（声明 custom 工具）；
+/// standard：强制标准工具模式（声明 exec_command/write_stdin 等 function 工具）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum CatalogToolMode {
+    #[default]
+    Auto,
+    CodeModeOnly,
+    Standard,
+}
+
+impl CatalogToolMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::CodeModeOnly => "codeModeOnly",
+            Self::Standard => "standard",
         }
     }
 }
@@ -795,6 +825,7 @@ impl BackendSettings {
                 responses_reasoning_policy: ResponsesReasoningPolicy::default(),
                 responses_wire_policy: ResponsesWirePolicy::default(),
                 custom_tools_as_functions: false,
+                catalog_tool_mode: CatalogToolMode::Auto,
                 native_agent_interop: NativeAgentInterop::default(),
                 relay_mode: RelayMode::MixedApi,
                 official_mix_api_key: true,
@@ -875,6 +906,7 @@ impl BackendSettings {
             responses_reasoning_policy: ResponsesReasoningPolicy::default(),
             responses_wire_policy: ResponsesWirePolicy::default(),
             custom_tools_as_functions: false,
+            catalog_tool_mode: CatalogToolMode::Auto,
             native_agent_interop: NativeAgentInterop::default(),
             relay_mode: RelayMode::Official,
             official_mix_api_key: false,
