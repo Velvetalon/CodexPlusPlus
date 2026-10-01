@@ -150,7 +150,11 @@ const DEEPSEEK_METADATA_JSON: &str = include_str!(concat!(
 ));
 
 pub fn requires_bundled_metadata_catalog(slug: &str) -> bool {
-    gpt56_metadata_entry(slug).is_some()
+    gpt56_metadata_entry(slug).is_some() || slug_starts_with_gpt(slug)
+}
+
+fn slug_starts_with_gpt(slug: &str) -> bool {
+    slug.len() >= 3 && slug[..3].eq_ignore_ascii_case("gpt")
 }
 
 pub fn model_ui_metadata(slug: &str) -> Option<Value> {
@@ -299,19 +303,33 @@ fn model_template_entry(slug: &str) -> (Value, bool) {
         return (entry, true);
     }
     if let Some(compatibility) = gpt56_metadata_entry(slug) {
-        let mut template = first_bundled_template_entry().unwrap_or_else(|| json!({}));
-        if let (Some(target), Some(source)) = (template.as_object_mut(), compatibility.as_object())
-        {
-            for (key, value) in source {
-                target.insert(key.clone(), value.clone());
-            }
-        }
+        return (overlay_gpt56_metadata(compatibility), true);
+    }
+    // gpt 前缀的自定义/改名模型没有官方元数据条目时，克隆 gpt-5.6-sol 的完整
+    // 元数据（low/medium/high/xhigh/max/ultra 全档位），否则思考档位只剩默认四档。
+    // 显示名/描述保持用户自己的模型名，不冒用官方模型名。
+    if slug_starts_with_gpt(slug)
+        && let Some(compatibility) = gpt56_metadata_entry("gpt-5.6-sol")
+    {
+        let mut template = overlay_gpt56_metadata(compatibility);
+        template["display_name"] = json!(slug);
+        template["description"] = json!(slug);
         return (template, true);
     }
     (
         first_bundled_template_entry().unwrap_or_else(|| json!({})),
         false,
     )
+}
+
+fn overlay_gpt56_metadata(compatibility: Value) -> Value {
+    let mut template = first_bundled_template_entry().unwrap_or_else(|| json!({}));
+    if let (Some(target), Some(source)) = (template.as_object_mut(), compatibility.as_object()) {
+        for (key, value) in source {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+    template
 }
 
 fn bundled_template_entry(slug: &str) -> Option<Value> {
