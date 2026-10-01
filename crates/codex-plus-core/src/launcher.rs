@@ -1622,6 +1622,9 @@ async fn handle_protocol_proxy_connection(
         stream.shutdown().await?;
         return Ok(());
     }
+    // 临时（只读）观测：把上游 SSE completed 帧里的 usage 记进诊断日志，便于对比
+    // DeepSeek 官方 / krill 两条链路的真实计费口径与缓存命中。
+    // TODO: 改 UpstreamProxyResponse 结构后从 open_* 返回正式 relay 元数据。
     if upstream.is_stream {
         write_http_stream_headers(stream, "200 OK", "text/event-stream; charset=utf-8").await?;
         if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
@@ -1636,6 +1639,10 @@ async fn handle_protocol_proxy_connection(
             let mut namespace_agents = crate::protocol_proxy::ResponsesNamespaceSseRewriter::new(
                 upstream.namespace_tools.clone(),
             );
+            // 上游兼容网关常省略 reasoning item 的 summary 注册事件，Codex 会因此
+            // 报 ReasoningSummaryDelta without active item 并丢弃整轮输出。
+            let mut reasoning_agents =
+                crate::protocol_proxy::ResponsesReasoningSseRewriter::default();
             let mut bytes_stream = upstream.response.bytes_stream();
             // R10：上游读取错误必须区分于正常完成；不再"出错就 break，随后记 stream_ok"。
             let mut stream_error: Option<String> = None;
@@ -1644,6 +1651,7 @@ async fn handle_protocol_proxy_connection(
                     Ok(bytes) => {
                         let bytes = custom_agents.push_bytes(&bytes);
                         let bytes = namespace_agents.push_bytes(&bytes);
+                        let bytes = reasoning_agents.push_bytes(&bytes);
                         let bytes = if let Some(rewriter) = &mut native_agents {
                             rewriter.push_bytes(&bytes)
                         } else {
@@ -1662,7 +1670,11 @@ async fn handle_protocol_proxy_connection(
             let (custom_tail, custom_truncated) = custom_agents.finish_with_truncation();
             let pushed_custom_tail = namespace_agents.push_bytes(&custom_tail);
             let (namespace_tail, namespace_truncated) = namespace_agents.finish_with_truncation();
-            let namespace_tail = [pushed_custom_tail, namespace_tail].concat();
+            let pushed_reasoning_tail =
+                reasoning_agents.push_bytes(&[pushed_custom_tail, namespace_tail].concat());
+            let (reasoning_tail, reasoning_truncated) =
+                reasoning_agents.finish_with_truncation();
+            let namespace_tail = [pushed_reasoning_tail, reasoning_tail].concat();
             let (tail, native_truncated) = if let Some(rewriter) = &mut native_agents {
                 let mut tail = rewriter.push_bytes(&namespace_tail);
                 let (native_tail, truncated) = rewriter.finish_with_truncation();
@@ -1696,7 +1708,18 @@ async fn handle_protocol_proxy_connection(
                 stream.shutdown().await?;
                 return Ok(());
             }
-            if native_truncated || namespace_truncated || custom_truncated {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "protocol_proxy.upstream_stream_usage",
+                json!({
+                    "relayId": upstream.relay_id,
+                    "relayName": upstream.relay_name,
+                    "endpoint": upstream.endpoint,
+                    "wireApi": "responses",
+                    "upstreamUsage": reasoning_agents.last_usage(),
+                    "sawCompleted": reasoning_agents.saw_completed()
+                }),
+            );
+            if native_truncated || namespace_truncated || custom_truncated || reasoning_truncated {
                 // EOF 处半帧：丢弃并明确报告截断，不把截断当成正常完成。
                 let _ = crate::diagnostic_log::append_diagnostic_log(
                     "helper.protocol_proxy_stream_failed",

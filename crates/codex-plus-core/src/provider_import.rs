@@ -191,6 +191,7 @@ fn relay_profile_from_request(
         responses_reasoning_policy: Default::default(),
         responses_wire_policy: Default::default(),
         custom_tools_as_functions: false,
+        catalog_tool_mode: Default::default(),
         native_agent_interop: Default::default(),
         relay_mode: relay_mode(&request.relay_mode),
         official_mix_api_key: false,

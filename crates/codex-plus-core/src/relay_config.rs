@@ -1839,6 +1839,14 @@ fn apply_model_catalog_to_config(
         custom_responses.then_some(false),
         official_deepseek_responses,
     );
+    // 兼容契约的两半必须同时成立：代理把 custom 工具包成 function 发给上游（包装），
+    // 客户端就得保持 code-mode 继续声明 custom 工具（catalog 写 code_mode_only）。
+    // 缺失后者的表现是 harness 发出 exec，而客户端 router 只注册了 exec_command。
+    let catalog_json = if catalog_needs_code_mode(profile, &[]) {
+        force_code_mode_catalog_tool_mode(&catalog_json)
+    } else {
+        catalog_json
+    };
     std::fs::write(&catalog_path, catalog_json)?;
     let mut doc = parse_toml_document(&config_text)?;
     doc["model_catalog_json"] = toml_edit::value(catalog_relative);
@@ -1859,6 +1867,36 @@ pub(crate) fn uses_official_deepseek_responses(profile: &RelayProfile) -> bool {
     .any(|base_url| deepseek_api_base_url(base_url))
 }
 
+/// 该 profile 的模型目录是否需要写 `tool_mode = code_mode_only`。
+///
+/// auto 跟随「会不会做 custom→function 包装」：profile 自身开了包装、或路由到会包装的
+/// 目标 relay，都算。relays 传空切片时只看 profile 自身（核心 apply 路径没有全局设置）；
+/// manager 在应用前用同一函数把结果固化到 profile.catalog_tool_mode，从而覆盖路由场景。
+pub fn catalog_needs_code_mode(profile: &RelayProfile, relays: &[RelayProfile]) -> bool {
+    match profile.catalog_tool_mode {
+        crate::settings::CatalogToolMode::Auto => {
+            let own_wraps =
+                uses_official_deepseek_responses(profile) || profile.custom_tools_as_functions;
+            own_wraps
+                || profile
+                    .model_routes
+                    .iter()
+                    .filter(|route| route.enabled)
+                    .any(|route| {
+                        relays
+                            .iter()
+                            .find(|candidate| candidate.id == route.target_relay_id)
+                            .is_some_and(|target| {
+                                uses_official_deepseek_responses(target)
+                                    || target.custom_tools_as_functions
+                            })
+                    })
+        }
+        crate::settings::CatalogToolMode::CodeModeOnly => true,
+        crate::settings::CatalogToolMode::Standard => false,
+    }
+}
+
 fn deepseek_api_base_url(base_url: &str) -> bool {
     let host = base_url
         .trim()
@@ -1874,6 +1912,23 @@ fn deepseek_api_base_url(base_url: &str) -> bool {
         .trim_end_matches('.')
         .to_ascii_lowercase();
     host == "deepseek.com" || host.ends_with(".deepseek.com")
+}
+
+fn force_code_mode_catalog_tool_mode(catalog_json: &str) -> String {
+    let Ok(mut catalog) = serde_json::from_str::<Value>(catalog_json) else {
+        return catalog_json.to_string();
+    };
+    if let Some(models) = catalog.get_mut("models").and_then(Value::as_array_mut) {
+        for model in models {
+            if let Some(object) = model.as_object_mut() {
+                object.insert(
+                    "tool_mode".to_string(),
+                    Value::String("code_mode_only".to_string()),
+                );
+            }
+        }
+    }
+    serde_json::to_string_pretty(&catalog).unwrap_or_else(|_| catalog_json.to_string())
 }
 
 pub fn apply_deepseek_responses_compatibility(
@@ -1894,7 +1949,8 @@ pub fn apply_deepseek_responses_compatibility(
         .get_mut("features")
         .and_then(Item::as_table_like_mut)
         .expect("features table-like item was created above");
-    features.insert("code_mode_only", toml_edit::value(false));
+    features.insert("unified_exec", toml_edit::value(true));
+    features.insert("code_mode_only", toml_edit::value(true));
     if features
         .get("code_mode")
         .and_then(Item::as_table_like)
@@ -1906,7 +1962,7 @@ pub fn apply_deepseek_responses_compatibility(
         .get_mut("code_mode")
         .and_then(Item::as_table_like_mut)
         .expect("code_mode table-like item was created above")
-        .insert("enabled", toml_edit::value(false));
+        .insert("enabled", toml_edit::value(true));
     Ok(normalize_optional_toml(doc))
 }
 

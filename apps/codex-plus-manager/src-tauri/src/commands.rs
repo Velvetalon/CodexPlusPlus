@@ -825,6 +825,10 @@ pub(crate) fn sync_active_relay_to_home(
         );
     }
     if relay_has_complete_files(&relay) {
+        let mut relay = relay;
+        if codex_plus_core::relay_config::catalog_needs_code_mode(&relay, &settings.relay_profiles) {
+            relay.catalog_tool_mode = codex_plus_core::settings::CatalogToolMode::CodeModeOnly;
+        }
         return codex_plus_core::relay_config::apply_relay_profile_to_home_with_switch_rules(
             home,
             &relay,
@@ -5139,6 +5143,10 @@ pub fn apply_relay_injection() -> CommandResult<RelayPayload> {
     prepare_codex_app_state_before_provider_switch(&home, "manager.apply_relay_injection.before");
     let relay = settings.active_relay_profile();
     log_relay_apply_request("manager.apply_relay_injection", &settings, &relay);
+    let mut relay = relay;
+    if codex_plus_core::relay_config::catalog_needs_code_mode(&relay, &settings.relay_profiles) {
+        relay.catalog_tool_mode = codex_plus_core::settings::CatalogToolMode::CodeModeOnly;
+    }
     if let Some(aggregate) = settings.active_aggregate_relay_profile() {
         let response =
             apply_aggregate_relay_injection_to_home(&home, &settings, aggregate.session_provider);
@@ -5305,6 +5313,10 @@ pub fn apply_pure_api_injection() -> CommandResult<RelayPayload> {
     );
     let relay = settings.active_relay_profile();
     log_relay_apply_request("manager.apply_pure_api_injection", &settings, &relay);
+    let mut relay = relay;
+    if codex_plus_core::relay_config::catalog_needs_code_mode(&relay, &settings.relay_profiles) {
+        relay.catalog_tool_mode = codex_plus_core::settings::CatalogToolMode::CodeModeOnly;
+    }
     if relay_has_complete_files(&relay) {
         return match codex_plus_core::relay_config::apply_relay_profile_to_home_with_switch_rules(
             &home,

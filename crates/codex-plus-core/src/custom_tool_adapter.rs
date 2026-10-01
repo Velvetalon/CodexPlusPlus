@@ -316,8 +316,8 @@ fn wrap_custom_tool_declaration(tool: &Value, wire_name: &str) -> Result<Value, 
     }))
 }
 
-/// 历史 custom 调用/结果 → function 调用/结果。`call_id` 与既有 item id 原样保留
-/// （ID 规范化已在更早的管线步骤完成），只有类型、name 与 input/arguments 变化。
+/// 历史 custom 调用/结果 → function 调用/结果。`call_id` 原样保留；item id 则进入
+/// function 形态的 `fc_`/`fco_` 命名空间，因为 OpenAI Responses 会校验历史 item id 前缀。
 fn convert_history_items(body: &mut Value) -> Result<(), AdapterError> {
     let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
         return Ok(());
@@ -347,6 +347,12 @@ fn convert_history_items(body: &mut Value) -> Result<(), AdapterError> {
                 let arguments = serde_json::to_string(&serde_json::json!({ "input": input_text }))
                     .unwrap_or_default();
                 let object = item.as_object_mut().expect("custom_tool_call 必须是对象");
+                if let Some(id) = object.get("id").and_then(Value::as_str) {
+                    let mapped = function_item_id(id, "fc_");
+                    if mapped != id {
+                        object.insert("id".to_string(), Value::String(mapped));
+                    }
+                }
                 object.insert("type".to_string(), Value::String("function_call".into()));
                 object.insert("name".to_string(), Value::String(name));
                 object.insert("arguments".to_string(), Value::String(arguments));
@@ -354,6 +360,12 @@ fn convert_history_items(body: &mut Value) -> Result<(), AdapterError> {
             }
             Some("custom_tool_call_output") => {
                 let object = item.as_object_mut().expect("custom_tool_call_output 必须是对象");
+                if let Some(id) = object.get("id").and_then(Value::as_str) {
+                    let mapped = function_item_id(id, "fco_");
+                    if mapped != id {
+                        object.insert("id".to_string(), Value::String(mapped));
+                    }
+                }
                 object.insert(
                     "type".to_string(),
                     Value::String("function_call_output".into()),
@@ -363,6 +375,17 @@ fn convert_history_items(body: &mut Value) -> Result<(), AdapterError> {
         }
     }
     Ok(())
+}
+
+/// OpenAI Responses 的 function history item id 有硬编码前缀校验。客户端 custom
+/// 项可能来自本适配器（ctc_/ctco_）、旧版本（fc_/fco_）或外部实现（item_/ct_ 等）；
+/// 统一去除已知来源前缀后重打目标前缀，避免每遇到一个来源就补一处补丁。
+fn function_item_id(id: &str, target_prefix: &str) -> String {
+    let suffix = ["fc_", "fco_", "ctc_", "ctco_", "item_", "ct_"]
+        .iter()
+        .find_map(|prefix| id.strip_prefix(prefix))
+        .unwrap_or(id);
+    format!("{target_prefix}{suffix}")
 }
 
 /// tool_choice 转换：仅对登记在计划中的 custom 引用改为 function 引用；
@@ -1674,6 +1697,30 @@ mod tests {
         let identity = plan.identity("functions__review_echo").unwrap();
         assert_eq!(identity.client_name, "review_echo");
         assert_eq!(identity.namespace, "functions");
+    }
+
+    #[test]
+    fn encode_normalizes_all_known_custom_history_id_sources() {
+        let calls = [
+            "ctc_alpha",
+            "ctco_alpha",
+            "fc_alpha",
+            "fco_alpha",
+            "item_alpha",
+            "ct_alpha",
+        ];
+        for call_id in calls {
+            let mut body = serde_json::json!({
+                "tools": [{ "type": "custom", "name": "review_echo" }],
+                "input": [
+                    { "type": "custom_tool_call", "id": call_id, "call_id": "c", "name": "review_echo", "input": "x" },
+                    { "type": "custom_tool_call_output", "id": call_id, "call_id": "c", "output": "done" }
+                ]
+            });
+            encode_request(&mut body, &BTreeMap::new()).unwrap();
+            assert_eq!(body["input"][0]["id"], json!("fc_alpha"), "source: {call_id}");
+            assert_eq!(body["input"][1]["id"], json!("fco_alpha"), "source: {call_id}");
+        }
     }
 
     #[test]

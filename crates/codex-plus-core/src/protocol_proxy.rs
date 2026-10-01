@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::btree_map::Entry;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -35,6 +36,9 @@ const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
     "user",
 ];
 const ERROR_BODY_PREVIEW_LIMIT: usize = 1024;
+/// 账号池轮换后 encrypted reasoning 失配时，错误体要整块还原给客户端；
+/// 这个上限只是防止异常供应商返回超大 body 的安全阀（正常错误体只有几 KB）。
+const ENCRYPTED_REASONING_ERROR_BODY_LIMIT: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChatReasoningStyle {
@@ -133,12 +137,14 @@ impl CodexToolContext {
         plan: &crate::custom_tool_adapter::CustomToolAdapterPlan,
     ) {
         for (wire_name, identity) in plan.entries() {
-            self.custom_tools.entry(wire_name.clone()).or_insert_with(|| CodexCustomToolSpec {
-                openai_name: identity.client_name.clone(),
-                kind: CodexCustomToolKind::Raw,
-                proxy_action: None,
-                namespace: identity.namespace.clone(),
-            });
+            self.custom_tools
+                .entry(wire_name.clone())
+                .or_insert_with(|| CodexCustomToolSpec {
+                    openai_name: identity.client_name.clone(),
+                    kind: CodexCustomToolKind::Raw,
+                    proxy_action: None,
+                    namespace: identity.namespace.clone(),
+                });
         }
         if !plan.is_empty() {
             self.has_custom_tools = true;
@@ -341,6 +347,10 @@ pub struct UpstreamProxyResponse {
     /// 请求级 Custom-as-Function 适配计划；开关关闭时为 None，所有响应路径退回既有行为。
     pub custom_adapter: Option<crate::custom_tool_adapter::CustomToolAdapterPlan>,
     pub response: reqwest::Response,
+    /// 诊断日志用：真正接收本次请求的上游身份。
+    pub relay_id: String,
+    pub relay_name: String,
+    pub endpoint: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -660,12 +670,14 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         let mut attempt_body = request_json.clone();
         // R08：passthrough 策略下不执行原生子任务别名等结构改写，
         // 即使 nativeAgentInterop 处于 auto/on。
-        let native_agent_plaintext = relay.responses_wire_policy
+        let official_deepseek = crate::relay_config::uses_official_deepseek_responses(&relay);
+        let native_agent_plaintext = (relay.responses_wire_policy
             == crate::settings::ResponsesWirePolicy::Compatible
+            || official_deepseek)
             && crate::native_agents::interop_enabled(&relay)
             && crate::native_agents::prepare_request(&mut attempt_body);
         let (endpoint, upstream_body, wire_api, namespace_tools, custom_adapter) =
-            upstream_request_parts(&relay, attempt_body, request_path).await?;
+            upstream_request_parts(&relay, attempt_body.clone(), request_path).await?;
         let has_more_candidates = attempt + 1 < relay_count;
         let header_timeout = response_header_timeout(is_stream);
         let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -688,7 +700,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 }))
             }),
         );
-        let upstream = match send_upstream_request_for_responses(
+        let mut upstream = match send_upstream_request_for_responses(
             upstream_request_builder(
                 crate::http_client::proxied_client(&effective_user_agent(
                     &relay.user_agent,
@@ -738,6 +750,87 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 });
             }
         };
+        let mut endpoint = endpoint;
+        let mut wire_api = wire_api;
+        let mut namespace_tools = namespace_tools;
+        let mut custom_adapter = custom_adapter;
+        // 账号池/中转账号轮换后，历史里携带 encrypted_content 的 reasoning 已经无法被
+        // 上游解密；这类 400 会在同一会话里反复出现，直接把整个对话打死。先缓冲错误体，
+        // 命中后去掉这些 reasoning 项，用同一供应商重试一次。
+        if relay.protocol == RelayProtocol::Responses
+            && upstream.status().as_u16() == 400
+            && has_encrypted_reasoning(&attempt_body)
+        {
+            let original_status = upstream.status();
+            let original_content_type = upstream
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let error_body =
+                read_response_body_capped(upstream, ENCRYPTED_REASONING_ERROR_BODY_LIMIT).await?;
+            if error_mentions_encrypted_content(&String::from_utf8_lossy(&error_body)) {
+                let mut sanitized_body = attempt_body.clone();
+                let removed = strip_encrypted_reasoning(&mut sanitized_body);
+                if removed > 0 {
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "protocol_proxy.encrypted_reasoning_retry",
+                        json!({
+                            "relayId": relay.id,
+                            "relayName": relay.name,
+                            "endpoint": endpoint,
+                            "wireApi": wire_api,
+                            "stream": is_stream,
+                            "attempt": attempt + 1,
+                            "statusCode": original_status.as_u16(),
+                            "removedReasoningItems": removed
+                        }),
+                    );
+                    let (
+                        retry_endpoint,
+                        retry_body,
+                        retry_wire_api,
+                        retry_namespace_tools,
+                        retry_adapter,
+                    ) = upstream_request_parts(&relay, sanitized_body, request_path).await?;
+                    endpoint = retry_endpoint;
+                    wire_api = retry_wire_api;
+                    namespace_tools = retry_namespace_tools;
+                    custom_adapter = retry_adapter;
+                    // 首个请求已经拿到响应，说明链路是通的；重试阶段的传输失败直接报错，
+                    // 不再切换候选，避免同一轮对话被重复计费两次。
+                    upstream = send_upstream_request_for_responses(
+                        upstream_request_builder(
+                            crate::http_client::proxied_client(&effective_user_agent(
+                                &relay.user_agent,
+                                original_user_agent,
+                            ))?,
+                            &endpoint,
+                            &relay,
+                            is_stream,
+                            &retry_body,
+                        ),
+                        is_stream,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "供应商「{}」在移除 encrypted reasoning 后重试失败，endpoint: {}",
+                            relay.name, endpoint
+                        )
+                    })?;
+                } else {
+                    upstream = rebuild_upstream_response(
+                        original_status,
+                        original_content_type,
+                        error_body,
+                    )?;
+                }
+            } else {
+                upstream =
+                    rebuild_upstream_response(original_status, original_content_type, error_body)?;
+            }
+        }
         let status_code = upstream.status().as_u16();
         let entered_cooldown_or_regular_failure =
             crate::relay_rotation::record_relay_request_outcome(
@@ -779,6 +872,9 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 namespace_tools,
                 custom_adapter,
                 response: upstream,
+                relay_id: relay.id.clone(),
+                relay_name: relay.name.clone(),
+                endpoint: endpoint.clone(),
             });
         }
         let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -886,7 +982,7 @@ pub async fn open_models_proxy_request(
         &relay.user_agent,
         original_user_agent,
     ))?
-    .get(endpoint);
+    .get(endpoint.clone());
     let upstream = send_upstream_request(with_relay_auth(request, &relay)).await?;
     let status_code = upstream.status().as_u16();
     let content_type = upstream
@@ -895,7 +991,6 @@ pub async fn open_models_proxy_request(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/json; charset=utf-8")
         .to_string();
-
     Ok(UpstreamProxyResponse {
         status_code,
         is_stream: false,
@@ -905,6 +1000,9 @@ pub async fn open_models_proxy_request(
         namespace_tools: BTreeMap::new(),
         custom_adapter: None,
         response: upstream,
+        relay_id: relay.id.clone(),
+        relay_name: relay.name.clone(),
+        endpoint: endpoint.clone(),
     })
 }
 
@@ -936,7 +1034,7 @@ pub async fn open_audio_transcriptions_proxy_request(
         &relay.user_agent,
         original_user_agent,
     ))?
-    .post(endpoint)
+    .post(endpoint.clone())
     .header(reqwest::header::CONTENT_TYPE, content_type)
     .body(body.to_vec());
     let upstream = send_upstream_request(with_relay_auth(request, &relay)).await?;
@@ -947,7 +1045,6 @@ pub async fn open_audio_transcriptions_proxy_request(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/json; charset=utf-8")
         .to_string();
-
     Ok(UpstreamProxyResponse {
         status_code,
         is_stream: false,
@@ -957,6 +1054,9 @@ pub async fn open_audio_transcriptions_proxy_request(
         namespace_tools: BTreeMap::new(),
         custom_adapter: None,
         response: upstream,
+        relay_id: relay.id.clone(),
+        relay_name: relay.name.clone(),
+        endpoint: endpoint.clone(),
     })
 }
 
@@ -1014,6 +1114,9 @@ pub async fn open_chat_completions_proxy_request(
         namespace_tools: BTreeMap::new(),
         custom_adapter: None,
         response: upstream,
+        relay_id: relay.id.clone(),
+        relay_name: relay.name.clone(),
+        endpoint: chat_completions_url(&relay.base_url),
     })
 }
 
@@ -1033,12 +1136,24 @@ async fn upstream_request_parts(
         anyhow::bail!("Chat Completions 协议暂不支持 Responses compact 请求");
     }
 
+    let official_deepseek = crate::relay_config::uses_official_deepseek_responses(relay);
+    let custom_tools_as_functions = relay.custom_tools_as_functions || official_deepseek;
+    // 客户端在流式 exec 输出被拆成多段时，会给同一个 call_id 写入多条 output 历史。
+    // 任何 Responses/ChatCompletions 上游都只接受每个 call 一条结果，这里先合并再发送；
+    // 这是历史合法性修复，不随 passthrough 策略关闭。
+    merge_duplicate_tool_outputs(&mut request_json);
+    // 多代理消息投递路径会写入没有 call_id 的 function_call_output（Codex 客户端侧
+    // 的形状缺陷）。严格上游会直接 422 "input: missing field call_id" 把整个会话打死，
+    // chat 转换早已静默丢弃这类条目，Responses 路径也必须丢弃。
+    drop_tool_outputs_without_call_id(&mut request_json);
+
     // Custom-as-Function 开关（默认关闭）：按候选 profile 冻结适配计划。
     // passthrough 组合是显式配置冲突，发送前报错而不是静默忽略。
     let mut custom_adapter = None;
-    if relay.custom_tools_as_functions {
+    if custom_tools_as_functions {
         if relay.protocol == RelayProtocol::Responses
             && relay.responses_wire_policy == crate::settings::ResponsesWirePolicy::Passthrough
+            && !official_deepseek
         {
             return Err(crate::custom_tool_adapter::AdapterError::new(
                 crate::custom_tool_adapter::AdapterErrorCode::PolicyConflict,
@@ -1087,21 +1202,25 @@ async fn upstream_request_parts(
     // R08：passthrough = 结构透传边界。跳过 reasoning/ID/原生子任务/additional_tools/
     // namespace 扁平化等全部 Codex 扩展改写；模型路由与认证仍按显式配置执行。
     let responses_compat = relay.protocol == RelayProtocol::Responses
-        && relay.responses_wire_policy == crate::settings::ResponsesWirePolicy::Compatible;
+        && (relay.responses_wire_policy == crate::settings::ResponsesWirePolicy::Compatible
+            || official_deepseek);
     if responses_compat {
         normalize_responses_reasoning_policy(
             &mut body,
             relay.responses_reasoning_policy,
             &relay.id,
         );
-        normalize_responses_item_ids(&mut body);
+        // Strict Responses upstreams reject relay-generated ids that violate the
+        // item-type namespace, so Compatible requests get deterministic rewrites
+        // instead of forwarding chatcmpl-* history unchanged.
+        normalize_responses_item_ids_with_policy(&mut body, true);
         if crate::native_agents::interop_enabled(relay) {
             crate::native_agents::prepare_glm_messages(&mut body);
         }
         normalize_responses_additional_tools(&mut body);
         namespace_tools = flatten_responses_tool_namespaces(&mut body)?;
-        normalize_responses_custom_tool_call_ids(&mut body);
-        if relay.custom_tools_as_functions {
+        normalize_responses_custom_tool_call_ids_with_policy(&mut body, official_deepseek);
+        if custom_tools_as_functions {
             let plan = crate::custom_tool_adapter::encode_request(&mut body, &namespace_tools)?;
             if !plan.is_empty() {
                 custom_adapter = Some(plan);
@@ -1276,37 +1395,149 @@ fn responses_reasoning_normalization_detail(
     })
 }
 
-fn normalize_responses_item_ids(body: &mut Value) {
+fn normalize_responses_item_ids_with_policy(body: &mut Value, strict_prefixes: bool) {
     let Some(input) = body.get_mut("input") else {
         return;
     };
     match input {
         Value::Array(items) => {
             for item in items {
-                normalize_responses_item_id(item);
+                normalize_responses_item_id(item, strict_prefixes);
             }
         }
-        Value::Object(_) => normalize_responses_item_id(input),
+        Value::Object(_) => normalize_responses_item_id(input, strict_prefixes),
         _ => {}
     }
 }
 
-fn normalize_responses_item_id(item: &mut Value) {
+fn normalize_responses_item_id(item: &mut Value, strict_prefixes: bool) {
     let Some(id) = item.get("id").and_then(Value::as_str) else {
-        return;
-    };
-    let Some(suffix) = id.strip_prefix("item_") else {
         return;
     };
     let prefix = match item.get("type").and_then(Value::as_str) {
         Some("message") => "msg_",
         Some("reasoning") => "rs_",
         Some("function_call") => "fc_",
+        Some("function_call_output") if strict_prefixes => "fco_",
         // custom_tool_call 由 normalize_responses_custom_tool_call_ids 一处权威
         // 规范化，这里跳过以免两套规则叠加出 ctc_ct_（R07）。
         _ => return,
     };
+    if id.starts_with(prefix) {
+        return;
+    }
+    let suffix = id
+        .strip_prefix("item_")
+        .or_else(|| strict_prefixes.then_some(id));
+    let Some(suffix) = suffix else {
+        return;
+    };
     item["id"] = json!(format!("{prefix}{suffix}"));
+}
+
+/// 多代理消息投递会在历史里留下没有 call_id 的 function_call_output / custom_tool_call_output。
+/// Responses 上游要求每个 output 都带 call_id（实测 api.deepseek.com 直接返回
+/// 422 "Failed to deserialize ... input: missing field call_id"），而 chat 转换路径本来就
+/// 丢弃这类条目，所以这里统一在发送前剔除。
+fn drop_tool_outputs_without_call_id(body: &mut Value) -> usize {
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let before = items.len();
+    items.retain(|item| {
+        let is_output = matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("function_call_output" | "custom_tool_call_output")
+        );
+        if !is_output {
+            return true;
+        }
+        item.get("call_id")
+            .and_then(Value::as_str)
+            .is_some_and(|call_id| !call_id.is_empty())
+    });
+    before.saturating_sub(items.len())
+}
+
+fn merge_duplicate_tool_outputs(body: &mut Value) {
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut output_indexes = BTreeMap::new();
+    let mut duplicates = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let matches_type = matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("function_call_output" | "custom_tool_call_output")
+        );
+        if !matches_type {
+            continue;
+        }
+        let Some(call_id) = item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .filter(|call_id| !call_id.is_empty())
+        else {
+            continue;
+        };
+        match output_indexes.entry(call_id.to_string()) {
+            Entry::Vacant(entry) => {
+                entry.insert(index);
+            }
+            Entry::Occupied(entry) => duplicates.push((*entry.get(), index)),
+        }
+    }
+    if duplicates.is_empty() {
+        return;
+    }
+    let duplicate_indexes: BTreeSet<_> = duplicates.iter().map(|(_, index)| *index).collect();
+    let mut merged_outputs = BTreeMap::new();
+    for &(kept_index, duplicate_index) in &duplicates {
+        let duplicate = items[duplicate_index].clone();
+        if let (Some(name), Value::Object(kept)) = (
+            duplicate.get("name").and_then(Value::as_str),
+            &mut items[kept_index],
+        ) {
+            kept.entry("name".to_string()).or_insert(json!(name));
+        }
+        let outputs = merged_outputs.entry(kept_index).or_insert_with(|| {
+            tool_output_parts(items[kept_index].get("output").unwrap_or(&Value::Null))
+        });
+        outputs.extend(tool_output_parts(
+            duplicate.get("output").unwrap_or(&Value::Null),
+        ));
+    }
+    let mut retained = Vec::with_capacity(items.len() - duplicate_indexes.len());
+    for (index, mut item) in items.drain(..).enumerate() {
+        if duplicate_indexes.contains(&index) {
+            continue;
+        }
+        if let Some(outputs) = merged_outputs.get(&index) {
+            item["output"] = merged_tool_output(item.get("output"), outputs.clone());
+        }
+        retained.push(item);
+    }
+    *items = retained;
+}
+
+fn tool_output_parts(output: &Value) -> Vec<Value> {
+    match output {
+        Value::Null => Vec::new(),
+        Value::Array(parts) => parts.clone(),
+        Value::String(text) => vec![json!({ "type": "input_text", "text": text })],
+        value => vec![json!({ "type": "input_text", "text": value.to_string() })],
+    }
+}
+
+fn merged_tool_output(original_output: Option<&Value>, outputs: Vec<Value>) -> Value {
+    if matches!(original_output, Some(Value::String(_))) && outputs.len() == 1 {
+        if let [Value::Object(part)] = &outputs[..] {
+            if part.get("type").and_then(Value::as_str) == Some("input_text") {
+                return part.get("text").cloned().unwrap_or_default();
+            }
+        }
+    }
+    Value::Array(outputs)
 }
 
 fn content_is_non_empty(content: Option<&Value>) -> bool {
@@ -1589,7 +1820,10 @@ fn hoist_namespace_custom_tools_for_chat(
         };
         let mut retained = Vec::new();
         for child in children.drain(..) {
-            let name = child.get("name").and_then(Value::as_str).unwrap_or_default();
+            let name = child
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let flat = flatten_namespace_tool_name(&namespace, name);
             if plan.identity(&flat).is_some() {
                 let mut custom = child;
@@ -1708,11 +1942,65 @@ fn restore_responses_tool_namespace_item(
         return;
     }
     if let Some(name) = object.get("name").and_then(Value::as_str) {
-        if let Some((namespace, original_name)) = namespace_tools.get(name) {
+        let restored = namespace_tools
+            .get(name)
+            .cloned()
+            .or_else(|| restore_flat_collaboration_tool_name(name, namespace_tools));
+        if let Some((namespace, original_name)) = restored {
             object.insert("namespace".to_string(), json!(namespace));
             object.insert("name".to_string(), json!(original_name));
         }
     }
+}
+
+/// 多代理工具在客户端注册为 namespace=collaboration 的裸名（spawn_agent 等）。
+/// 兼容层把它们拍扁成 namespace__tool 之后，模型可能再套一层前缀，或者那一轮根本
+/// 没有建立映射表；此时只按精确 key 还原会漏掉，core 会直接报 unsupported call。
+const COLLABORATION_TOOL_NAMES: [&str; 6] = [
+    "spawn_agent",
+    "wait_agent",
+    "send_message",
+    "followup_task",
+    "list_agents",
+    "interrupt_agent",
+];
+const COLLABORATION_TOOL_SUFFIXES: [&[u8]; 6] = [
+    b"__spawn_agent",
+    b"__wait_agent",
+    b"__send_message",
+    b"__followup_task",
+    b"__list_agents",
+    b"__interrupt_agent",
+];
+const COLLABORATION_NAMESPACE: &str = "collaboration";
+
+fn is_collaboration_namespace_prefix(prefix: &str) -> bool {
+    let lower = prefix.trim().to_ascii_lowercase();
+    lower == COLLABORATION_NAMESPACE || lower.ends_with(COLLABORATION_NAMESPACE)
+}
+
+fn restore_flat_collaboration_tool_name(
+    name: &str,
+    namespace_tools: &BTreeMap<String, (String, String)>,
+) -> Option<(String, String)> {
+    let (prefix, tool) = name.rsplit_once("__")?;
+    if !is_collaboration_namespace_prefix(prefix) || !COLLABORATION_TOOL_NAMES.contains(&tool) {
+        return None;
+    }
+    // 同一轮请求里已经知道这个工具的命名空间时优先沿用，否则回落到注册命名空间。
+    let namespace = namespace_tools
+        .values()
+        .find(|(_, original)| original == tool)
+        .map(|(namespace, _)| namespace.clone())
+        .unwrap_or_else(|| COLLABORATION_NAMESPACE.to_string());
+    Some((namespace, tool.to_string()))
+}
+
+/// 映射表为空时的快速判定：只有真的出现拍扁的多代理工具名才做解析重排。
+fn contains_flat_collaboration_tool_name(bytes: &[u8]) -> bool {
+    COLLABORATION_TOOL_SUFFIXES
+        .iter()
+        .any(|needle| bytes.windows(needle.len()).any(|window| window == *needle))
 }
 
 pub fn restore_responses_tool_namespace_json(
@@ -1720,7 +2008,7 @@ pub fn restore_responses_tool_namespace_json(
     namespace_tools: &BTreeMap<String, (String, String)>,
 ) -> Vec<u8> {
     // R10：没有映射时按原样透传，不做无谓的解析重排。
-    if namespace_tools.is_empty() {
+    if namespace_tools.is_empty() && !contains_flat_collaboration_tool_name(bytes) {
         return bytes.to_vec();
     }
     let Ok(mut value) = serde_json::from_slice::<Value>(bytes) else {
@@ -1786,8 +2074,10 @@ impl ResponsesNamespaceSseRewriter {
             .filter_map(|line| line.strip_prefix("data:"))
             .map(|line| line.strip_prefix(' ').unwrap_or(line))
             .collect::<Vec<_>>()
-            .join("
-");
+            .join(
+                "
+",
+            );
         if data.trim().is_empty() {
             return (Vec::new(), true);
         }
@@ -1802,7 +2092,7 @@ impl ResponsesNamespaceSseRewriter {
     fn rewrite_frame(&self, frame: &[u8]) -> Vec<u8> {
         // R10：没有 namespace 映射时不做任何改写，按原样透传，
         // 不把每个 JSON frame 解析重排一遍。
-        if self.namespace_tools.is_empty() {
+        if self.namespace_tools.is_empty() && !contains_flat_collaboration_tool_name(frame) {
             return frame.to_vec();
         }
         let Ok(text) = std::str::from_utf8(frame) else {
@@ -1834,6 +2124,240 @@ impl ResponsesNamespaceSseRewriter {
         }
         output.into_bytes()
     }
+}
+
+/// 上游 Responses 兼容网关（Chat Completions 转 Responses）常在 reasoning item 上
+/// 省略 `summary` 字段，也不发 `response.reasoning_summary_part.added`，直接开始
+/// `response.reasoning_summary_text.delta`。Codex 的 Responses 解析器要求 item 已注册
+/// summary（或存在 part.added），否则报 `ReasoningSummaryDelta without active item`
+/// 并中止整个采样轮次，表现为子任务返回空内容。这里按协议补齐最小结构：item 带空
+/// summary 数组，并在首个 summary 事件前补发 added/part.added。属于通用兼容，
+/// 不绑定端点或模型；字段齐全的上游流不受影响。
+#[derive(Default)]
+pub struct ResponsesReasoningSseRewriter {
+    buffer: Vec<u8>,
+    seen_items: BTreeSet<String>,
+    announced: BTreeSet<String>,
+    last_usage: Option<Value>,
+    saw_completed: bool,
+}
+
+impl ResponsesReasoningSseRewriter {
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.buffer.extend_from_slice(bytes);
+        let mut output = Vec::new();
+        loop {
+            let lf = self
+                .buffer
+                .windows(2)
+                .position(|window| window == b"\n\n")
+                .map(|index| index + 2);
+            let crlf = self
+                .buffer
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|index| index + 4);
+            let Some(end) = lf.into_iter().chain(crlf).min() else {
+                break;
+            };
+            let frame: Vec<u8> = self.buffer.drain(..end).collect();
+            output.extend(self.rewrite_frame(&frame));
+        }
+        output
+    }
+
+    pub fn finish(&mut self) -> Vec<u8> {
+        self.finish_with_truncation().0
+    }
+
+    pub fn last_usage(&self) -> Option<&Value> {
+        self.last_usage.as_ref()
+    }
+
+    pub fn saw_completed(&self) -> bool {
+        self.saw_completed
+    }
+
+    /// 收尾与 namespace 侧一致：完整但缺结尾空行的最后一帧照常处理，
+    /// 无法解析的半帧丢弃并报告截断。
+    pub fn finish_with_truncation(&mut self) -> (Vec<u8>, bool) {
+        let buffer = std::mem::take(&mut self.buffer);
+        if buffer.is_empty() {
+            return (Vec::new(), false);
+        }
+        let text = match std::str::from_utf8(&buffer) {
+            Ok(text) => text,
+            Err(_) => return (Vec::new(), true),
+        };
+        let data = sse_data_payload(text);
+        if data.trim().is_empty() {
+            return (Vec::new(), true);
+        }
+        match serde_json::from_str::<Value>(&data) {
+            Ok(_) => (self.rewrite_frame(&buffer), false),
+            Err(_) => (Vec::new(), true),
+        }
+    }
+
+    fn rewrite_frame(&mut self, frame: &[u8]) -> Vec<u8> {
+        let Ok(text) = std::str::from_utf8(frame) else {
+            return frame.to_vec();
+        };
+        let data = sse_data_payload(text);
+        let Ok(mut value) = serde_json::from_str::<Value>(&data) else {
+            return frame.to_vec();
+        };
+        let kind = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+        .to_string();
+        match kind.as_str() {
+            "response.completed" | "response.incomplete" | "response.failed" => {
+                self.saw_completed = true;
+                if let Some(usage) = value.get("usage").filter(|usage| usage.is_object()) {
+                    self.last_usage = Some(usage.clone());
+                }
+                frame.to_vec()
+            }
+            "response.output_item.added" => {
+                if value.pointer("/item/type").and_then(Value::as_str) != Some("reasoning") {
+                    return frame.to_vec();
+                }
+                let patched = ensure_reasoning_summary_field(&mut value);
+                let item_id = value
+                    .pointer("/item/id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if !item_id.is_empty() {
+                    self.seen_items.insert(item_id);
+                }
+                // 合规上游已带 summary 时逐字节透传，不做无谓重排。
+                if patched {
+                    rewrite_frame_payload(text, &value)
+                } else {
+                    frame.to_vec()
+                }
+            }
+            // 合规上游自行发送的 part.added：记录后透传，后续不再补发。
+            "response.reasoning_summary_part.added" => {
+                if let Some(item_id) = value.get("item_id").and_then(Value::as_str) {
+                    self.announced.insert(item_id.to_string());
+                }
+                frame.to_vec()
+            }
+            "response.reasoning_summary_text.delta" | "response.reasoning_summary_text.done" => {
+                let item_id = value
+                    .get("item_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let mut output = Vec::new();
+                if !item_id.is_empty() && self.announced.insert(item_id.clone()) {
+                    let output_index = value.get("output_index").cloned().unwrap_or(Value::from(0));
+                    if !self.seen_items.contains(&item_id) {
+                        output.extend(reasoning_item_added_frame(&item_id, &output_index));
+                    }
+                    output.extend(reasoning_part_added_frame(&item_id, &output_index));
+                }
+                output.extend(rewrite_frame_payload(text, &value));
+                output
+            }
+            "response.output_item.done" => {
+                if value.pointer("/item/type").and_then(Value::as_str) != Some("reasoning") {
+                    return frame.to_vec();
+                }
+                if ensure_reasoning_summary_field(&mut value) {
+                    rewrite_frame_payload(text, &value)
+                } else {
+                    frame.to_vec()
+                }
+            }
+            _ => frame.to_vec(),
+        }
+    }
+}
+
+/// 取出 SSE 帧里的 data 负载（多行按协议用换行拼接）。
+fn sse_data_payload(text: &str) -> String {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(|line| line.strip_prefix(' ').unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 用改写后的 JSON 替换帧内 data 行，保留 event 行与原始换行风格。
+fn rewrite_frame_payload(text: &str, value: &Value) -> Vec<u8> {
+    let mut output = String::new();
+    let mut wrote_data = false;
+    for line in text.split_inclusive('\n') {
+        if line.starts_with("data:") {
+            if !wrote_data {
+                output.push_str("data: ");
+                output.push_str(&value.to_string());
+                output.push_str(if line.ends_with("\r\n") { "\r\n" } else { "\n" });
+                wrote_data = true;
+            }
+        } else {
+            output.push_str(line);
+        }
+    }
+    output.into_bytes()
+}
+
+/// 上游 reasoning item 缺 `summary` 时补空数组，避免 Codex 判定 item 未注册。
+/// 返回是否真的改写了内容；未改动时调用方应逐字节透传原帧。
+fn ensure_reasoning_summary_field(value: &mut Value) -> bool {
+    if let Some(item) = value.get_mut("item").and_then(Value::as_object_mut) {
+        if item.get("summary").and_then(Value::as_array).is_none() {
+            item.insert("summary".to_string(), json!([]));
+            return true;
+        }
+    }
+    false
+}
+
+fn reasoning_item_added_frame(item_id: &str, output_index: &Value) -> Vec<u8> {
+    sse_frame_bytes(
+        "response.output_item.added",
+        &json!({
+            "type": "response.output_item.added",
+            "output_index": output_index,
+            "item": {
+                "id": item_id,
+                "type": "reasoning",
+                "status": "in_progress",
+                "summary": []
+            }
+        }),
+    )
+}
+
+fn reasoning_part_added_frame(item_id: &str, output_index: &Value) -> Vec<u8> {
+    sse_frame_bytes(
+        "response.reasoning_summary_part.added",
+        &json!({
+            "type": "response.reasoning_summary_part.added",
+            "item_id": item_id,
+            "output_index": output_index,
+            "summary_index": 0,
+            "part": { "type": "summary_text", "text": "" }
+        }),
+    )
+}
+
+fn sse_frame_bytes(event: &str, payload: &Value) -> Vec<u8> {
+    let mut output = String::new();
+    output.push_str("event: ");
+    output.push_str(event);
+    output.push('\n');
+    output.push_str("data: ");
+    output.push_str(&payload.to_string());
+    output.push('\n');
+    output.push('\n');
+    output.into_bytes()
 }
 
 fn upstream_request_builder(
@@ -1940,14 +2464,17 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
                 native_agent_plaintext.then(crate::native_agents::NativeAgentSseRewriter::default);
             let mut namespace_rewriter =
                 ResponsesNamespaceSseRewriter::new(upstream.namespace_tools.clone());
+            let mut reasoning_rewriter = ResponsesReasoningSseRewriter::default();
             let mut namespace_output = namespace_rewriter.push_bytes(&custom_output);
             namespace_output.extend(namespace_rewriter.finish());
+            let mut reasoning_output = reasoning_rewriter.push_bytes(&namespace_output);
+            reasoning_output.extend(reasoning_rewriter.finish());
             let body = if let Some(rewriter) = &mut native_rewriter {
-                let mut output = rewriter.push_bytes(&namespace_output);
+                let mut output = rewriter.push_bytes(&reasoning_output);
                 output.extend(rewriter.finish());
                 output
             } else {
-                namespace_output
+                reasoning_output
             };
             body
         } else {
@@ -2119,7 +2646,8 @@ pub fn chat_sse_to_responses_sse_with_request_plan(
     original_request: &Value,
     custom_adapter: Option<&crate::custom_tool_adapter::CustomToolAdapterPlan>,
 ) -> String {
-    let mut converter = ChatSseToResponsesConverter::with_request_plan(original_request, custom_adapter);
+    let mut converter =
+        ChatSseToResponsesConverter::with_request_plan(original_request, custom_adapter);
     let mut output = converter.push_bytes(input.as_bytes());
     output.extend(converter.finish());
     String::from_utf8(output).unwrap_or_default()
@@ -2133,7 +2661,10 @@ pub(crate) fn restore_responses_json_with_custom_adapter(
     namespace_tools: &BTreeMap<String, (String, String)>,
 ) -> anyhow::Result<Vec<u8>> {
     let Some(plan) = custom_adapter.filter(|plan| !plan.is_empty()) else {
-        return Ok(restore_responses_tool_namespace_json(bytes, namespace_tools));
+        return Ok(restore_responses_tool_namespace_json(
+            bytes,
+            namespace_tools,
+        ));
     };
     let Ok(mut value) = serde_json::from_slice::<Value>(bytes) else {
         // 不可解析的响应体按既有约定原样返回，由上层按上游错误处理。
@@ -3003,22 +3534,86 @@ fn truncate_error_preview(input: &str) -> String {
     input.chars().take(ERROR_BODY_PREVIEW_LIMIT).collect()
 }
 
-fn normalize_responses_custom_tool_call_ids(body: &mut Value) {
+fn is_encrypted_reasoning_item(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("reasoning")
+        && item
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+}
+
+fn has_encrypted_reasoning(body: &Value) -> bool {
+    body.get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|items| items.iter().any(is_encrypted_reasoning_item))
+}
+
+fn strip_encrypted_reasoning(body: &mut Value) -> usize {
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let before = items.len();
+    items.retain(|item| !is_encrypted_reasoning_item(item));
+    before.saturating_sub(items.len())
+}
+
+fn error_mentions_encrypted_content(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("invalid_encrypted_content")
+        || (lower.contains("encrypted content")
+            && (lower.contains("could not be")
+                || lower.contains("decrypt")
+                || lower.contains("parsed")))
+}
+
+async fn read_response_body_capped(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> anyhow::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.is_empty() {
+            continue;
+        }
+        let remaining = limit.saturating_sub(body.len());
+        if chunk.len() >= remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// 未命中重试条件时把已读出的上游响应原样还原，保持非重试路径的行为不变。
+fn rebuild_upstream_response(
+    status: reqwest::StatusCode,
+    content_type: Option<String>,
+    body: Vec<u8>,
+) -> anyhow::Result<reqwest::Response> {
+    let mut builder = http::Response::builder().status(status);
+    if let Some(content_type) = content_type {
+        builder = builder.header(reqwest::header::CONTENT_TYPE, content_type);
+    }
+    Ok(reqwest::Response::from(builder.body(body)?))
+}
+
+fn normalize_responses_custom_tool_call_ids_with_policy(body: &mut Value, strict_prefixes: bool) {
     let Some(input) = body.get_mut("input") else {
         return;
     };
     match input {
         Value::Array(items) => {
             for item in items {
-                normalize_custom_tool_call_item_id(item);
+                normalize_custom_tool_call_item_id(item, strict_prefixes);
             }
         }
-        Value::Object(_) => normalize_custom_tool_call_item_id(input),
+        Value::Object(_) => normalize_custom_tool_call_item_id(input, strict_prefixes),
         _ => {}
     }
 }
 
-fn normalize_custom_tool_call_item_id(item: &mut Value) {
+fn normalize_custom_tool_call_item_id(item: &mut Value, strict_prefixes: bool) {
     if item.get("type").and_then(Value::as_str) != Some("custom_tool_call") {
         return;
     }
@@ -3030,12 +3625,11 @@ fn normalize_custom_tool_call_item_id(item: &mut Value) {
     }
     // 只规范化已知跨适配器生成的 fc_/item_ 前缀；原生 ct_ 等其它 id 保持原样，
     // 不被"统一风格"二次改写（R07）。
-    let Some(suffix) = id
+    let suffix = id
         .strip_prefix("fc_")
         .or_else(|| id.strip_prefix("item_"))
-    else {
-        return;
-    };
+        .or_else(|| strict_prefixes.then_some(id));
+    let Some(suffix) = suffix else { return };
     item["id"] = json!(format!("ctc_{suffix}"));
 }
 
@@ -5693,9 +6287,10 @@ mod glm_additional_tools_tests {
             ]
         });
         let relay = crate::settings::RelayProfile::default();
-        let (_, wire, _, namespace_tools, _) = upstream_request_parts(&relay, request, "/responses")
-            .await
-            .unwrap();
+        let (_, wire, _, namespace_tools, _) =
+            upstream_request_parts(&relay, request, "/responses")
+                .await
+                .unwrap();
         assert_eq!(
             wire["tools"],
             json!([
@@ -5786,9 +6381,10 @@ mod glm_additional_tools_tests {
         });
         assert!(crate::native_agents::prepare_request(&mut request));
         let relay = crate::settings::RelayProfile::default();
-        let (_, wire, _, namespace_tools, _) = upstream_request_parts(&relay, request, "/responses")
-            .await
-            .unwrap();
+        let (_, wire, _, namespace_tools, _) =
+            upstream_request_parts(&relay, request, "/responses")
+                .await
+                .unwrap();
         assert_eq!(
             wire["tools"][0]["name"],
             "codexpp_native_collaboration__spawn_agent"
@@ -5929,6 +6525,160 @@ mod glm_additional_tools_tests {
 mod responses_reasoning_policy_tests {
     use super::*;
 
+    fn parse_frames(bytes: &[u8]) -> Vec<Value> {
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        text.split("\n\n")
+            .filter_map(|frame| {
+                let data = sse_data_payload(frame);
+                if data.trim().is_empty() {
+                    return None;
+                }
+                serde_json::from_str::<Value>(&data).ok()
+            })
+            .collect()
+    }
+
+    fn frame(kind: &str, payload: Value) -> Vec<u8> {
+        sse_frame_bytes(kind, &payload)
+    }
+
+    /// 上游兼容网关省略 reasoning item 的 summary 注册，Codex 会报
+    /// ReasoningSummaryDelta without active item 并丢掉整轮输出。
+    #[test]
+    fn reasoning_rewriter_registers_summary_before_delta() {
+        let mut rewriter = ResponsesReasoningSseRewriter::default();
+        let mut output = Vec::new();
+        output.extend(rewriter.push_bytes(&frame(
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"id": "chatcmpl-1_reasoning_0", "type": "reasoning", "status": "in_progress"}
+            }),
+        )));
+        output.extend(rewriter.push_bytes(&frame(
+            "response.reasoning_summary_text.delta",
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "chatcmpl-1_reasoning_0",
+                "output_index": 0,
+                "delta": "think"
+            }),
+        )));
+        output.extend(rewriter.finish());
+        let frames = parse_frames(&output);
+        let kinds: Vec<&str> = frames
+            .iter()
+            .map(|value| value["type"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "response.output_item.added",
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_text.delta"
+            ],
+            "reasoning item 必须先注册 summary，再发 delta"
+        );
+        assert_eq!(
+            frames[0]["item"]["summary"],
+            json!([]),
+            "added item 必须带 summary 字段"
+        );
+    }
+
+    /// 已经自行发送 part.added 的上游不得被重复注入，且帧内容逐字节不变。
+    #[test]
+    fn reasoning_rewriter_does_not_duplicate_existing_part_added() {
+        let added = frame(
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"id": "rs_1", "type": "reasoning", "status": "in_progress", "summary": []}
+            }),
+        );
+        let part = frame(
+            "response.reasoning_summary_part.added",
+            json!({
+                "type": "response.reasoning_summary_part.added",
+                "item_id": "rs_1",
+                "output_index": 0,
+                "summary_index": 0,
+                "part": {"type": "summary_text", "text": ""}
+            }),
+        );
+        let delta = frame(
+            "response.reasoning_summary_text.delta",
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "rs_1",
+                "output_index": 0,
+                "delta": "hi"
+            }),
+        );
+        let mut rewriter = ResponsesReasoningSseRewriter::default();
+        let mut output = Vec::new();
+        for input in [&added, &part, &delta] {
+            output.extend(rewriter.push_bytes(input));
+        }
+        output.extend(rewriter.finish());
+        assert_eq!(
+            output,
+            [added, part, delta].concat(),
+            "合规上游的三个帧必须原样透传，不得插入任何补发帧"
+        );
+    }
+
+    /// 非 reasoning 帧必须逐字节透传。
+    #[test]
+    fn reasoning_rewriter_passes_other_frames_untouched() {
+        let raw = frame(
+            "response.output_text.delta",
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": "msg_1",
+                "output_index": 1,
+                "delta": "hello"
+            }),
+        );
+        let mut rewriter = ResponsesReasoningSseRewriter::default();
+        let mut output = rewriter.push_bytes(&raw);
+        output.extend(rewriter.finish());
+        assert_eq!(output, raw);
+    }
+
+    /// 上游连 output_item.added 都省略、直接发 delta 时，必须补齐 item 注册。
+    #[test]
+    fn reasoning_rewriter_synthesizes_missing_item_added() {
+        let mut rewriter = ResponsesReasoningSseRewriter::default();
+        let mut output = rewriter.push_bytes(&frame(
+            "response.reasoning_summary_text.delta",
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "chatcmpl-2_reasoning_0",
+                "output_index": 0,
+                "delta": "thinking"
+            }),
+        ));
+        output.extend(rewriter.finish());
+        let frames = parse_frames(&output);
+        let kinds: Vec<&str> = frames
+            .iter()
+            .map(|value| value["type"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "response.output_item.added",
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_text.delta"
+            ],
+            "缺失 added 时也必须先注册 item 与 summary"
+        );
+        assert_eq!(frames[0]["item"]["type"], json!("reasoning"));
+    }
+
     fn request() -> Value {
         json!({
             "model": "gpt-5.4",
@@ -5978,14 +6728,229 @@ mod responses_reasoning_policy_tests {
         });
         // R07 统一规则：按生产管线顺序调用；custom_tool_call 只由专用规范化处理，
         // item_ 前缀得到 ctc_，不再出现两套规则叠加的 ctc_ct_。
-        normalize_responses_item_ids(&mut actual);
-        normalize_responses_custom_tool_call_ids(&mut actual);
+        normalize_responses_item_ids_with_policy(&mut actual, false);
+        normalize_responses_custom_tool_call_ids_with_policy(&mut actual, false);
         assert_eq!(
             actual["input"],
             json!([
                 {"type": "message", "id": "msg_message", "role": "user", "content": "before"},
                 {"type": "function_call", "id": "fc_function", "call_id": "call-1", "name": "lookup"},
                 {"type": "custom_tool_call", "id": "ctc_custom", "call_id": "call-2", "name": "exec", "input": "pwd"}
+            ])
+        );
+    }
+
+    #[test]
+    fn tool_outputs_without_call_id_are_dropped() {
+        let mut actual = json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "before"},
+                {
+                    "type": "function_call_output",
+                    "id": "fco_orphan",
+                    "name": "send_message_to_thread",
+                    "output": "subagent message"
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "id": "ctco_orphan",
+                    "output": "orphan"
+                },
+                {"type": "function_call", "id": "fc_ok", "call_id": "call_ok", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call_output", "id": "fco_ok", "call_id": "call_ok", "output": "done"},
+                {"type": "message", "role": "user", "content": "after"}
+            ]
+        });
+
+        assert_eq!(drop_tool_outputs_without_call_id(&mut actual), 2);
+        assert_eq!(
+            actual["input"],
+            json!([
+                {"type": "message", "role": "user", "content": "before"},
+                {"type": "function_call", "id": "fc_ok", "call_id": "call_ok", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call_output", "id": "fco_ok", "call_id": "call_ok", "output": "done"},
+                {"type": "message", "role": "user", "content": "after"}
+            ])
+        );
+        // 已经合法的历史必须保持原样（包括空 input / 非数组 input 的幂等性）。
+        assert_eq!(drop_tool_outputs_without_call_id(&mut actual), 0);
+    }
+
+    #[test]
+    fn duplicate_custom_tool_outputs_merge_in_first_position() {
+        let mut actual = json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "before"},
+                {
+                    "type": "custom_tool_call_output",
+                    "id": "ctco_first",
+                    "call_id": "call_duplicate",
+                    "output": "Script completed\nOutput:\n"
+                },
+                {"type": "message", "role": "user", "content": "between"},
+                {
+                    "type": "custom_tool_call_output",
+                    "id": "ctco_second",
+                    "call_id": "call_duplicate",
+                    "name": "exec",
+                    "output": "5610"
+                }
+            ]
+        });
+        merge_duplicate_tool_outputs(&mut actual);
+        assert_eq!(
+            actual["input"],
+            json!([
+                {"type": "message", "role": "user", "content": "before"},
+                {
+                    "type": "custom_tool_call_output",
+                    "id": "ctco_first",
+                    "call_id": "call_duplicate",
+                    "name": "exec",
+                    "output": [
+                        {"type": "input_text", "text": "Script completed\nOutput:\n"},
+                        {"type": "input_text", "text": "5610"}
+                    ]
+                },
+                {"type": "message", "role": "user", "content": "between"}
+            ])
+        );
+    }
+
+    #[test]
+    fn duplicate_plain_string_outputs_keep_both_texts() {
+        let mut actual = json!({
+            "input": [
+                {"type": "custom_tool_call_output", "call_id": "call_a", "output": "one"},
+                {"type": "custom_tool_call_output", "call_id": "call_a", "output": "two"}
+            ]
+        });
+        merge_duplicate_tool_outputs(&mut actual);
+        assert_eq!(
+            actual["input"][0]["output"],
+            json!([
+                {"type": "input_text", "text": "one"},
+                {"type": "input_text", "text": "two"}
+            ])
+        );
+        assert_eq!(actual["input"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn duplicate_array_and_string_outputs_keep_encounter_order() {
+        let mut actual = json!({
+            "input": [
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_a",
+                    "output": [{"type": "input_text", "text": "first"}]
+                },
+                {"type": "custom_tool_call_output", "call_id": "call_a", "output": "second"}
+            ]
+        });
+        merge_duplicate_tool_outputs(&mut actual);
+        assert_eq!(
+            actual["input"][0]["output"],
+            json!([
+                {"type": "input_text", "text": "first"},
+                {"type": "input_text", "text": "second"}
+            ])
+        );
+    }
+
+    #[test]
+    fn duplicate_function_call_outputs_merge_the_same_way() {
+        let mut actual = json!({
+            "input": [
+                {"type": "function_call_output", "id": "fco_a", "call_id": "call_a", "output": "first"},
+                {"type": "function_call_output", "id": "fco_b", "call_id": "call_a", "name": "lookup", "output": "second"},
+                {"type": "function_call_output", "id": "fco_c", "call_id": "call_b", "output": "other"}
+            ]
+        });
+        merge_duplicate_tool_outputs(&mut actual);
+        assert_eq!(
+            actual["input"],
+            json!([
+                {
+                    "type": "function_call_output",
+                    "id": "fco_a",
+                    "call_id": "call_a",
+                    "name": "lookup",
+                    "output": [
+                        {"type": "input_text", "text": "first"},
+                        {"type": "input_text", "text": "second"}
+                    ]
+                },
+                {"type": "function_call_output", "id": "fco_c", "call_id": "call_b", "output": "other"}
+            ])
+        );
+    }
+
+    #[test]
+    fn distinct_and_shapeless_tool_outputs_are_not_merged() {
+        let expected = json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "question"},
+                {"type": "custom_tool_call_output", "call_id": "", "output": "missing-call-id"},
+                {"type": "custom_tool_call_output", "call_id": "call_a", "output": "one"},
+                {"type": "custom_tool_call_output", "call_id": "call_b", "output": "two"},
+                {"type": "function_call", "call_id": "call_a", "name": "lookup"}
+            ]
+        });
+        let mut actual = expected.clone();
+        merge_duplicate_tool_outputs(&mut actual);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn three_way_duplicate_outputs_are_concatenated_once() {
+        let mut actual = json!({
+            "input": [
+                {"type": "custom_tool_call_output", "call_id": "call_a", "output": "one"},
+                {"type": "custom_tool_call_output", "call_id": "call_a", "output": "two"},
+                {"type": "custom_tool_call_output", "call_id": "call_a", "output": "three"}
+            ]
+        });
+        merge_duplicate_tool_outputs(&mut actual);
+        assert_eq!(
+            actual["input"][0]["output"],
+            json!([
+                {"type": "input_text", "text": "one"},
+                {"type": "input_text", "text": "two"},
+                {"type": "input_text", "text": "three"}
+            ])
+        );
+    }
+
+    #[test]
+    fn non_output_and_non_array_inputs_are_untouched() {
+        let string_input = json!({
+            "input": "not an item array"
+        });
+        let mut actual = string_input.clone();
+        merge_duplicate_tool_outputs(&mut actual);
+        assert_eq!(actual, string_input);
+
+        let missing_input = json!({ "model": "gpt-5.6-luna" });
+        actual = missing_input.clone();
+        merge_duplicate_tool_outputs(&mut actual);
+        assert_eq!(actual, missing_input);
+    }
+
+    #[test]
+    fn non_string_scalar_output_becomes_compact_json_text() {
+        let mut actual = json!({
+            "input": [
+                {"type": "function_call_output", "call_id": "call_a", "output": 42},
+                {"type": "function_call_output", "call_id": "call_a", "output": true}
+            ]
+        });
+        merge_duplicate_tool_outputs(&mut actual);
+        assert_eq!(
+            actual["input"][0]["output"],
+            json!([
+                {"type": "input_text", "text": "42"},
+                {"type": "input_text", "text": "true"}
             ])
         );
     }
@@ -5998,7 +6963,7 @@ mod responses_reasoning_policy_tests {
                 {"type": "reasoning", "id": "item_reasoning", "summary": [{"type": "summary_text", "text": "glm-thought"}]}
             ]
         });
-        normalize_responses_item_ids(&mut actual);
+        normalize_responses_item_ids_with_policy(&mut actual, false);
         assert_eq!(
             actual["input"],
             json!([
@@ -6023,7 +6988,7 @@ mod responses_reasoning_policy_tests {
             ResponsesReasoningPolicy::OpenAiOpaque,
             "relay-a",
         );
-        normalize_responses_item_ids(&mut actual);
+        normalize_responses_item_ids_with_policy(&mut actual, false);
         assert_eq!(
             actual["input"],
             json!([
@@ -6248,7 +7213,11 @@ mod review_20260916_regression {
         let tool = &body["tools"][0];
         assert_eq!(tool["name"], json!("fs__inspect"));
         assert_eq!(tool["type"], json!("function"));
-        assert_eq!(tool.get("strict"), Some(&json!(false)), "顶层 strict 不能丢");
+        assert_eq!(
+            tool.get("strict"),
+            Some(&json!(false)),
+            "顶层 strict 不能丢"
+        );
         assert_eq!(tool.get("defer_loading"), Some(&json!(true)));
         assert_eq!(tool["allowed_callers"], json!(["direct"]));
         assert_eq!(tool.get("async"), Some(&json!(false)));
@@ -6277,8 +7246,7 @@ mod review_20260916_regression {
         }]});
         let _map = flatten_responses_tool_namespaces(&mut body).unwrap();
         assert_eq!(
-            body["tools"][0]["parameters"]["examples"][0],
-            example,
+            body["tools"][0]["parameters"]["examples"][0], example,
             "parameters 中的示例数据必须逐字段保持原样"
         );
     }
@@ -6296,9 +7264,10 @@ mod review_20260916_regression {
                 "call_id": "call_keep", "arguments": "{}"
             }]
         });
-        let map = BTreeMap::from([
-            ("fs__inspect".to_string(), ("fs".to_string(), "inspect".to_string()))
-        ]);
+        let map = BTreeMap::from([(
+            "fs__inspect".to_string(),
+            ("fs".to_string(), "inspect".to_string()),
+        )]);
         let restored: Value = serde_json::from_slice(&restore_responses_tool_namespace_json(
             &serde_json::to_vec(&response).unwrap(),
             &map,
@@ -6321,8 +7290,8 @@ mod review_20260916_regression {
             "name": "exec", "call_id": "call_keep", "input": "echo fixture"
         }]});
         let mut body = original.clone();
-        normalize_responses_item_ids(&mut body);
-        normalize_responses_custom_tool_call_ids(&mut body);
+        normalize_responses_item_ids_with_policy(&mut body, false);
+        normalize_responses_custom_tool_call_ids_with_policy(&mut body, false);
         assert_eq!(
             body["input"][0]["id"],
             json!("ctc_demo"),
@@ -6330,8 +7299,8 @@ mod review_20260916_regression {
         );
         assert_eq!(body["input"][0]["call_id"], json!("call_keep"));
         let once = body.clone();
-        normalize_responses_item_ids(&mut body);
-        normalize_responses_custom_tool_call_ids(&mut body);
+        normalize_responses_item_ids_with_policy(&mut body, false);
+        normalize_responses_custom_tool_call_ids_with_policy(&mut body, false);
         assert_eq!(body, once, "规范化必须幂等");
         assert_eq!(
             original["input"][0]["id"],
@@ -6347,8 +7316,8 @@ mod review_20260916_regression {
             {"type": "custom_tool_call", "id": "ct_native", "name": "exec", "input": "a"},
             {"type": "custom_tool_call", "id": "ctc_canonical", "name": "exec", "input": "b"}
         ]});
-        normalize_responses_item_ids(&mut body);
-        normalize_responses_custom_tool_call_ids(&mut body);
+        normalize_responses_item_ids_with_policy(&mut body, false);
+        normalize_responses_custom_tool_call_ids_with_policy(&mut body, false);
         assert_eq!(body["input"][0]["id"], json!("ct_native"));
         assert_eq!(body["input"][1]["id"], json!("ctc_canonical"));
     }
@@ -6380,7 +7349,9 @@ mod review_20260916_regression {
             ..Default::default()
         };
         let (endpoint, wire, wire_api, namespace_tools, _) =
-            upstream_request_parts(&relay, request, "/responses").await.unwrap();
+            upstream_request_parts(&relay, request, "/responses")
+                .await
+                .unwrap();
         assert!(matches!(wire_api, UpstreamWireApi::Responses));
         assert_eq!(
             endpoint, "https://example.invalid/v1/responses",
@@ -6391,21 +7362,25 @@ mod review_20260916_regression {
             "透传策略下不执行 namespace 扁平化"
         );
         assert_eq!(
-            wire["tools"][0]["type"], json!("namespace"),
+            wire["tools"][0]["type"],
+            json!("namespace"),
             "namespace 声明按原样透传"
         );
         assert_eq!(wire["tools"][0]["tools"][0]["name"], json!("inspect"));
         assert_eq!(
-            wire["input"][0]["id"], json!("item_demo"),
+            wire["input"][0]["id"],
+            json!("item_demo"),
             "透传策略下不做 item ID 规范化"
         );
         assert_eq!(
-            wire["model"], json!("physical-model"),
+            wire["model"],
+            json!("physical-model"),
             "模型别名仍按显式配置执行"
         );
         let reasoning = &wire["input"][1];
         assert_eq!(
-            reasoning["content"][0]["text"], json!("keep-me"),
+            reasoning["content"][0]["text"],
+            json!("keep-me"),
             "透传策略下 reasoning 不做有损清理"
         );
     }
@@ -6427,4 +7402,3 @@ mod review_20260916_regression {
         assert!(map_twice.is_empty());
     }
 }
-
