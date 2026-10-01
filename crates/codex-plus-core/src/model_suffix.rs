@@ -314,6 +314,12 @@ fn model_template_entry(slug: &str) -> (Value, bool) {
         let mut template = overlay_gpt56_metadata(compatibility);
         template["display_name"] = json!(slug);
         template["description"] = json!(slug);
+        // tool_mode 由「Custom 工具转 Function」开关统一决定
+        // （relay_config::catalog_needs_code_mode），模板预设值不能抢走控制权，
+        // 否则关闭开关的 profile 会残留 code_mode_only。
+        if let Some(object) = template.as_object_mut() {
+            object.remove("tool_mode");
+        }
         return (template, true);
     }
     (
