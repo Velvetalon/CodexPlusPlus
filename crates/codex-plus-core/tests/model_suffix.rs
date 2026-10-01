@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use codex_plus_core::model_suffix::{
     build_model_catalog_json, build_model_catalog_json_with_template, collect_catalog_entries,
-    model_ui_metadata, parse_model_suffix,
+    model_ui_metadata, parse_model_suffix, requires_bundled_metadata_catalog,
 };
 
 #[test]
@@ -234,4 +234,81 @@ fn migrate_model_list_with_suffixes_splits_slug_and_window() {
     );
     assert_eq!(windows.get("deepseek-v4-pro"), None);
     assert_eq!(windows.get("nvidia/...:free"), Some(&"200000".to_string()));
+}
+
+#[test]
+fn build_catalog_json_clones_full_levels_for_renamed_gpt_models() {
+    let entries = collect_catalog_entries(
+        "gpt-6-sol\ngpt-6.1-sol\ngpt-6-astra",
+        &HashMap::new(),
+        "gpt-6-sol",
+    );
+    let catalog: serde_json::Value =
+        serde_json::from_str(&build_model_catalog_json(&entries, None)).unwrap();
+    let models = catalog["models"].as_array().unwrap();
+
+    for slug in ["gpt-6-sol", "gpt-6.1-sol", "gpt-6-astra"] {
+        let model = models.iter().find(|model| model["slug"] == slug).unwrap();
+        let efforts = model["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["effort"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            efforts,
+            vec!["low", "medium", "high", "xhigh", "max", "ultra"],
+            "gpt* 模型必须带全档位（含 ultra）"
+        );
+        // 显示名保持用户自己的模型名，不冒用官方 gpt-5.6 名称。
+        assert_eq!(model["display_name"], slug);
+        assert_eq!(model["description"], slug);
+    }
+}
+
+#[test]
+fn non_gpt_slugs_keep_generic_levels() {
+    let entries = collect_catalog_entries("glm-5.3\ndeepseek-flash", &HashMap::new(), "glm-5.3");
+    let catalog: serde_json::Value =
+        serde_json::from_str(&build_model_catalog_json(&entries, None)).unwrap();
+    for model in catalog["models"].as_array().unwrap() {
+        let efforts = model["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["effort"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            !efforts.contains(&"ultra"),
+            "非 gpt 模型不得被追加 ultra 档"
+        );
+    }
+}
+
+#[test]
+fn exact_gpt56_slug_metadata_still_wins_for_luna() {
+    let entries = collect_catalog_entries("gpt-5.6-luna", &HashMap::new(), "gpt-5.6-luna");
+    let catalog: serde_json::Value =
+        serde_json::from_str(&build_model_catalog_json(&entries, None)).unwrap();
+    let model = &catalog["models"][0];
+    let efforts = model["supported_reasoning_levels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry["effort"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        efforts,
+        vec!["low", "medium", "high", "xhigh", "max"],
+        "精确命中的官方元数据保持原档位，不被追加 ultra"
+    );
+}
+
+#[test]
+fn requires_bundled_metadata_catalog_covers_gpt_prefixed_slugs() {
+    assert!(requires_bundled_metadata_catalog("gpt-6-sol"));
+    assert!(requires_bundled_metadata_catalog("GPT-6-Astra"));
+    assert!(requires_bundled_metadata_catalog("gpt-5.6-sol"));
+    assert!(!requires_bundled_metadata_catalog("glm-5.3"));
+    assert!(!requires_bundled_metadata_catalog("deepseek-v4-pro"));
 }
