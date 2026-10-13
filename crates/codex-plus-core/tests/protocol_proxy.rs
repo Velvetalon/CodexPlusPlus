@@ -2810,6 +2810,100 @@ async fn responses_proxy_drops_tool_outputs_without_call_id() {
 }
 
 #[tokio::test]
+async fn custom_tool_history_ids_use_function_namespace_when_wrapping() {
+    // 现网事故：历史里的 custom 工具项被转成 function 形态后保留了 ctc_/ctco_ id，
+    // 严格上游（要求 fc 前缀）整包 400。这里锁住「包装模式下 id 必须换成 fc_/fco_」。
+    for with_custom_tool in [true, false] {
+        let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let target_server = tokio::spawn(capture_json_request_once(target));
+        let mut request = json!({
+            "model": "gpt-5.6-luna",
+            "input": [
+                {"type": "message", "id": "msg_keep", "role": "user", "content": "hi"},
+                {
+                    "type": "custom_tool_call",
+                    "id": "ctc_01a1300a-645c-7580-94e8-f1918d8cf929",
+                    "call_id": "call_probe",
+                    "name": "exec",
+                    "input": "pwd"
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "id": "ctco_01a1300a-645c-7580-94e8-f1918d8cf929",
+                    "call_id": "call_probe",
+                    "output": "ok"
+                }
+            ],
+            "stream": false
+        });
+        if with_custom_tool {
+            request["tools"] = json!([{
+                "type": "custom",
+                "name": "exec",
+                "description": "run js",
+                "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.*/"}
+            }]);
+        }
+        let settings = BackendSettings {
+            active_relay_id: "wrap".to_string(),
+            relay_profiles: vec![RelayProfile {
+                id: "wrap".to_string(),
+                name: "wrap".to_string(),
+                base_url: format!("http://{target_addr}/v1"),
+                upstream_base_url: format!("http://{target_addr}/v1"),
+                api_key: "sk-test".to_string(),
+                protocol: RelayProtocol::Responses,
+                relay_mode: RelayMode::PureApi,
+                custom_tools_as_functions: true,
+                ..RelayProfile::default()
+            }],
+            ..BackendSettings::default()
+        };
+
+        let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+            .await
+            .unwrap();
+        assert_eq!(result.status_code, 200);
+        let (_, body) = target_server.await.unwrap();
+        let items = body["input"].as_array().unwrap();
+        let call = items
+            .iter()
+            .find(|item| matches!(item["type"].as_str(), Some("function_call" | "custom_tool_call")))
+            .unwrap();
+        let output = items
+            .iter()
+            .find(|item| {
+                matches!(
+                    item["type"].as_str(),
+                    Some("function_call_output" | "custom_tool_call_output")
+                )
+            })
+            .unwrap();
+        assert!(
+            call["id"].as_str().unwrap().starts_with("fc"),
+            "with_custom_tool={with_custom_tool} call id={}",
+            call["id"]
+        );
+        assert!(
+            output["id"].as_str().unwrap().starts_with("fc"),
+            "with_custom_tool={with_custom_tool} output id={}",
+            output["id"]
+        );
+        assert_eq!(
+            call["type"], "function_call",
+            "with_custom_tool={with_custom_tool} 上游必须是 function 形态"
+        );
+        assert_eq!(
+            output["type"], "function_call_output",
+            "with_custom_tool={with_custom_tool} 上游必须是 function 形态"
+        );
+    }
+}
+
+#[tokio::test]
 async fn model_route_preserves_responses_compact_endpoint() {
     let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
