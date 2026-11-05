@@ -328,6 +328,23 @@ pub fn apply_relay_config_to_home_with_protocol(
     )
 }
 
+fn session_auth_contents(
+    home: &Path,
+    bearer_token: &str,
+    session_provider: RelaySessionProvider,
+) -> anyhow::Result<String> {
+    if session_provider == RelaySessionProvider::Openai {
+        let live = read_optional_text(&home.join("auth.json"))?;
+        if !auth_contents_looks_like_chatgpt_auth(&live) {
+            anyhow::bail!("OpenAI 会话身份需要当前 ChatGPT 登录；请先登录官方账号。原配置未改动。");
+        }
+        return remove_openai_api_key_from_auth_contents(&live);
+    }
+    Ok(serde_json::to_string_pretty(&json!({
+        "OPENAI_API_KEY": bearer_token.trim()
+    }))?)
+}
+
 pub fn apply_relay_config_to_home_with_session_provider(
     home: &Path,
     base_url: &str,
@@ -355,9 +372,7 @@ pub fn apply_relay_config_to_home_with_session_provider(
         session_provider == RelaySessionProvider::Openai,
         session_provider,
     )?;
-    let auth_contents = serde_json::to_string_pretty(&json!({
-        "OPENAI_API_KEY": bearer_token
-    }))?;
+    let auth_contents = session_auth_contents(home, bearer_token, session_provider)?;
     let backup_path =
         write_codex_live_atomic(home, Some(&updated), Some(auth_contents.as_bytes()))?;
     let status = relay_config_status_from_home(home);
@@ -630,9 +645,7 @@ pub fn apply_pure_api_config_to_home_with_session_provider(
         session_provider == RelaySessionProvider::Openai,
         session_provider,
     )?;
-    let auth_contents = serde_json::to_string_pretty(&json!({
-        "OPENAI_API_KEY": bearer_token
-    }))?;
+    let auth_contents = session_auth_contents(home, bearer_token, session_provider)?;
     let backup_path =
         write_codex_live_atomic(home, Some(&updated), Some(auth_contents.as_bytes()))?;
     let status = relay_config_status_from_home(home);

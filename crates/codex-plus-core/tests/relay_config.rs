@@ -1,18 +1,19 @@
 use codex_plus_core::codex_sqlite::codex_session_db_path_from_home;
 use codex_plus_core::relay_config::{
     apply_aggregate_relay_profile_to_home_with_session_provider, apply_pure_api_config_to_home,
-    apply_relay_config_file_to_home, apply_relay_config_to_home, apply_relay_files_to_home,
+    apply_relay_config_file_to_home, apply_relay_config_to_home,
+    apply_relay_config_to_home_with_session_provider, apply_relay_files_to_home,
     apply_relay_files_to_home_with_common, apply_relay_profile_files_to_home_with_context,
     apply_relay_profile_to_home_with_switch_rules, backfill_relay_profile_from_home,
-    backfill_relay_profile_from_home_with_common, chatgpt_auth_status_from_home,
-    cleanup_unsupported_approval_policies_in_home, clear_relay_config_to_home,
-    clear_relay_config_to_home_with_auth, delete_context_entry_from_common_config,
-    extract_common_config_from_config, list_context_entries_from_common_config,
-    normalize_relay_profile_for_storage, prepare_common_config_for_apply,
-    relay_config_status_from_home, relay_profile_api_key, sanitize_common_config_contents,
-    set_codex_goals_feature_in_home, strip_common_config_from_config,
-    sync_live_config_context_entries, upsert_context_entry_in_common_config,
-    catalog_needs_code_mode,
+    backfill_relay_profile_from_home_with_common, catalog_needs_code_mode,
+    chatgpt_auth_status_from_home, cleanup_unsupported_approval_policies_in_home,
+    clear_relay_config_to_home, clear_relay_config_to_home_with_auth,
+    delete_context_entry_from_common_config, extract_common_config_from_config,
+    list_context_entries_from_common_config, normalize_relay_profile_for_storage,
+    prepare_common_config_for_apply, relay_config_status_from_home, relay_profile_api_key,
+    sanitize_common_config_contents, set_codex_goals_feature_in_home,
+    strip_common_config_from_config, sync_live_config_context_entries,
+    upsert_context_entry_in_common_config,
 };
 use codex_plus_core::settings::{
     CatalogToolMode, RelayMode, RelayModelRoute, RelayProfile, RelayProtocol, RelaySessionProvider,
@@ -818,6 +819,32 @@ fn aggregate_custom_session_uses_custom_bearer_auth_not_chatgpt_auth() {
     assert!(auth.get("tokens").is_none());
 }
 
+#[test]
+fn standard_openai_session_preserves_chatgpt_auth() {
+    let temp = tempfile::tempdir().unwrap();
+    let login = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"access","refresh_token":"refresh","id_token":"id"},"last_refresh":"2026-11-05T00:00:00Z"}"#;
+    std::fs::write(temp.path().join("auth.json"), login).unwrap();
+    apply_relay_config_to_home_with_session_provider(
+        temp.path(),
+        "https://relay.test/v1",
+        "local-key",
+        RelayProtocol::Responses,
+        57321,
+        RelaySessionProvider::Openai,
+    )
+    .unwrap();
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert!(config.contains(r#"model_provider = "openai""#));
+    assert!(config.contains(r#"openai_base_url = "http://127.0.0.1:57321/v1""#));
+    let auth: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(temp.path().join("auth.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        auth,
+        serde_json::from_str::<serde_json::Value>(login).unwrap()
+    );
+    assert!(auth.get("OPENAI_API_KEY").is_none());
+}
 #[test]
 fn aggregate_openai_session_keeps_openai_identity_explicit() {
     let temp = tempfile::tempdir().unwrap();

@@ -358,6 +358,7 @@ pub enum UpstreamWireApi {
     Responses,
     ChatCompletions,
     AudioTranscriptions,
+    ImagesGenerations,
 }
 
 #[derive(Debug, Clone)]
@@ -575,6 +576,47 @@ pub fn is_audio_transcriptions_proxy_path(path: &str) -> bool {
             | "/v1/v1/audio/transcriptions"
             | "/codex/v1/audio/transcriptions"
     )
+}
+
+pub fn is_images_generations_proxy_path(p: &str) -> bool {
+    matches!(p, "/images/generations" | "/v1/images/generations")
+}
+
+pub async fn open_images_generations_proxy_request(
+    body: &[u8],
+    ua: Option<&str>,
+) -> anyhow::Result<UpstreamProxyResponse> {
+    let settings = SettingsStore::default().load().unwrap_or_default();
+    let relay =
+        crate::relay_rotation::select_relay_for_request(&settings, RotationContext::default())?;
+    validate_upstream(&relay)?;
+    let endpoint = images_generations_url(&relay.base_url);
+    let req = crate::http_client::proxied_client(&effective_user_agent(&relay.user_agent, ua))?
+        .post(endpoint.clone())
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::ACCEPT_ENCODING, "identity")
+        .body(body.to_vec());
+    let upstream = send_upstream_request(with_relay_auth(req, &relay)).await?;
+    let status_code = upstream.status().as_u16();
+    let content_type = upstream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    Ok(UpstreamProxyResponse {
+        status_code,
+        is_stream: false,
+        content_type,
+        wire_api: UpstreamWireApi::ImagesGenerations,
+        native_agent_plaintext: false,
+        namespace_tools: BTreeMap::new(),
+        custom_adapter: None,
+        response: upstream,
+        relay_id: relay.id.clone(),
+        relay_name: relay.name.clone(),
+        endpoint,
+    })
 }
 
 pub async fn open_responses_proxy_request(
@@ -2593,6 +2635,26 @@ pub fn audio_transcriptions_url(base_url: &str) -> String {
         url = url.replace("/v1/v1", "/v1");
     }
     url
+}
+
+pub fn images_generations_url(base: &str) -> String {
+    let b = base.trim().trim_end_matches('#').trim_end_matches('/');
+    if b.to_ascii_lowercase().ends_with("/images/generations") {
+        return b.to_string();
+    }
+    let o = b
+        .split_once("://")
+        .map_or(!b.contains('/'), |(_, r)| !r.contains('/'));
+    let p = if has_version_suffix(b) || !o {
+        ""
+    } else {
+        "/v1"
+    };
+    let mut u = format!("{b}{p}/images/generations");
+    while u.contains("/v1/v1") {
+        u = u.replace("/v1/v1", "/v1")
+    }
+    u
 }
 
 pub fn models_url(base_url: &str) -> String {

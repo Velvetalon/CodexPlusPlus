@@ -1143,6 +1143,17 @@ async fn handle_helper_connection(
         )
         .await;
     }
+    if crate::protocol_proxy::is_images_generations_proxy_path(path) && method == "POST" {
+        return handle_images_generations_proxy_connection(
+            &mut stream,
+            &request.body,
+            request_user_agent.as_deref(),
+            method,
+            path,
+            remote_addr_text,
+        )
+        .await;
+    }
     if crate::protocol_proxy::is_responses_proxy_path(path) && method == "GET" {
         let body = serde_json::to_vec(&serde_json::json!({
             "status": "upgrade_required",
@@ -1918,6 +1929,57 @@ async fn handle_audio_transcriptions_proxy_connection(
         remote_addr_text,
     );
     stream.shutdown().await?;
+    Ok(())
+}
+
+async fn handle_images_generations_proxy_connection(
+    s: &mut tokio::net::TcpStream,
+    b: &[u8],
+    ua: Option<&str>,
+    m: &str,
+    p: &str,
+    r: Option<String>,
+) -> anyhow::Result<()> {
+    let u = match crate::protocol_proxy::open_images_generations_proxy_request(b, ua).await {
+        Ok(v) => v,
+        Err(e) => {
+            let x = serde_json::to_vec(
+                &serde_json::json!({"status":"failed","message":e.to_string()}),
+            )?;
+            write_http_response(s, "502 Bad Gateway", "application/json; charset=utf-8", &x)
+                .await?;
+            log_helper_response(
+                "helper.images_generations_proxy_failed",
+                m,
+                p,
+                "502 Bad Gateway",
+                r,
+            );
+            s.shutdown().await?;
+            return Ok(());
+        }
+    };
+    let st = u.status();
+    let ok = u.is_success();
+    let ct = if u.content_type.is_empty() {
+        "application/json".to_string()
+    } else {
+        u.content_type.clone()
+    };
+    let b = u.response.bytes().await?.to_vec();
+    write_http_response(s, &st, &ct, &b).await?;
+    log_helper_response(
+        if ok {
+            "helper.images_generations_proxy_ok"
+        } else {
+            "helper.images_generations_proxy_error"
+        },
+        m,
+        p,
+        &st,
+        r,
+    );
+    s.shutdown().await?;
     Ok(())
 }
 
